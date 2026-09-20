@@ -1,0 +1,22 @@
+{
+  "schema": "sparkplane.benchmark-plan/v1",
+  "warmup_samples": 1,
+  "measured_samples": 3,
+  "sampling": {"temperature": 0.0, "max_output_tokens": 512, "reasoning": {"effort": "none"}},
+  "workloads": [
+    {
+      "id": "code", "kind": "code", "timeout_seconds": 300,
+      "request": {
+        "instructions": "Write complete Rust source and focused unit tests. Emit code only.",
+        "input": "Implement a generic bounded LRU cache using only the Rust standard library. Include get, put, remove and len; test update, eviction, missing keys and zero capacity. Explain invariants in code comments."
+      }
+    },
+    {
+      "id": "prose", "kind": "prose", "timeout_seconds": 300,
+      "request": {
+        "instructions": "Write precise technical prose for an experienced systems engineer.",
+        "input": "Explain Linux virtual memory, page faults, mmap, the page cache, memory pressure and the difference between resident and available memory. Include practical diagnostic examples. Write at least 800 words."
+      }
+    }
+  ]
+}

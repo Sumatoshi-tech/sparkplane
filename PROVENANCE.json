@@ -1,0 +1,502 @@
+{
+  "origin": "sy audited working-tree extraction, 2026-09-21",
+  "license": "MIT; original LICENSE retained",
+  "note": "Source hashes precede mechanical namespace transformation. No git history, credentials or runtime state included.",
+  "files": [
+    {
+      "source": "src/spark/agent.rs",
+      "destination": "src/spark/agent.rs",
+      "source_sha256": "ddcb0b3565822ab614c670aee2401930f77b6751b1127be9454e989125022cb7"
+    },
+    {
+      "source": "src/spark/bench.rs",
+      "destination": "src/spark/bench.rs",
+      "source_sha256": "e46c6a6538b7eade5d174c9219edb7783d2086742a71e7c62ed45428cc70b8fe"
+    },
+    {
+      "source": "src/spark/cli.rs",
+      "destination": "src/spark/cli.rs",
+      "source_sha256": "0f25591f0592a4264692c22fb6002b123a731b833f20aaab44b406af11c66f66"
+    },
+    {
+      "source": "src/spark/client.rs",
+      "destination": "src/spark/client.rs",
+      "source_sha256": "0c599369d343b66e803a6840ad281fbb80c88807e3b093be872f1164e8c7530f"
+    },
+    {
+      "source": "src/spark/engine.rs",
+      "destination": "src/spark/engine.rs",
+      "source_sha256": "8f44e495d51eb5feba9dd948841d65e68ba80e5c3c3fba10d68ea6eeb868314f"
+    },
+    {
+      "source": "src/spark/executor.rs",
+      "destination": "src/spark/executor.rs",
+      "source_sha256": "a8f2737a9c334aa4e63e686884a9c93399bb5796e0340df9e7722a8d24d22e0d"
+    },
+    {
+      "source": "src/spark/gateway.rs",
+      "destination": "src/spark/gateway.rs",
+      "source_sha256": "5bfc48f5da5f92d7083c5c8d2b932cc6f99f6ef2cbb5a86d0ca4df4711cc4d96"
+    },
+    {
+      "source": "src/spark/install.rs",
+      "destination": "src/spark/install.rs",
+      "source_sha256": "06e54c33c617142d6669c37ae53bb0184e7eb2d55b7f8e56841162bbb726f724"
+    },
+    {
+      "source": "src/spark/launch.rs",
+      "destination": "src/spark/launch.rs",
+      "source_sha256": "3275a66f09db4521e2619106e24ea64f10acecdd1e2a1e028ba7699c3e35ed27"
+    },
+    {
+      "source": "src/spark/mod.rs",
+      "destination": "src/spark/mod.rs",
+      "source_sha256": "1364b60afead8a1998080fec609c4c238e6778c081ac1f9164666380b02203f9"
+    },
+    {
+      "source": "src/spark/model.rs",
+      "destination": "src/spark/model.rs",
+      "source_sha256": "48198e63ae074149ae74110ffb1627198fb55a914718190b5ef3028e2a834eb1"
+    },
+    {
+      "source": "src/spark/model_catalog.rs",
+      "destination": "src/spark/model_catalog.rs",
+      "source_sha256": "d9cd026f6b5a69ff5c0f1ce1a6b22fad2f6e6410a5cf8668479c9b5d67ac1778"
+    },
+    {
+      "source": "src/spark/qualification.rs",
+      "destination": "src/spark/qualification.rs",
+      "source_sha256": "da0e9821531e0812d06d139888b99aad59d69acab3cbc17d00c0101cffbf9356"
+    },
+    {
+      "source": "src/spark/recipe.rs",
+      "destination": "src/spark/recipe.rs",
+      "source_sha256": "9bd047c9e9bba2083cea0150a708c787121fea7cbdd33e6e816c806b81615f19"
+    },
+    {
+      "source": "src/spark/reconcile.rs",
+      "destination": "src/spark/reconcile.rs",
+      "source_sha256": "889c41e622ae11941b6107fc22e081e93d3d30fabe4b741a8134207da66481bb"
+    },
+    {
+      "source": "src/spark/resources.rs",
+      "destination": "src/spark/resources.rs",
+      "source_sha256": "c8348a5d8641f8949e2c0aa37b3dfca2e84439290f5abed57a2a4b5afed1ced5"
+    },
+    {
+      "source": "src/spark/state.rs",
+      "destination": "src/spark/state.rs",
+      "source_sha256": "67134e4e1d26a3bea0c20752861d7ff9df7e78b7c65bcce2736316d681bb034e"
+    },
+    {
+      "source": "src/spark/upstream.rs",
+      "destination": "src/spark/upstream.rs",
+      "source_sha256": "88bc31f494fcf38e244d9b61769a10d26582e1603dff520e60c95383003d0c3b"
+    },
+    {
+      "source": "src/spark/wire.rs",
+      "destination": "src/spark/wire.rs",
+      "source_sha256": "8cd3c9411d7684aae41b93cfb23d1c74a100ad28802c651695f8752e7bb10811"
+    },
+    {
+      "source": "configs/sy/spark/agent.toml",
+      "destination": "configs/sparkplane/agent.toml",
+      "source_sha256": "774615952961e816b298c0db15297fc0b65ad7965943d6230fc96840d8ef391f"
+    },
+    {
+      "source": "configs/sy/spark/engines/checks/qwen38_optimization.py",
+      "destination": "configs/sparkplane/engines/checks/qwen38_optimization.py",
+      "source_sha256": "e50abc24cf214a9b6139d44cc1da9836fa1f37394ea67fc4e41411dff7e24a6b"
+    },
+    {
+      "source": "configs/sy/spark/engines/checks/qwen38_sampling.py",
+      "destination": "configs/sparkplane/engines/checks/qwen38_sampling.py",
+      "source_sha256": "3caca02e281dd6ede5a645b0c95fdfeb48823392f2043d8afb5d86e6d50650ec"
+    },
+    {
+      "source": "configs/sy/spark/engines/freetoken.Dockerfile",
+      "destination": "configs/sparkplane/engines/freetoken.Dockerfile",
+      "source_sha256": "23c0652339746b67298e7b92ab42c6763f921f0e52bcc780c88d48b09f3edc68"
+    },
+    {
+      "source": "configs/sy/spark/engines/freetoken.toml",
+      "destination": "configs/sparkplane/engines/freetoken.toml",
+      "source_sha256": "c1c2ea81ae4c632c3e9fd6db3d83f33f7587b64aa959ed95639c5487fc6973d1"
+    },
+    {
+      "source": "configs/sy/spark/engines/llama-cpp.Dockerfile",
+      "destination": "configs/sparkplane/engines/llama-cpp.Dockerfile",
+      "source_sha256": "198e9a19d37f514c6ef89cbbbae0b5a2531fc33b1046ed9143f7f664f24045fa"
+    },
+    {
+      "source": "configs/sy/spark/engines/llama-cpp.toml",
+      "destination": "configs/sparkplane/engines/llama-cpp.toml",
+      "source_sha256": "5fb19fe0e285d57345eef0ef77d2f4b5d921f06334e92d6f8126ee0ab0b527e1"
+    },
+    {
+      "source": "configs/sy/spark/engines/patches/sha256-12714616ca51148aeee0089153826230adc15b66031eba3de07586a81f6544db.py",
+      "destination": "configs/sparkplane/engines/patches/sha256-12714616ca51148aeee0089153826230adc15b66031eba3de07586a81f6544db.py",
+      "source_sha256": "12714616ca51148aeee0089153826230adc15b66031eba3de07586a81f6544db"
+    },
+    {
+      "source": "configs/sy/spark/engines/patches/sha256-2edb46d75172645bc444853563385f480b5bfb872127d0b281fea2f5a8fc6e28.py",
+      "destination": "configs/sparkplane/engines/patches/sha256-2edb46d75172645bc444853563385f480b5bfb872127d0b281fea2f5a8fc6e28.py",
+      "source_sha256": "2edb46d75172645bc444853563385f480b5bfb872127d0b281fea2f5a8fc6e28"
+    },
+    {
+      "source": "configs/sy/spark/engines/patches/sha256-4ba17608fbb8908c6dfb2e796b8eb9aa4517cdcf6f261c40e8d9d8583b283e25.py",
+      "destination": "configs/sparkplane/engines/patches/sha256-4ba17608fbb8908c6dfb2e796b8eb9aa4517cdcf6f261c40e8d9d8583b283e25.py",
+      "source_sha256": "4ba17608fbb8908c6dfb2e796b8eb9aa4517cdcf6f261c40e8d9d8583b283e25"
+    },
+    {
+      "source": "configs/sy/spark/engines/patches/sha256-6530076f56575c6754375ba944f0911282999c30bbd2d5b1bdb7e89cf5e5b4aa.py",
+      "destination": "configs/sparkplane/engines/patches/sha256-6530076f56575c6754375ba944f0911282999c30bbd2d5b1bdb7e89cf5e5b4aa.py",
+      "source_sha256": "6530076f56575c6754375ba944f0911282999c30bbd2d5b1bdb7e89cf5e5b4aa"
+    },
+    {
+      "source": "configs/sy/spark/engines/patches/sha256-6e5e0a16b41be5795a2ce0bb0e7470641947495c4179402c0298800cb3bf51e0.py",
+      "destination": "configs/sparkplane/engines/patches/sha256-6e5e0a16b41be5795a2ce0bb0e7470641947495c4179402c0298800cb3bf51e0.py",
+      "source_sha256": "6e5e0a16b41be5795a2ce0bb0e7470641947495c4179402c0298800cb3bf51e0"
+    },
+    {
+      "source": "configs/sy/spark/engines/patches/sha256-708e870359a4d0f390b60096a6428506af013a8aaf7d796783e689f432ff4744.py",
+      "destination": "configs/sparkplane/engines/patches/sha256-708e870359a4d0f390b60096a6428506af013a8aaf7d796783e689f432ff4744.py",
+      "source_sha256": "708e870359a4d0f390b60096a6428506af013a8aaf7d796783e689f432ff4744"
+    },
+    {
+      "source": "configs/sy/spark/engines/patches/sha256-9f228eb6db985bd17fb21b051e747841da8fd37ac5e131228c15fa4cca2dc669.py",
+      "destination": "configs/sparkplane/engines/patches/sha256-9f228eb6db985bd17fb21b051e747841da8fd37ac5e131228c15fa4cca2dc669.py",
+      "source_sha256": "9f228eb6db985bd17fb21b051e747841da8fd37ac5e131228c15fa4cca2dc669"
+    },
+    {
+      "source": "configs/sy/spark/engines/patches/sha256-ba23e86521ba43731da3eff8b58bd438529f6a3341de5c351f01ce898b581372.py",
+      "destination": "configs/sparkplane/engines/patches/sha256-ba23e86521ba43731da3eff8b58bd438529f6a3341de5c351f01ce898b581372.py",
+      "source_sha256": "ba23e86521ba43731da3eff8b58bd438529f6a3341de5c351f01ce898b581372"
+    },
+    {
+      "source": "configs/sy/spark/engines/patches/sha256-bbaec9843bab2d859db87f05cbd8929638aa6caf1e2cc95754edd89ce4dbad3b.py",
+      "destination": "configs/sparkplane/engines/patches/sha256-bbaec9843bab2d859db87f05cbd8929638aa6caf1e2cc95754edd89ce4dbad3b.py",
+      "source_sha256": "bbaec9843bab2d859db87f05cbd8929638aa6caf1e2cc95754edd89ce4dbad3b"
+    },
+    {
+      "source": "configs/sy/spark/engines/patches/sha256-e373f3b21a12ce62066d8b1a3bd8390d7946651def00b5d54e976d07b97a8510.py",
+      "destination": "configs/sparkplane/engines/patches/sha256-e373f3b21a12ce62066d8b1a3bd8390d7946651def00b5d54e976d07b97a8510.py",
+      "source_sha256": "e373f3b21a12ce62066d8b1a3bd8390d7946651def00b5d54e976d07b97a8510"
+    },
+    {
+      "source": "configs/sy/spark/engines/patches/sha256-e4492a172636e0cc6d55b8baebf29313d687ca56bb6d5f2a155f4de3f00b78e0.py",
+      "destination": "configs/sparkplane/engines/patches/sha256-e4492a172636e0cc6d55b8baebf29313d687ca56bb6d5f2a155f4de3f00b78e0.py",
+      "source_sha256": "e4492a172636e0cc6d55b8baebf29313d687ca56bb6d5f2a155f4de3f00b78e0"
+    },
+    {
+      "source": "configs/sy/spark/engines/patches/sha256-eeabdde061631c9b606d4ccc7371ff8fb01c6cc034dfe6bad1e4f29a8aa21555.py",
+      "destination": "configs/sparkplane/engines/patches/sha256-eeabdde061631c9b606d4ccc7371ff8fb01c6cc034dfe6bad1e4f29a8aa21555.py",
+      "source_sha256": "eeabdde061631c9b606d4ccc7371ff8fb01c6cc034dfe6bad1e4f29a8aa21555"
+    },
+    {
+      "source": "configs/sy/spark/engines/patches/sha256-f60ccb9f9e350a43155a1a7a20d154be0b7e93c29dacb3db95d397ba910090b2.py",
+      "destination": "configs/sparkplane/engines/patches/sha256-f60ccb9f9e350a43155a1a7a20d154be0b7e93c29dacb3db95d397ba910090b2.py",
+      "source_sha256": "f60ccb9f9e350a43155a1a7a20d154be0b7e93c29dacb3db95d397ba910090b2"
+    },
+    {
+      "source": "configs/sy/spark/engines/patches/sha256-f969092584d6a9d2c8e74f6a9720ed7d4bdb51fca69962b88a8470282f88ce78.py",
+      "destination": "configs/sparkplane/engines/patches/sha256-f969092584d6a9d2c8e74f6a9720ed7d4bdb51fca69962b88a8470282f88ce78.py",
+      "source_sha256": "f969092584d6a9d2c8e74f6a9720ed7d4bdb51fca69962b88a8470282f88ce78"
+    },
+    {
+      "source": "configs/sy/spark/engines/runtime/qwen38_sampling.py",
+      "destination": "configs/sparkplane/engines/runtime/qwen38_sampling.py",
+      "source_sha256": "a41c5720074f09f71f5c49fbf290083e2424a4b85a7607d6ce165d9c893695a4"
+    },
+    {
+      "source": "configs/sy/spark/engines/sglang-qwen38-mmap.Dockerfile",
+      "destination": "configs/sparkplane/engines/sglang-qwen38-mmap.Dockerfile",
+      "source_sha256": "ab48668cd71c589f941e8a020360f800b700ca6884b642f03ec3a2e28a517153"
+    },
+    {
+      "source": "configs/sy/spark/engines/sglang-qwen38-mmap.toml",
+      "destination": "configs/sparkplane/engines/sglang-qwen38-mmap.toml",
+      "source_sha256": "feb8422c5b84ccafebc4790239f25942fc848aeccb45888a655064e94edcc696"
+    },
+    {
+      "source": "configs/sy/spark/engines/vllm-qwen38-mmap.Dockerfile",
+      "destination": "configs/sparkplane/engines/vllm-qwen38-mmap.Dockerfile",
+      "source_sha256": "2cec0b17da520f46cc47c30da3a7d408bd8b848ce9b33364a54f14b1ebc933a8"
+    },
+    {
+      "source": "configs/sy/spark/engines/vllm-qwen38-mmap.toml",
+      "destination": "configs/sparkplane/engines/vllm-qwen38-mmap.toml",
+      "source_sha256": "1b878194852da5048ecd7b104b89b0cc42758ac8fd35c97206378b1db4ec0df4"
+    },
+    {
+      "source": "configs/sy/spark/engines/vllm.toml",
+      "destination": "configs/sparkplane/engines/vllm.toml",
+      "source_sha256": "a469793800d1fcdbf123e5f2d5bf35651044cc70d048a3c3b6ab8cd627ee9330"
+    },
+    {
+      "source": "configs/sy/spark/executor.toml",
+      "destination": "configs/sparkplane/executor.toml",
+      "source_sha256": "bb6a9f8f452f829a0fc8e8eb425a259c0473e68ef1010c4362fee5b6065f9587"
+    },
+    {
+      "source": "configs/sy/spark/hf-http-fallback.lock",
+      "destination": "configs/sparkplane/hf-http-fallback.lock",
+      "source_sha256": "40e4010fe334ab44a2a663a6bbd3d73b5dad34c74098c1b6953d9dee839aeeab"
+    },
+    {
+      "source": "configs/sy/spark/models.toml",
+      "destination": "configs/sparkplane/models.toml",
+      "source_sha256": "8e5ea5855c6f544744db30a4d42def50afdfa49d74e422f4e07599778b3f4672"
+    },
+    {
+      "source": "configs/sy/spark/recipes/fixture-http-echo.toml",
+      "destination": "configs/sparkplane/recipes/fixture-http-echo.toml",
+      "source_sha256": "70a87791bff46d6016248996a16377769c0065a40c700ebe680950312f923ffc"
+    },
+    {
+      "source": "configs/sy/spark/recipes/ornith-vllm.toml",
+      "destination": "configs/sparkplane/recipes/ornith-vllm.toml",
+      "source_sha256": "c95c9c4090d6c2562dcd51fc3f289e53414cba3715fff667778e207e4de3d7cc"
+    },
+    {
+      "source": "configs/sy/spark/recipes/qwen3-embedding.toml",
+      "destination": "configs/sparkplane/recipes/qwen3-embedding.toml",
+      "source_sha256": "b151957faf999667b63823ad7a8c253a95d0efca09a7c8fb10120b946c485bc0"
+    },
+    {
+      "source": "tests/fixtures/spark-engine/README.md",
+      "destination": "tests/fixtures/spark-engine/README.md",
+      "source_sha256": "bf9c2ab295ee3f6495bcde471ca652eb92f4a1ada0160424cf38ea14349decf7"
+    },
+    {
+      "source": "tests/fixtures/spark-engine/image.lock",
+      "destination": "tests/fixtures/spark-engine/image.lock",
+      "source_sha256": "5fbb95d23859817a21a3c2925c26b8a072815a78b1b8703dc950593faa714508"
+    },
+    {
+      "source": "tests/fixtures/spark-engine/image_inventory.py",
+      "destination": "tests/fixtures/spark-engine/image_inventory.py",
+      "source_sha256": "74e69ea66184900d06a553f598bdb59906152b70b3011b7a7ed7e8fad79fcb04"
+    },
+    {
+      "source": "tests/fixtures/spark-engine/sm121_runtime_jit.py",
+      "destination": "tests/fixtures/spark-engine/sm121_runtime_jit.py",
+      "source_sha256": "7c203e0095e5a7760aed874319044308db2135abb228296fae2fc65f281a8623"
+    },
+    {
+      "source": "tests/fixtures/spark-benchmark/cold.json",
+      "destination": "tests/fixtures/spark-benchmark/cold.json",
+      "source_sha256": "bd6f2d92734780ac7e83d9388757f69dc19eb166adaa3a456801a0b83cbe25a7"
+    },
+    {
+      "source": "tests/fixtures/spark-benchmark/events.json",
+      "destination": "tests/fixtures/spark-benchmark/events.json",
+      "source_sha256": "3841d890aa1866428530d4bfabed57bd3c030ceaaa0c9333064cbed712c3fa7d"
+    },
+    {
+      "source": "tests/fixtures/spark-benchmark/paired.json",
+      "destination": "tests/fixtures/spark-benchmark/paired.json",
+      "source_sha256": "5ecd22d802226564ac390ec8a9c3e26f9ec2146997ec64c995b76bec692ca11e"
+    },
+    {
+      "source": "tests/fixtures/spark-benchmark/qwen38-optimization.json",
+      "destination": "tests/fixtures/spark-benchmark/qwen38-optimization.json",
+      "source_sha256": "b8f7213111889df9e792f3488b126d662658ed8745584cb6fd63e59ff59e4f11"
+    },
+    {
+      "source": "tests/fixtures/spark-benchmark/short.json",
+      "destination": "tests/fixtures/spark-benchmark/short.json",
+      "source_sha256": "bdb861db78613015330d5e0d29abcf9bc82c64e0b504363f7f906a9ad0db9afd"
+    },
+    {
+      "source": "tests/fixtures/spark-benchmark/smoke.json",
+      "destination": "tests/fixtures/spark-benchmark/smoke.json",
+      "source_sha256": "b1164760ea3a734d57e97c4df775fad84b586ffa7d86f53ec00e3cf35ef37c23"
+    },
+    {
+      "source": "tests/spark_anthropic_e2e.rs",
+      "destination": "tests/spark_anthropic_e2e.rs",
+      "source_sha256": "71f9baa6118f95e09f68794cc17b0d16bd66fb226a724b9d017e4b4b77c82556"
+    },
+    {
+      "source": "tests/spark_benchmark_harness.rs",
+      "destination": "tests/spark_benchmark_harness.rs",
+      "source_sha256": "60171df6e153b56dec0bf29dd53e7cfb0fc6e196575cbb60273e8447ed3a5896"
+    },
+    {
+      "source": "tests/spark_cache_promotion.rs",
+      "destination": "tests/spark_cache_promotion.rs",
+      "source_sha256": "cf6fe144c46241d3c2885f2b00b055289c4e2b444525bab2d807699e333c4242"
+    },
+    {
+      "source": "tests/spark_engine_image_contract.rs",
+      "destination": "tests/spark_engine_image_contract.rs",
+      "source_sha256": "ee45e7152d82ad0793b39aee9b3c8d364b74a2d76897883330a077291fe35c9b"
+    },
+    {
+      "source": "tests/spark_modalities_e2e.rs",
+      "destination": "tests/spark_modalities_e2e.rs",
+      "source_sha256": "4f366781230727937607c183ef50cc4298acdb48a5b39c7fdf0c1c4d49f6b810"
+    },
+    {
+      "source": "tests/spark_openai_e2e.rs",
+      "destination": "tests/spark_openai_e2e.rs",
+      "source_sha256": "47ded7cc3b0f962518f5a9a85ce0b8bf72c674807aecb49a1bc604ff8219264e"
+    },
+    {
+      "source": "tests/spark_qualification_e2e.rs",
+      "destination": "tests/spark_qualification_e2e.rs",
+      "source_sha256": "23e3f825518003c0250f9c989b8d382e8935fd28071b2a0efb9b39556d2456e8"
+    },
+    {
+      "source": "tests/spark_qwen_vllm_optimization.rs",
+      "destination": "tests/spark_qwen_vllm_optimization.rs",
+      "source_sha256": "0d45922925d043e82e9c40ddf0e9238551993d343f2cfb5809b75253223754e6"
+    },
+    {
+      "source": "tests/spark_reconcile_e2e.rs",
+      "destination": "tests/spark_reconcile_e2e.rs",
+      "source_sha256": "20df9ff15f874472793d884813504887470652f4667d126419c5bc2b4ee755c8"
+    },
+    {
+      "source": "tests/spark_release_catalog_boundary.rs",
+      "destination": "tests/spark_release_catalog_boundary.rs",
+      "source_sha256": "936b6bc49a5cb22aca7c52841f7d73095791d678a2cb1fe3bdccd0d5d084fc42"
+    },
+    {
+      "source": "tests/spark_release_e2e.rs",
+      "destination": "tests/spark_release_e2e.rs",
+      "source_sha256": "88c96be7db88bc3fcb92725818bc016f8e0c531f78be4079d19bda9096cd3362"
+    },
+    {
+      "source": "tests/spark_vllm_e2e.rs",
+      "destination": "tests/spark_vllm_e2e.rs",
+      "source_sha256": "5ab94ec8fe99fc5666830a83f6874c4b1a4c8464b6a9eee207a4ea793f6bb0ab"
+    },
+    {
+      "source": "configs/systemd/system/sy-spark-agent.service",
+      "destination": "configs/systemd/system/sparkplane-agent.service",
+      "source_sha256": "cffe986b8e19a5a7fa2de4f60d34cf473af66e3cc4d0c1602ffc774ad08ed5ab"
+    },
+    {
+      "source": "configs/systemd/system/sy-spark-executor.service",
+      "destination": "configs/systemd/system/sparkplane-executor.service",
+      "source_sha256": "b6b7f6ba133d860a8f23052477a05a582e9a3609bc5e1e34d8b80834be56ea0a"
+    },
+    {
+      "source": "configs/systemd/system/sy-spark.target",
+      "destination": "configs/systemd/system/sparkplane.target",
+      "source_sha256": "d401d64e2aef20c9196e17047b39f85d568a3c471d539dfe50c05155237270f7"
+    },
+    {
+      "source": "configs/apparmor.d/sy-spark-agent",
+      "destination": "configs/apparmor.d/sparkplane-agent",
+      "source_sha256": "69944f6b0e86215ab0f94e6fbaadd7cb559d24f5744e428c3b3fb1c0617b1158"
+    },
+    {
+      "source": "configs/apparmor.d/sy-spark-executor",
+      "destination": "configs/apparmor.d/sparkplane-executor",
+      "source_sha256": "d227d98bf9175c45be5d922a9169738dfa85236c84aafa8062156ee09f8da8f9"
+    },
+    {
+      "source": "LICENSE",
+      "destination": "LICENSE",
+      "source_sha256": "0ddc28ea52700addeeaa0ecad75dd709728475ab8e14eae51b8673fc5e97715c"
+    },
+    {
+      "source": "Cargo.lock",
+      "destination": "Cargo.lock",
+      "source_sha256": "31141817cf94162ec25698e114f8fac032ac97d1f00c4621c82fc8c8315a5421"
+    },
+    {
+      "source": "deny.toml",
+      "destination": "deny.toml",
+      "source_sha256": "7568496873b794630494c663352f7b889d2a60df7c382138b51a0b348d4b9636"
+    },
+    {
+      "source": "scripts/package-spark-release.sh",
+      "destination": "scripts/package-spark-release.sh",
+      "source_sha256": "02e9f3b355a7a46d4e4dd1238294e2504514f129192a3bb83e1c5f3aac0d1dd6"
+    },
+    {
+      "source": "scripts/benchmark-spark-engine.py",
+      "destination": "scripts/benchmark-spark-engine.py",
+      "source_sha256": "312fab742a4c1bcf9d5ceea9412f98aacc664504fa29d85f9e70b0b8bf87352b"
+    },
+    {
+      "source": "scripts/promote-spark-cache.py",
+      "destination": "scripts/promote-spark-cache.py",
+      "source_sha256": "eaee5c48ebc40cb04dac986f4c001691defbfb9d42cfeae1bb214d3a35b47bd1"
+    },
+    {
+      "source": "specs/openapi/sy-spark-control-v1.json",
+      "destination": "specs/openapi/sparkplane-control-v1.json",
+      "source_sha256": "1a430ed9735320d8d0e3062386aa86b0877c538c7abdb1387cbfc3f41b09358e"
+    },
+    {
+      "source": "docs/how-to/install-spark.md",
+      "destination": "docs/how-to/install-spark.md",
+      "source_sha256": "e0abac3468df880a387bb14f7fa3d50f7fddfdf297a8d149acc72b6a966358e6"
+    },
+    {
+      "source": "docs/how-to/develop-spark.md",
+      "destination": "docs/how-to/develop-spark.md",
+      "source_sha256": "057f6220cb9c7996c9c0ad491abfb501e2d814d9a898ee6aea1789b9b9945dbb"
+    },
+    {
+      "source": "crates/sy-core/src/error.rs",
+      "destination": "crates/sparkplane-core/src/error.rs",
+      "source_sha256": "c8f2f32b2cd703f6951f6cd14fe6f20fb26d3cffbf70b41fd7162301ab9c0603"
+    },
+    {
+      "source": "crates/sy-core/src/priority.rs",
+      "destination": "crates/sparkplane-core/src/priority.rs",
+      "source_sha256": "35a0909d4223c278230ad579b893aa644b96e9a31817fc023c1770a0daf7a1ac"
+    },
+    {
+      "source": "crates/sy-core/src/trace.rs",
+      "destination": "crates/sparkplane-core/src/trace.rs",
+      "source_sha256": "ef130be54037e785b1494e3ac0d19875beeed65aa9edb562a783f37a8020db36"
+    },
+    {
+      "source": "crates/sy-core/src/notify.rs",
+      "destination": "crates/sparkplane-core/src/notify.rs",
+      "source_sha256": "da4754ce17893432464758387f004c91ccf7901b927c5f2ab5f4ea0d573ca51c"
+    },
+    {
+      "source": "crates/sy-core/src/obs/trace_ctx.rs",
+      "destination": "crates/sparkplane-core/src/obs.rs",
+      "source_sha256": "1181055bdb39700666673a57638a9445cd957016d64e5d73d27a196d4719d207"
+    },
+    {
+      "source": "crates/sy-ipc/src/cancel.rs",
+      "destination": "crates/sparkplane-ipc/src/cancel.rs",
+      "source_sha256": "fed22cb8053d7ab7a2b356495f07a8ec6f50792229b9a3e056e7a88f3be7adfb"
+    },
+    {
+      "source": "crates/sy-ipc/src/client.rs",
+      "destination": "crates/sparkplane-ipc/src/client.rs",
+      "source_sha256": "552eff5557fd9f2db3aadd4f6913c71fe3acc9a8f8b9832c03ce18462ed58381"
+    },
+    {
+      "source": "crates/sy-ipc/src/codec.rs",
+      "destination": "crates/sparkplane-ipc/src/codec.rs",
+      "source_sha256": "210db7ffb3b5ae217c55ebbf926bc4e3f183acb864c8754bb750728f5d74b02b"
+    },
+    {
+      "source": "crates/sy-ipc/src/envelope.rs",
+      "destination": "crates/sparkplane-ipc/src/envelope.rs",
+      "source_sha256": "926f48eb7f834281fe0c03fce9afd99210b8d030c42c6acc0e5aa226c6c9f3f7"
+    },
+    {
+      "source": "crates/sy-ipc/src/server.rs",
+      "destination": "crates/sparkplane-ipc/src/server.rs",
+      "source_sha256": "ed5cb113ed28d6f8aebbecb82943dc06d9ed98a52e1873e36455f924fab03680"
+    },
+    {
+      "source": "crates/sy-ipc/src/stream.rs",
+      "destination": "crates/sparkplane-ipc/src/stream.rs",
+      "source_sha256": "fe183f8276d163910c0f6de1b2c04df44a96d71140d2b82123e052ddc20d093a"
+    }
+  ]
+}

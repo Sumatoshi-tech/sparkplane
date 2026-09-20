@@ -1,0 +1,64 @@
+[Unit]
+Description=Sparkplane DGX Spark HTTPS agent
+After=network-online.target sparkplane-executor.service
+Wants=network-online.target sparkplane-executor.service
+PartOf=sparkplane.target
+StartLimitIntervalSec=120s
+StartLimitBurst=5
+
+[Service]
+Type=notify
+User=sparkplane
+Group=sparkplane
+ExecStart=/opt/sparkplane/current/sparkplane agent run-agent --config /etc/sparkplane/agent.toml --certificate /var/lib/sparkplane/tls/server-chain.pem --key /var/lib/sparkplane/tls/server-key.pem --token %d/bootstrap-token --hf-token %d/hf-token
+LoadCredential=bootstrap-token:/etc/sparkplane/bootstrap-admin.credential
+LoadCredential=hf-token:/etc/sparkplane/hf-read.credential
+UnsetEnvironment=HF_TOKEN HF_TOKEN_PATH HF_HOME HF_HUB_CACHE HF_ENDPOINT HF_XET_HIGH_PERFORMANCE
+WorkingDirectory=/var/lib/sparkplane
+UMask=0027
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateIPC=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+DevicePolicy=closed
+ReadWritePaths=/var/lib/sparkplane
+ReadOnlyPaths=/etc/sparkplane/agent.toml /etc/sparkplane/models.toml /etc/sparkplane/engines
+LimitNOFILE=4096
+TasksMax=128
+MemoryMax=256M
+OOMScoreAdjust=-100
+AppArmorProfile=sparkplane-agent
+NotifyAccess=main
+WatchdogSec=30s
+TimeoutStopSec=15s
+Restart=on-failure
+RestartSec=2s
+RestartSteps=5
+RestartMaxDelaySec=30s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=sparkplane.target

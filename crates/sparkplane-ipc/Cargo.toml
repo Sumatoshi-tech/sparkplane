@@ -1,0 +1,25 @@
+[package]
+name = "sparkplane-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sparkplane-core.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+bytes.workspace = true
+ulid.workspace = true
+rustix.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+metrics.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,45 @@
+#include <tunables/global>
+
+profile sparkplane-executor /opt/sparkplane/current/sparkplane flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
+
+  /opt/sparkplane/releases/*/sparkplane mr,
+  /opt/sparkplane/releases/*/minisign.pub r,
+  /etc/sparkplane/executor.toml r,
+  /etc/sparkplane/agent.toml r,
+  /etc/sparkplane/engines/ r,
+  /etc/sparkplane/engines/*.toml r,
+  deny /etc/sparkplane/** wklx,
+  /etc/hostname r,
+  /etc/machine-id r,
+  /run/sparkplane/ rw,
+  /run/sparkplane/executor.sock rwk,
+  /run/systemd/notify w,
+  /var/run/docker.sock rw,
+  /run/docker.sock rw,
+  /var/lib/sparkplane/executor/ rw,
+  /var/lib/sparkplane/executor/** rwk,
+  /var/lib/sparkplane/compile-cache/ rw,
+  /var/lib/sparkplane/compile-cache/** rwk,
+  /var/lib/sparkplane/huggingface/ r,
+  /var/lib/sparkplane/huggingface/** r,
+  /proc/*/cgroup r,
+  /proc/*/stat r,
+  /proc/meminfo r,
+  /proc/vmstat r,
+  /proc/pressure/memory r,
+  /sys/fs/cgroup/**/cpu.max r,
+  /sys/fs/cgroup/system.slice/docker-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].scope/memory.current r,
+  /sys/fs/cgroup/system.slice/docker-*.scope/cgroup.kill w,
+
+  network unix stream,
+  network unix dgram,
+
+  deny network inet,
+  deny network inet6,
+  deny /home/** rwklx,
+  deny /var/lib/sparkplane/tls/** rwklx,
+  deny /var/lib/sparkplane/ca/** rwklx,
+  deny /etc/sparkplane/bootstrap-admin.credential rwklx,
+}

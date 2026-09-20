@@ -5720,15 +5720,20 @@ mod tests {
             assert!(!asset.contains("spark-recipes"));
         }
         if let Ok(parser) = which::which("apparmor_parser") {
-            let status = std::process::Command::new(parser)
+            let output = std::process::Command::new(parser)
                 .args([
                     "-Q",
+                    "-K",
                     "configs/apparmor.d/sparkplane-agent",
                     "configs/apparmor.d/sparkplane-executor",
                 ])
-                .status()
+                .output()
                 .unwrap();
-            assert!(status.success(), "AppArmor catalog policy does not parse");
+            assert!(
+                output.status.success(),
+                "AppArmor catalog policy does not parse: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 

@@ -81,8 +81,8 @@ cargo zigbuild --release \
 ```
 
 CI uses `cargo auditable zigbuild` so the resulting binary carries its Rust
-dependency inventory. Do not enable desktop, NPU, or unrelated feature sets
-when producing a Spark artifact.
+dependency inventory. Use the `appliance` feature for the ARM64 service binary
+and the default feature set for workstation clients.
 
 The Rust toolchain is pinned by `rust-toolchain.toml`. Zig is a separate
 requirement of [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild#installation);
@@ -91,8 +91,7 @@ the release workflow installs it explicitly. Keep local and CI versions aligned.
 ## Package and sign a release
 
 Run `make lint` for warning-denying checks on both client and appliance builds.
-`make lint-spark` is an alias for the same gate. Sparkplane has no desktop, GUI
-or NPU feature dependency.
+`make lint-spark` is an alias for the same gate.
 
 Package the binary and catalogs from the repository root:
 
@@ -300,8 +299,7 @@ and first-token latency separately, plus cached-versus-cold output, near-limit
 context, concurrent requests, reasoning and tool continuation. If correctness
 fails, stop the unqualified instance and retain its native logs before cleanup.
 Do not silently disable optimizations or promote a control profile as a fix.
-No Sparky configuration or new client launcher is
-involved; the existing `sparkplane` alias and instance endpoint remain the UX.
+Use `sparkplane` to manage the qualified profile through its instance endpoint.
 
 ### Preserve GPU access across lifecycle updates
 
@@ -376,7 +374,7 @@ total image bytes, then author an exact manifest such as:
   "schema": "sparkplane.qualification-manifest/v1",
   "job_id": "spark-flash-adaptive-decoding",
   "operation": "spark_flash_adaptive_decoding_v1",
-  "image": "registry.example/sparky@sha256:<64 lowercase hex digits>",
+  "image": "registry.example/qualification-runner@sha256:<64 lowercase hex digits>",
   "target": {
     "architecture": "aarch64",
     "gpu_model": "NVIDIA GB10",
@@ -410,13 +408,13 @@ sparkplane dgx-spark qualify \
   --dry-run --json
 ```
 
-A real Sparky qualification therefore requires four release-authority inputs:
+A qualification requires four release-authority inputs:
 the built ARM64 runner image, its immutable registry digest, its measured total
 image bytes, and a detached manifest signature from the installed release
 authority. The CLI cannot substitute an executable or arguments; adding a new
 runner mode requires a reviewed finite operation variant and its fixed executor
-mapping. The `spark_flash_qsa_v1` variant is fixed to
-`/opt/sparky/bin/sparky-qualification qsa-target --json`; it accepts no
+mapping. The `spark_flash_qsa_v1` variant invokes the fixed runner with
+`qsa-target --json`; it accepts no
 checkpoint path, mount, executable, or caller-supplied argument. Its Triton JIT
 cache is isolated to a bounded executable `/tmp/triton` tmpfs; the parent
 `/tmp` remains bounded and no-exec, as it is for adaptive decoding.

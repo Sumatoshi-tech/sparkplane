@@ -12,7 +12,7 @@ healthy, and confirm the OpenAI-compatible gateway path answers.
 - A DGX Spark on the network with the `sparkplane` agent and executor
   already installed and authenticated. If they are not, follow
   [How to install the Spark agent](install-spark.md) first.
-- `sy` on your laptop with Spark client credentials configured for
+- `sparkplane` on your laptop with client credentials configured for
   that host. Substitute `dgx-spark` below for the host name you use.
 - Enough free memory and disk on the Spark for the configured engine envelope. Missing
   or stale telemetry fails closed; the agent will refuse the serve
@@ -32,8 +32,8 @@ healthy, and confirm the OpenAI-compatible gateway path answers.
    retry. Missing telemetry fails closed: the agent refuses
    rather than guessing.
 
-2. Start the verified model. The agent selects the single engine configured at
-   `/etc/sparkplane/engine.toml`; there is no image, recipe, argv, or unsafe-override
+2. Start the verified model. The agent selects a matching engine from
+   `/etc/sparkplane/engines/`; there is no image, recipe, argv, or unsafe-override
    flag on the request:
 
    ```bash
@@ -56,7 +56,7 @@ healthy, and confirm the OpenAI-compatible gateway path answers.
 
    Models supported by the installed vLLM version need no code change. If a
    model requires a finite parser or capability, add a `model_type` profile to
-   the root-owned engine configuration and restart the two sy services. Never
+   the engine catalog and deploy it through a signed upgrade. Never
    place image names, model IDs, or launch arguments in Rust.
 
 5. Print a client config for Codex or Claude Code. The output names

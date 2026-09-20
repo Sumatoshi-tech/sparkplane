@@ -114,7 +114,7 @@ client values are preserved. Runtime workarounds are profile arguments in the
 same file. The legacy Qwen 3.5 profile selects eager execution for its GB10 GEMM
 compatibility constraint. The optimized Qwen 3.8 Flash Next profile instead
 uses PIECEWISE CUDA graphs, MTP and prefix caching; preserve that qualified
-configuration during extraction and require GPU qualification for changes.
+configuration across upgrades and require GPU qualification for changes.
 
 Warming or recovering generations return protocol-native `503`
 with `Retry-After` and never inherit a stale route.
@@ -141,13 +141,13 @@ environment overrides, network settings, or Docker labels.
 
 ```bash
 sparkplane dgx-spark qualify \
-  --manifest sparky-adaptive-decoding.json \
-  --signature sparky-adaptive-decoding.json.minisig \
+  --manifest adaptive-decoding.json \
+  --signature adaptive-decoding.json.minisig \
   --dry-run --json
 
 sparkplane dgx-spark qualify \
-  --manifest sparky-adaptive-decoding.json \
-  --signature sparky-adaptive-decoding.json.minisig \
+  --manifest adaptive-decoding.json \
+  --signature adaptive-decoding.json.minisig \
   --yes --json
 ```
 
@@ -175,20 +175,20 @@ engine reconciliation and emergency handling never adopt the job. One
 qualification may run per host, and the normal high-memory transition lease
 prevents overlap with engine starts.
 
-Kernel catalog qualification uses only the fixed
-`/opt/sparky/bin/sparky-qualification kernel-catalog-target --json` command.
+Kernel catalog qualification invokes the fixed runner with
+`kernel-catalog-target --json`.
 Its kernels are precompiled: it receives no JIT environment or executable
 cache, and its only temporary mount is the bounded no-exec `/tmp`.
 
-CUDA lifecycle qualification similarly fixes the command to
-`/opt/sparky/bin/sparky-qualification cuda-lifecycle-target --json`, with no JIT
+CUDA lifecycle qualification fixes the runner arguments to
+`cuda-lifecycle-target --json`, with no JIT
 environment or executable cache. Its signed image supplies bounded lifecycle
-cases and a parent collector that observes child exit after cleanup. Sy retains
+cases and a parent collector that observes child exit after cleanup. Sparkplane retains
 the same signed admission, exclusive lease, output ceilings, and cleanup policy;
 it does not interpret a child's claimed receipt as proof of process termination.
 
-Memory admission qualification fixes the command to
-`/opt/sparky/bin/sparky-qualification memory-admission-target --json`. Its signed
+Memory admission qualification fixes the runner arguments to
+`memory-admission-target --json`. Its signed
 image supplies the finite checkpoint, plans, and captured-memory cycles. It
 inherits precompiled no-JIT isolation and unchanged signed admission, exclusive
 high-memory lease, resource/output limits, and exact-container cleanup.

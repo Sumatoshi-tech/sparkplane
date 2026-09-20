@@ -1,9 +1,9 @@
 # Sparkplane
 
-An independent DGX Spark inference appliance and workstation CLI. Sparkplane
-owns model downloads, declarative engine profiles, authenticated OpenAI and
-Anthropic gateways, signed releases, resource admission and GPU qualification.
-It does not depend on sy, a desktop session, an AMD NPU runtime or a Sparky checkout.
+Run and manage language models on NVIDIA DGX Spark. Sparkplane provides a
+workstation CLI, model downloads, declarative engine profiles, authenticated
+OpenAI and Anthropic gateways, signed releases, resource admission and GPU
+qualification.
 
 ```sh
 cargo build --locked --release
@@ -37,7 +37,7 @@ make audit
 cargo build --locked --release --features appliance
 ```
 
-Three inherited hardware/client qualification tests require explicit external
+Hardware, client and privilege-dependent tests require explicit external
 fixtures and are ignored by default. Ordinary unit and integration tests are
 hermetic and do not contact a Spark or allocate a GPU.
 
@@ -45,22 +45,13 @@ hermetic and do not contact a Spark or allocate a GPU.
 
 - [Build, release, deploy, add engines and models](docs/how-to/develop-spark.md)
 - [Install, upgrade and rollback](docs/how-to/install-spark.md)
-- [Extraction and compatibility contracts](docs/extraction.md)
-- [Legacy migration status and safety gates](docs/how-to/migrate-from-sy.md)
+- [CLI and runtime reference](docs/reference/spark.md)
 - [Security and release authority](SECURITY.md)
 
-Inference URLs stay at `/openai/<instance>/v1` and `/anthropic/<instance>/v1`.
+Inference URLs use `/openai/<instance>/v1` and `/anthropic/<instance>/v1`.
 The control API uses `/api/sparkplane/v1`. Runtime paths, units, schemas,
 environment variables and Docker ownership use the Sparkplane namespace.
 
-The companion `sy spark HOST ...` bridge forwards to a pinned, verified client.
-Sparkplane itself requires no sy installation. Sparky is a separate research
-project whose engine artifacts use the same signed qualification interface.
+## License
 
-## Provenance
-
-Extracted from the sy working tree on 2026-09-21, including the optimized vLLM
-GPU device mapping fix. `PROVENANCE.json` records the original source hashes.
-Content-addressed engine patches retain their original bytes and attribution;
-historical names inside those immutable payloads are not active service names.
-The original MIT license is retained.
+[MIT](LICENSE).

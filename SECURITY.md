@@ -11,10 +11,9 @@ release authorization. A signing key must never be committed or placed in a
 build artifact. The `release` GitHub environment must require maintainer review
 before its signing secrets become available.
 
-The migration trust transition is signed by the already-installed sy release
-authority and binds the new authority to an exact release, host identity and
-expiration. Migration must not trust a replacement key merely because it was
-downloaded alongside the new executable.
+Do not trust a replacement release key merely because it was downloaded
+alongside a new executable. Authority changes require separate authorization
+by the operator's established trust chain.
 
 Pull-request CI runs on hosted CPU runners. GPU qualification is an operator
 action using the existing finite, signed operation interface; untrusted PR code

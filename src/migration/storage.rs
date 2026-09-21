@@ -14,6 +14,8 @@ pub struct Storage {
     original: Vec<(String, FileIdentity)>,
     candidate: FileIdentity,
     caches: Vec<(String, String, Identity)>,
+    #[serde(default)]
+    emergency: super::emergency::Journal,
 }
 
 fn cache_key(key: &str) -> bool {
@@ -77,6 +79,7 @@ impl Storage {
             }
         }
         Ok(Self {
+            emergency: super::emergency::Journal::prepare(&data, work)?,
             data: Identity::read(&data)?,
             original,
             candidate: FileIdentity::read(&candidate)?,
@@ -133,6 +136,7 @@ impl Storage {
             let parent = new.join("compile-cache");
             relocate(&parent.join(from), &parent.join(to), id)?;
         }
+        self.emergency.activate(&new, work)?;
         Ok(())
     }
 
@@ -140,6 +144,8 @@ impl Storage {
         self.validate()?;
         let old = root.join("var/lib/sy-spark");
         let new = root.join("var/lib/sparkplane");
+        self.emergency
+            .restore(if new.try_exists()? { &new } else { &old }, work)?;
         if new.try_exists()? {
             for (from, to, id) in self.caches.iter().rev() {
                 let parent = new.join("compile-cache");

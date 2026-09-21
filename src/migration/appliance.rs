@@ -136,6 +136,7 @@ pub fn verify_sources(root: &Path, plan: &Plan) -> Result<()> {
     )?;
     connection.execute_batch("BEGIN")?;
     super::verify_database(&connection)?;
+    super::emergency::validate(&root.join("var/lib/sy-spark"))?;
     ensure!(
         inventory_digest(&connection)? == plan.inventory_sha256,
         "source inventory changed after preflight"
@@ -248,6 +249,7 @@ pub fn preflight(
     )?;
     connection.execute_batch("BEGIN")?;
     super::verify_database(&connection)?;
+    super::emergency::validate(&data)?;
     let inventory_sha256 = inventory_digest(&connection)?;
     let mut statement =
         connection.prepare("SELECT id,repository,commit_sha,metadata_json FROM models")?;

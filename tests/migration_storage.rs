@@ -18,15 +18,51 @@ fn filesystem_cutover_and_recovery_preserve_original_database_and_weights() {
     )
     .unwrap();
     let original = std::fs::read(data.join("state.sqlite3")).unwrap();
+    let emergency = r#"{"schema":"sy.spark.emergency-record/v1","event_id":"01M303PWWXR02FK2H7XN15NV7B","occurred_at_unix_ms":123,"decision":{"schema":"sy.spark.emergency-decision/v1","instance_id":"fixture","generation":8,"cause":"floor","mem_available_bytes":7,"memory_full_psi_avg10_percent":0.0}}"#;
+    std::fs::create_dir(data.join("executor")).unwrap();
+    let journal_path = data.join("executor/emergency.jsonl");
+    std::fs::write(&journal_path, emergency).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    rusqlite::Connection::open(data.join("state.sqlite3")).unwrap().execute("INSERT INTO emergency_records VALUES('01M303PWWXR02FK2H7XN15NV7B','fixture',8,'floor',?1,'fixture')", [emergency]).unwrap();
     let storage = Storage::prepare(root.path(), &work, &[], &[]).unwrap();
     storage.activate(root.path(), &work).unwrap();
     storage.activate(root.path(), &work).unwrap();
+    assert!(
+        std::fs::read_to_string(
+            root.path()
+                .join("var/lib/sparkplane/executor/emergency.jsonl")
+        )
+        .unwrap()
+        .contains("sparkplane.emergency-record/v1")
+    );
+    let current = root.path().join("var/lib/sparkplane");
+    let replay = sparkplane::spark::resources::read_emergency_records(
+        &current.join("executor/emergency.jsonl"),
+    )
+    .unwrap();
+    let actor = sparkplane::spark::state::DbActor::open(
+        current.join("state.sqlite3"),
+        current.join("backups"),
+        8,
+        2,
+        secrecy::SecretString::from("fixture"),
+    )
+    .unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    assert!(
+        !runtime
+            .block_on(actor.import_emergency(replay[0].clone()))
+            .unwrap()
+    );
+    drop(actor);
     assert_eq!(
         std::fs::read(root.path().join("var/lib/sparkplane/huggingface/weights")).unwrap(),
         b"unchanged"
     );
     storage.restore(root.path(), &work).unwrap();
     storage.restore(root.path(), &work).unwrap();
+    assert_eq!(std::fs::read_to_string(journal_path).unwrap(), emergency);
     assert!(
         std::fs::read(data.join("state.sqlite3")).unwrap() == original,
         "original database bytes must survive recovery"

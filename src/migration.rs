@@ -12,6 +12,7 @@ pub mod commands;
 pub mod config;
 pub mod container;
 pub mod docker;
+pub mod emergency;
 pub mod fence;
 pub mod host;
 pub mod journal;

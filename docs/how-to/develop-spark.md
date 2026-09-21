@@ -173,6 +173,11 @@ commit, artifact name, and manifest signature in the release notes. The
 artifact must be the one whose manifest was signed; do not rebuild it after
 signing.
 
+Installation assigns explicit permissions independently of the operator's
+umask. Public release directories are root-owned and traversable by the service
+account; executable and catalog payloads remain read-only. Private credentials,
+state and rollback evidence retain their restricted modes.
+
 ## Install or upgrade Spark
 
 For a new host, use the bootstrap installer. Always inspect the dry run first:

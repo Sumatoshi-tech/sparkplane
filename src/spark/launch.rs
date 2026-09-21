@@ -43,6 +43,7 @@ struct LaunchPlan {
     action: &'static str,
     token_id: Option<String>,
     extra_argument_count: usize,
+    allow_network: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +179,7 @@ pub fn run(host: &str, config_dir: &Path, args: LaunchArgs) -> Result<(), Client
                 action: if reused_instance { "reuse" } else { "serve" },
                 token_id: None,
                 extra_argument_count: args.extra_args.len(),
+                allow_network: args.allow_network,
             },
             args.json,
         );
@@ -251,6 +253,7 @@ pub fn run(host: &str, config_dir: &Path, args: LaunchArgs) -> Result<(), Client
         },
         token_id: Some(token_id),
         extra_argument_count: args.extra_args.len(),
+        allow_network: args.allow_network,
     };
     if args.configure {
         return render_plan(&plan, args.json);
@@ -262,9 +265,15 @@ pub fn run(host: &str, config_dir: &Path, args: LaunchArgs) -> Result<(), Client
         model.canonical,
         instance.name
     );
+    if args.allow_network {
+        eprintln!(
+            "Network access requested for this invocation; filesystem and approval policies are unchanged."
+        );
+    }
     launch_child(
         args.integration,
         args.yes,
+        args.allow_network,
         ReadyLaunch {
             config_dir,
             host,
@@ -277,6 +286,22 @@ pub fn run(host: &str, config_dir: &Path, args: LaunchArgs) -> Result<(), Client
 }
 
 fn validate_args(args: &LaunchArgs) -> Result<(), ClientError> {
+    if args.allow_network && (args.configure || args.restore) {
+        return Err(usage(
+            "--allow-network is invocation-only; it cannot be combined with --config or --restore",
+        ));
+    }
+    if args.allow_network
+        && args.integration == LaunchIntegration::Claude
+        && args
+            .extra_args
+            .iter()
+            .any(|arg| arg == "--settings" || arg.starts_with("--settings="))
+    {
+        return Err(usage(
+            "--allow-network manages Claude --settings; put other settings in your normal Claude settings file, or omit --allow-network and pass the complete --settings yourself",
+        ));
+    }
     if args.restore
         && (args.model.is_some()
             || args.configure
@@ -610,14 +635,35 @@ fn codex_catalog(model: &ModelDocument, context_window: u64) -> Value {
     })
 }
 
+fn configure_network_access(command: &mut Command, integration: LaunchIntegration, allow: bool) {
+    if !allow {
+        return;
+    }
+    match integration {
+        LaunchIntegration::Codex => {
+            command.args(["-c", "sandbox_workspace_write.network_access=true"]);
+        }
+        LaunchIntegration::Claude => {
+            command.args([
+                "--settings",
+                r#"{"sandbox":{"network":{"allowedDomains":["*"]}}}"#,
+            ]);
+        }
+        // OpenCode has no network sandbox; retain its independent tool permissions.
+        LaunchIntegration::Opencode => {}
+    }
+}
+
 fn launch_child(
     integration: LaunchIntegration,
     yes: bool,
+    allow_network: bool,
     launch: ReadyLaunch<'_>,
     extra_args: &[String],
 ) -> Result<(), ClientError> {
     let executable = ensure_executable(integration, yes)?;
     let mut command = Command::new(executable);
+    configure_network_access(&mut command, integration, allow_network);
     command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -739,7 +785,7 @@ fn configure_codex_command(
         .args(extra_args)
         .env("SPARKPLANE_INFERENCE_TOKEN", token.expose())
         .env("OPENAI_API_KEY", token.expose())
-        .env("SSL_CERT_FILE", config.ca_path);
+        .env(&config.ca_env_key, config.ca_path);
     Ok(())
 }
 
@@ -1127,8 +1173,17 @@ fn render_plan(plan: &LaunchPlan, json: bool) -> Result<(), ClientError> {
         );
     } else {
         println!(
-            "{} {} with {} on {} ({})",
-            plan.action, plan.integration, plan.model, plan.instance, plan.host
+            "{} {} with {} on {} ({}; network={})",
+            plan.action,
+            plan.integration,
+            plan.model,
+            plan.instance,
+            plan.host,
+            if plan.allow_network {
+                "requested"
+            } else {
+                "agent-default"
+            }
         );
     }
     Ok(())
@@ -1225,6 +1280,95 @@ mod tests {
             restart_failures: 0,
             restart_suppressed: false,
             quarantine: None,
+        }
+    }
+
+    #[test]
+    fn network_opt_in_only_changes_codex_network_setting() {
+        let mut command = Command::new("codex");
+        configure_network_access(&mut command, LaunchIntegration::Codex, true);
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, ["-c", "sandbox_workspace_write.network_access=true"]);
+    }
+
+    #[test]
+    fn network_opt_in_only_changes_claude_domain_allowlist() {
+        let mut command = Command::new("claude");
+        configure_network_access(&mut command, LaunchIntegration::Claude, true);
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                "--settings",
+                r#"{"sandbox":{"network":{"allowedDomains":["*"]}}}"#
+            ]
+        );
+    }
+
+    #[test]
+    fn default_launch_does_not_override_any_agents_permissions() {
+        for integration in [
+            LaunchIntegration::Codex,
+            LaunchIntegration::Claude,
+            LaunchIntegration::Opencode,
+        ] {
+            let mut command = Command::new(integration.as_str());
+            configure_network_access(&mut command, integration, false);
+            assert_eq!(command.get_args().count(), 0);
+        }
+    }
+
+    #[test]
+    fn opencode_network_opt_in_preserves_existing_tool_permissions() {
+        let mut command = Command::new("opencode");
+        configure_network_access(&mut command, LaunchIntegration::Opencode, true);
+        assert_eq!(command.get_args().count(), 0);
+        assert_eq!(command.get_envs().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Codex 0.155.1+, curl, Linux sandbox support and public HTTPS access"]
+    fn native_codex_network_opt_in_keeps_filesystem_confinement() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let outside = root.path().join("outside-workspace");
+        let codex_config = root.path().join("codex");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&codex_config).unwrap();
+        for allow in [false, true] {
+            let mut command = Command::new("codex");
+            // The diagnostic subcommand reads its own overrides, unlike TUI/exec.
+            command.arg("sandbox");
+            configure_network_access(&mut command, LaunchIntegration::Codex, allow);
+            let output = command.current_dir(&workspace)
+                .env("CODEX_HOME", &codex_config)
+                .env_remove("SSL_CERT_FILE").env_remove("CODEX_CA_CERTIFICATE")
+                .args(["-c", "sandbox_mode=\"workspace-write\"",
+                    "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+                    "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true", "--", "sh", "-c",
+                    "if touch \"$1\" 2>/dev/null; then exit 99; fi; curl --silent --show-error --fail --max-time 15 --output /dev/null --write-out '%{http_code}' https://example.com",
+                    "network-probe"])
+                .arg(&outside).output().unwrap();
+            assert!(
+                !outside.exists(),
+                "network permission must not grant outside writes"
+            );
+            if allow {
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(output.stdout, b"200");
+            } else {
+                assert_eq!(
+                    output.status.code(),
+                    Some(6),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
         }
     }
 
@@ -1351,6 +1495,13 @@ mod tests {
             .get_args()
             .map(|value| value.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
+        assert_eq!(command_env(&command, "SSL_CERT_FILE"), None);
+        assert_eq!(
+            command_env(&command, "CODEX_CA_CERTIFICATE"),
+            Some(Some(
+                root.path().join("spark/dgx.ca.pem").display().to_string()
+            ))
+        );
         assert!(
             arguments
                 .windows(2)
@@ -1499,6 +1650,7 @@ mod tests {
     fn restore_flags_cannot_be_combined() {
         let args = LaunchArgs {
             integration: LaunchIntegration::Codex,
+            allow_network: false,
             model: Some("ornith".into()),
             configure: false,
             restore: true,

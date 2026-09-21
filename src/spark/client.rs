@@ -183,7 +183,7 @@ fn build_codex_config(
         base_url,
         env_key: ENV_KEY.into(),
         wire_api: "responses".into(),
-        ca_env_key: "SSL_CERT_FILE".into(),
+        ca_env_key: "CODEX_CA_CERTIFICATE".into(),
         ca_path: config_dir.join("spark").join(format!("{host}.ca.pem")),
         config_path: "$CODEX_HOME/config.toml (defaults to ~/.codex/config.toml)".into(),
         toml,
@@ -1037,6 +1037,7 @@ mod tests {
         let parsed: toml::Value = toml::from_str(&config.toml).unwrap();
         assert_eq!(parsed["web_search"].as_str(), Some("disabled"));
         assert_eq!(config.base_url, "https://10.1.30.143:9843/openai/ornith/v1");
+        assert_eq!(config.ca_env_key, "CODEX_CA_CERTIFICATE");
     }
 
     #[test]

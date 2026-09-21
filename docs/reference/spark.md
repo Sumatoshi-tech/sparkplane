@@ -37,7 +37,7 @@ sparkplane <host> status --json
 sparkplane <host> doctor --json
 sparkplane <host> qualify --manifest <json> --signature <minisig> (--dry-run | --yes) [--detach] [--json]
 sparkplane <host> serve <model> [--name <instance>] [--detach] [--dry-run] [--json]
-sparkplane <host> launch <codex|claude|opencode> [--model <model>] [--config] [--restore] [-y] [-- <agent-args>...]
+sparkplane <host> launch <codex|claude|opencode> [--model <model>] [--allow-network] [--config] [--restore] [-y] [-- <agent-args>...]
 sparkplane <host> ls [--json]
 sparkplane <host> ps [--json]
 sparkplane <host> logs <instance> [--limit N]
@@ -252,6 +252,53 @@ bearer is held separately in a mode-0600 credential file. The child receives an
 inference-only token and pinned CA, never the administrator credential. Claude
 uses the native Anthropic route, Codex uses a Sparkplane-owned Responses profile and
 catalog, and OpenCode uses process-local `OPENCODE_CONFIG_CONTENT`.
+
+### Internet access for development
+
+Use `--allow-network` (or `SPARKPLANE_LAUNCH_ALLOW_NETWORK=true`) when the
+agent needs to download dependencies, fetch documentation or use remote APIs:
+
+```bash
+sparkplane dgx-spark launch codex --allow-network
+sparkplane dgx-spark launch claude --allow-network
+```
+
+The grant applies only to this invocation. It is not saved in launch state or
+agent configuration, and cannot be combined with `--config` or `--restore`.
+`--dry-run --json` reports the requested `allow_network` value without changing
+anything. Without the flag, the agent's existing permissions remain unchanged;
+Sparkplane does not impose its own workstation sandbox.
+
+| Agent | Effect of `--allow-network` |
+| --- | --- |
+| Codex | Sets `sandbox_workspace_write.network_access=true`. Filesystem sandbox mode and approval policy are unchanged. |
+| Claude Code | Passes session-only `sandbox.network.allowedDomains=["*"]` through `--settings`. Filesystem restrictions and explicit domain denials remain in force. |
+| OpenCode | No extra permission override: OpenCode already has direct network access. Existing shell, web-fetch and other tool approval rules remain in force. |
+
+For Codex, the network setting applies to `workspace-write` sessions. If the
+workspace is not trusted or Codex is configured read-only, explicitly select
+the development sandbox with `-- --sandbox workspace-write`. Named permission
+profiles, managed organization restrictions and explicit forwarded overrides
+can impose different policies; this flag does not bypass them. It does not
+enable the hosted Responses web-search tool, which the model gateway does not
+provide. Commands such as `curl`, package managers and Git can use the network.
+
+Do not combine Claude's forwarded `--settings` with `--allow-network`: the
+launcher rejects that ambiguous combination before contacting the appliance.
+Use normal Claude settings files for other settings, or omit the flag and pass
+your complete session settings yourself.
+
+Codex receives its pinned Spark CA through `CODEX_CA_CERTIFICATE`, not a
+launcher-supplied `SSL_CERT_FILE`. This keeps private inference TLS verification
+separate from the public/system CA trust used by development subprocesses.
+Existing user-supplied certificate and proxy settings are not erased.
+
+Internet access lets subprocesses transmit data they can read; opt in only for
+trusted work. This option changes neither the inference-token scope nor the
+appliance's private engine networking. Agent controls are documented in the
+[Codex sandbox configuration](https://developers.openai.com/codex/security),
+[Claude sandbox guide](https://code.claude.com/docs/en/sandboxing), and
+[OpenCode permissions reference](https://opencode.ai/docs/permissions/).
 
 ## Examples
 

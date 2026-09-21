@@ -1,6 +1,62 @@
 use std::process::Command;
 
 #[test]
+fn launch_help_exposes_opt_in_network_access() {
+    let output = Command::new(env!("CARGO_BIN_EXE_sparkplane"))
+        .args(["dgx-spark", "launch", "codex", "--help"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--allow-network"));
+}
+
+#[test]
+fn network_opt_in_rejects_shadowing_claude_settings_before_contacting_spark() {
+    let root = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sparkplane"))
+        .env_clear()
+        .env("SPARKPLANE_CONFIG_DIR", root.path())
+        .args([
+            "dgx-spark",
+            "launch",
+            "claude",
+            "--allow-network",
+            "--",
+            "--settings",
+            "{}",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--allow-network manages Claude --settings")
+    );
+}
+
+#[test]
+fn network_grants_cannot_be_saved_or_combined_with_restore() {
+    for mode in ["--config", "--restore"] {
+        for flag in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_sparkplane"));
+            command
+                .env_clear()
+                .env("SPARKPLANE_CONFIG_DIR", root.path())
+                .args(["dgx-spark", "launch", "codex", mode]);
+            if flag {
+                command.arg("--allow-network");
+            } else {
+                command.env("SPARKPLANE_LAUNCH_ALLOW_NETWORK", "true");
+            }
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), Some(2));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("--allow-network"));
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        }
+    }
+}
+
+#[test]
 fn bridge_protocol_is_available_without_a_host_or_configuration() {
     let output = Command::new(env!("CARGO_BIN_EXE_sparkplane"))
         .arg("--bridge-protocol")

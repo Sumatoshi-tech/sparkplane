@@ -458,6 +458,19 @@ fn running_instances_still_require_the_exact_engine_fingerprint() {
 }
 
 #[test]
+fn stopped_suppression_is_preserved_without_reactivating_the_instance() {
+    let fixture = fixture_with_instance(true);
+    let source = fixture.root.path().join("var/lib/sy-spark/state.sqlite3");
+    let db = rusqlite::Connection::open(&source).unwrap();
+    db.execute("UPDATE instances SET desired_state='stopped', observed_state='absent', metadata_json=json_set(metadata_json,'$.desired','stopped','$.observed','absent','$.healthy',json('false'),'$.restart_suppressed',json('true'))", []).unwrap();
+    appliance::preflight(fixture.root.path(), &fixture.release, &[], u64::MAX).unwrap();
+    let destination = fixture.root.path().join("suppressed.sqlite3");
+    sparkplane::migration::stage_database(&source, &destination, &[]).unwrap();
+    let saved: (String, bool) = rusqlite::Connection::open(destination).unwrap().query_row("SELECT desired_state,json_extract(metadata_json,'$.restart_suppressed') FROM instances", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    assert_eq!(saved, ("stopped".into(), true));
+}
+
+#[test]
 fn snapshot_retains_stopped_history_without_a_current_engine_policy() {
     let fixture = fixture_with_instance(true);
     let source = fixture.root.path().join("var/lib/sy-spark/state.sqlite3");

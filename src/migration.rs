@@ -220,7 +220,8 @@ fn transform_state(connection: &mut Connection, engines: &[EnginePolicy]) -> Res
             "unsupported or inconsistent legacy instance"
         );
         ensure!(
-            !instance.restart_suppressed && instance.quarantine.is_none(),
+            instance.desired != crate::spark::wire::InstanceDesiredState::Running
+                || (!instance.restart_suppressed && instance.quarantine.is_none()),
             "resolve suppressed/quarantined instance {} before migration",
             instance.name
         );

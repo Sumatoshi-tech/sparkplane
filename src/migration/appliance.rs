@@ -297,8 +297,8 @@ pub fn preflight(
                 && instance.name == name
                 && Some(instance.generation) == u64::try_from(generation).ok()
                 && serde_json::to_value(instance.desired)? == desired
-                && !instance.restart_suppressed
-                && instance.quarantine.is_none(),
+                && (instance.desired != InstanceDesiredState::Running
+                    || (!instance.restart_suppressed && instance.quarantine.is_none())),
             "legacy instance is inconsistent or suppressed"
         );
         ensure!(

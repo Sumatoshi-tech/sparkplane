@@ -18,6 +18,7 @@ pub mod host;
 pub mod journal;
 pub mod publication;
 pub mod qualification;
+pub mod recovery;
 pub mod release;
 pub mod relocation;
 pub mod runner;

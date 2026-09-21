@@ -540,6 +540,11 @@ catalogs or the CLI.
 
 ## Release checklist
 
+The agent's initial reconciliation can wait for the engine's 1800-second cold
+start. Its notify service therefore allows 1900 seconds for startup; do not
+restore systemd's shorter default or restart the service while weights load.
+Readiness remains gated on semantic engine health, not merely a running process.
+
 Before tagging:
 
 - catalog boundary tests pass and every engine/model entry validates;

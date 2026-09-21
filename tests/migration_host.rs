@@ -121,6 +121,69 @@ struct Fixture {
     release: Release,
 }
 
+#[test]
+fn approved_replacement_changes_only_the_in_memory_recovery_generation() {
+    let mut f = fixture_with_instance(true);
+    let original = serde_json::to_vec(&f.host.record).unwrap();
+    let mut replacement = f.host.record.plan.active[0].container.clone();
+    replacement.generation += 1;
+    replacement.container_id = "e".repeat(64);
+    let approval: sparkplane::migration::recovery::Approval = serde_json::from_value(serde_json::json!({"schema":"sparkplane.recovery-approval/v1", "host":f.host.record.plan.host, "record_sha256":"b".repeat(64), "executable_sha256":"c".repeat(64), "expires_at_unix_seconds":200, "replacements":[replacement]})).unwrap();
+    approval
+        .apply(
+            &mut f.host.record.plan,
+            &[inspect(&replacement, Namespace::Legacy)],
+        )
+        .unwrap();
+    assert_eq!(
+        f.host.record.plan.active[0].before.generation,
+        replacement.generation
+    );
+    let original: Record = serde_json::from_slice(&original).unwrap();
+    assert_eq!(
+        original.plan.active[0].before.generation + 1,
+        replacement.generation
+    );
+}
+
+#[test]
+fn replacement_rejects_identity_drift_without_changing_the_plan() {
+    let mut f = fixture_with_instance(true);
+    let original = serde_json::to_vec(&f.host.record.plan).unwrap();
+    let mut exact = f.host.record.plan.active[0].container.clone();
+    exact.generation += 1;
+    exact.container_id = "e".repeat(64);
+    for field in [
+        "instance_id",
+        "generation",
+        "image_digest",
+        "engine_id",
+        "engine_fingerprint",
+        "artifact_fingerprint",
+        "model_repository",
+        "model_commit",
+        "container_id",
+    ] {
+        let mut replacement = serde_json::to_value(&exact).unwrap();
+        replacement[field] = if field == "generation" {
+            0.into()
+        } else {
+            "different".into()
+        };
+        let approval: sparkplane::migration::recovery::Approval = serde_json::from_value(serde_json::json!({"schema":"sparkplane.recovery-approval/v1", "host":f.host.record.plan.host, "record_sha256":"b".repeat(64), "executable_sha256":"c".repeat(64), "expires_at_unix_seconds":200, "replacements":[replacement]})).unwrap();
+        assert!(
+            approval
+                .apply(
+                    &mut f.host.record.plan,
+                    &[inspect(&exact, Namespace::Legacy)]
+                )
+                .is_err(),
+            "{field}"
+        );
+        assert_eq!(serde_json::to_vec(&f.host.record.plan).unwrap(), original);
+    }
+}
+
 fn legacy(text: &str) -> String {
     text.replace("sparkplane.engine/", "sy.spark.engine/")
         .replace("sparkplane.models/", "sy.spark.models/")

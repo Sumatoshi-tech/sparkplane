@@ -408,6 +408,83 @@ fn populate(root: &Path) -> Vec<serde_json::Value> {
 }
 
 #[test]
+fn preflight_preserves_stopped_historical_engine_settings() {
+    let fixture = fixture_with_instance(true);
+    let db = rusqlite::Connection::open(fixture.root.path().join("var/lib/sy-spark/state.sqlite3"))
+        .unwrap();
+    db.execute("UPDATE instances SET desired_state='stopped', observed_state='absent', metadata_json=json_set(metadata_json,'$.desired','stopped','$.observed','absent','$.healthy',json('false'),'$.engine_fingerprint',?1,'$.context_window',8192)", [format!("sha256:{}", "e".repeat(64))]).unwrap();
+    let plan = appliance::preflight(fixture.root.path(), &fixture.release, &[], u64::MAX).unwrap();
+    assert!(plan.active.is_empty() && plan.cache_keys.is_empty());
+}
+
+#[test]
+fn preflight_accepts_retired_policies_only_for_stopped_history() {
+    let fixture = fixture_with_instance(true);
+    let db = rusqlite::Connection::open(fixture.root.path().join("var/lib/sy-spark/state.sqlite3"))
+        .unwrap();
+    db.execute(
+        "UPDATE instances SET metadata_json=json_set(metadata_json,'$.engine_id','retired-policy')",
+        [],
+    )
+    .unwrap();
+    assert!(appliance::preflight(fixture.root.path(), &fixture.release, &[], u64::MAX).is_err());
+    db.execute("UPDATE instances SET desired_state='stopped', observed_state='absent', metadata_json=json_set(metadata_json,'$.desired','stopped','$.observed','absent','$.healthy',json('false'))", []).unwrap();
+    assert!(appliance::preflight(fixture.root.path(), &fixture.release, &[], u64::MAX).is_ok());
+}
+
+#[test]
+fn running_instances_still_require_the_exact_engine_fingerprint() {
+    let fixture = fixture_with_instance(true);
+    let db = rusqlite::Connection::open(fixture.root.path().join("var/lib/sy-spark/state.sqlite3"))
+        .unwrap();
+    db.execute(
+        "UPDATE instances SET metadata_json=json_set(metadata_json,'$.engine_fingerprint',?1)",
+        [format!("sha256:{}", "e".repeat(64))],
+    )
+    .unwrap();
+    let error = appliance::preflight(
+        fixture.root.path(),
+        &fixture.release,
+        &fixture.host.platform.old,
+        u64::MAX,
+    )
+    .err()
+    .unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("legacy engine fingerprint differs")
+    );
+}
+
+#[test]
+fn stopped_suppression_is_preserved_without_reactivating_the_instance() {
+    let fixture = fixture_with_instance(true);
+    let source = fixture.root.path().join("var/lib/sy-spark/state.sqlite3");
+    let db = rusqlite::Connection::open(&source).unwrap();
+    db.execute("UPDATE instances SET desired_state='stopped', observed_state='absent', metadata_json=json_set(metadata_json,'$.desired','stopped','$.observed','absent','$.healthy',json('false'),'$.restart_suppressed',json('true'))", []).unwrap();
+    appliance::preflight(fixture.root.path(), &fixture.release, &[], u64::MAX).unwrap();
+    let destination = fixture.root.path().join("suppressed.sqlite3");
+    sparkplane::migration::stage_database(&source, &destination, &[]).unwrap();
+    let saved: (String, bool) = rusqlite::Connection::open(destination).unwrap().query_row("SELECT desired_state,json_extract(metadata_json,'$.restart_suppressed') FROM instances", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    assert_eq!(saved, ("stopped".into(), true));
+}
+
+#[test]
+fn snapshot_retains_stopped_history_without_a_current_engine_policy() {
+    let fixture = fixture_with_instance(true);
+    let source = fixture.root.path().join("var/lib/sy-spark/state.sqlite3");
+    let db = rusqlite::Connection::open(&source).unwrap();
+    let historical = format!("sha256:{}", "e".repeat(64));
+    db.execute("UPDATE instances SET desired_state='stopped', observed_state='absent', metadata_json=json_set(metadata_json,'$.desired','stopped','$.observed','absent','$.healthy',json('false'),'$.engine_fingerprint',?1,'$.context_window',8192)", [&historical]).unwrap();
+    let destination = fixture.root.path().join("history.sqlite3");
+    sparkplane::migration::stage_database(&source, &destination, &[]).unwrap();
+    let snapshot = rusqlite::Connection::open(destination).unwrap();
+    let preserved: (String, i64) = snapshot.query_row("SELECT json_extract(metadata_json,'$.engine_fingerprint'), json_extract(metadata_json,'$.context_window') FROM instances", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    assert_eq!(preserved, (historical, 8192));
+}
+
+#[test]
 fn running_model_cutover_preserves_generation_context_image_and_warm_cache_inode() {
     use std::os::unix::fs::MetadataExt;
     let mut fixture = fixture_with_instance(true);

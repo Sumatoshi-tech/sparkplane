@@ -220,24 +220,27 @@ fn transform_state(connection: &mut Connection, engines: &[EnginePolicy]) -> Res
             "unsupported or inconsistent legacy instance"
         );
         ensure!(
-            !instance.restart_suppressed && instance.quarantine.is_none(),
+            instance.desired != crate::spark::wire::InstanceDesiredState::Running
+                || (!instance.restart_suppressed && instance.quarantine.is_none()),
             "resolve suppressed/quarantined instance {} before migration",
             instance.name
         );
         instance.schema = crate::spark::wire::INSTANCE_SCHEMA.into();
         migrate_artifacts(&mut instance.artifacts)?;
-        let engine = engines
-            .iter()
-            .find(|engine| engine.config().id == instance.engine_id)
-            .context("signed release does not contain the instance engine")?;
-        let profile = engine
-            .profile_for(None, &instance.artifacts)
-            .map_err(anyhow::Error::msg)?;
-        ensure!(
-            profile.context_window == instance.context_window,
-            "migration must preserve instance context window"
-        );
-        instance.engine_fingerprint = engine.fingerprint().into();
+        if instance.desired == crate::spark::wire::InstanceDesiredState::Running {
+            let engine = engines
+                .iter()
+                .find(|engine| engine.config().id == instance.engine_id)
+                .context("signed release does not contain the instance engine")?;
+            let profile = engine
+                .profile_for(None, &instance.artifacts)
+                .map_err(anyhow::Error::msg)?;
+            ensure!(
+                profile.context_window == instance.context_window,
+                "migration must preserve instance context window"
+            );
+            instance.engine_fingerprint = engine.fingerprint().into();
+        }
         instance.artifact_fingerprint =
             crate::spark::wire::artifact_fingerprint(&instance.artifacts)
                 .map_err(anyhow::Error::msg)?;

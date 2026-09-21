@@ -68,7 +68,7 @@ the cross linker):
 
 ```bash
 rustup target add aarch64-unknown-linux-gnu
-cargo install cargo-auditable cargo-zigbuild minisign
+cargo install cargo-auditable cargo-zigbuild
 python3 -m pip install --user ziglang==0.16.0
 ```
 
@@ -83,6 +83,10 @@ cargo zigbuild --release \
 CI uses `cargo auditable zigbuild` so the resulting binary carries its Rust
 dependency inventory. Use the `appliance` feature for the ARM64 service binary
 and the default feature set for workstation clients.
+
+Install the [Minisign executable](https://jedisct1.github.io/minisign/) separately
+for signing and the encrypted-key release tests; the Rust `minisign` crate is a
+library, not that executable.
 
 The Rust toolchain is pinned by `rust-toolchain.toml`. Zig is a separate
 requirement of [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild#installation);

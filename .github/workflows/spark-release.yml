@@ -16,7 +16,7 @@ jobs:
           components: clippy,rustfmt
       - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
         with:
-          tool: cargo-deny
+          tool: cargo-deny,minisign@0.12
       - run: cargo deny --no-default-features --features appliance check
       - run: make lint-spark
       - run: make test
@@ -67,6 +67,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: sparkplane-*
@@ -74,7 +75,7 @@ jobs:
           path: release
       - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
         with:
-          tool: minisign
+          tool: minisign@0.12
       - name: Sign and publish
         env:
           SPARKPLANE_MINISIGN_SECRET_KEY: ${{ secrets.SPARKPLANE_MINISIGN_SECRET_KEY }}
@@ -83,14 +84,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$SPARKPLANE_MINISIGN_SECRET_KEY"
-          keydir=$(mktemp -d)
-          trap 'rm -f "$keydir/release.key"; rmdir "$keydir"' EXIT
-          umask 077
-          printf '%s' "$SPARKPLANE_MINISIGN_SECRET_KEY" > "$keydir/release.key"
-          minisign -Sm release/appliance/SHA256SUMS -s "$keydir/release.key"
-          tar -C release/appliance -czf release/sparkplane-appliance-aarch64.tar.gz .
+          bash scripts/sign-spark-release.sh release
           cd release
-          sha256sum sparkplane-* > SHA256SUMS
-          minisign -Sm SHA256SUMS -s "$keydir/release.key"
-          gh release create "$GITHUB_REF_NAME" sparkplane-* SHA256SUMS SHA256SUMS.minisig --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+          gh release create "$GITHUB_REF_NAME" sparkplane-* SHA256SUMS SHA256SUMS.minisig minisign.pub --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes

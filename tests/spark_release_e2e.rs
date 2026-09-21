@@ -2,7 +2,8 @@ use std::{fs, path::Path};
 
 #[test]
 fn spark_release_inventory_and_policy_are_repository_owned() {
-    let workflow = fs::read_to_string(".github/workflows/spark-release.yml").unwrap();
+    let workflow = fs::read_to_string(".github/workflows/spark-release.yml").unwrap()
+        + &fs::read_to_string("scripts/sign-spark-release.sh").unwrap();
     let policy = fs::read_to_string("deny.toml").unwrap();
     for required in [
         "cargo deny --no-default-features --features appliance check",

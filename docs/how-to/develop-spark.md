@@ -68,7 +68,7 @@ the cross linker):
 
 ```bash
 rustup target add aarch64-unknown-linux-gnu
-cargo install cargo-auditable cargo-zigbuild minisign
+cargo install cargo-auditable cargo-zigbuild
 python3 -m pip install --user ziglang==0.16.0
 ```
 
@@ -83,6 +83,10 @@ cargo zigbuild --release \
 CI uses `cargo auditable zigbuild` so the resulting binary carries its Rust
 dependency inventory. Use the `appliance` feature for the ARM64 service binary
 and the default feature set for workstation clients.
+
+Install the [Minisign executable](https://jedisct1.github.io/minisign/) separately
+for signing and the encrypted-key release tests; the Rust `minisign` crate is a
+library, not that executable.
 
 The Rust toolchain is pinned by `rust-toolchain.toml`. Zig is a separate
 requirement of [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild#installation);
@@ -117,6 +121,30 @@ commit them, place them in the bundle, or print them in a log. The public key
 is pinned in the operator's local Spark configuration. A manually dispatched
 workflow builds and uploads an artifact but deliberately does not sign it;
 only a `v*` tag invokes the CI signing step.
+
+### Provision the release authority
+
+Generate the dedicated encrypted key in your own terminal. Store its password
+in your password manager; do not send it in chat or put it in a command argument.
+The commands below do not overwrite an existing key pair:
+
+```bash
+sparkplane_signing_dir="${XDG_CONFIG_HOME:-$HOME/.config}/sparkplane-release-signing"
+install -d -m 700 "$sparkplane_signing_dir"
+minisign -G -p "$sparkplane_signing_dir/release.pub" \
+  -s "$sparkplane_signing_dir/release.key"
+gh secret set SPARKPLANE_MINISIGN_SECRET_KEY \
+  --repo Sumatoshi-tech/sparkplane --env release < "$sparkplane_signing_dir/release.key"
+gh secret set SPARKPLANE_MINISIGN_PASSWORD \
+  --repo Sumatoshi-tech/sparkplane --env release
+```
+
+The last command prompts for the same password interactively. Back up the key
+securely and distribute the public key through your established trust channel.
+The protected `release` environment must already exist with maintainer review
+and `v*` tag-only deployment rules. Neither PR checks nor unsigned build jobs
+receive these secrets. Never replace an installed authority merely because a
+new public key accompanies a download.
 
 ## CI/CD lifecycle
 

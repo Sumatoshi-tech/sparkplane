@@ -6,6 +6,99 @@ use crate::spark::{
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, backup::Backup};
 use std::{fs, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
+pub mod config;
+pub mod container;
+pub mod journal;
+pub mod relocation;
+
+pub fn snapshot_path(snapshot: &str, repository: &str, commit: &str) -> Result<String> {
+    crate::spark::model::Repository::parse(repository)?;
+    crate::spark::model::CommitSha::parse(commit)?;
+    let relative = format!(
+        "models--{}/snapshots/{commit}",
+        repository.replace('/', "--")
+    );
+    if snapshot == relative {
+        return Ok(relative);
+    }
+    ensure!(
+        snapshot == format!("/var/lib/sy-spark/huggingface/{relative}"),
+        "legacy snapshot does not match its immutable model identity"
+    );
+    Ok(format!("/var/lib/sparkplane/huggingface/{relative}"))
+}
+
+/// Cache move keys use the executor's identity algorithm, not a second implementation.
+pub fn cache_keys(
+    policy: &EnginePolicy,
+    repository: &str,
+    commit: &str,
+    profile: &str,
+    legacy_artifact: &str,
+    current_artifact: &str,
+) -> Result<(String, String)> {
+    crate::spark::model::Repository::parse(repository)?;
+    crate::spark::model::CommitSha::parse(commit)?;
+    ensure!(
+        policy.config().profiles.iter().any(|p| p.id == profile),
+        "unknown cache engine profile"
+    );
+    ensure!(
+        [legacy_artifact, current_artifact].iter().all(|s| s
+            .strip_prefix("sha256:")
+            .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))),
+        "invalid cache artifact fingerprint"
+    );
+    let key = |schema, artifact| {
+        crate::spark::engine::compile_cache_key(
+            policy.config(),
+            schema,
+            repository,
+            commit,
+            profile,
+            artifact,
+        )
+    };
+    Ok((
+        key("sy.spark.compile-cache-identity/v1", legacy_artifact),
+        key("sparkplane.compile-cache-identity/v1", current_artifact),
+    ))
+}
+/// Reject any runtime change while allowing the five owned namespace fields.
+pub fn verify_engine_transition(legacy: &str, current: &str) -> Result<()> {
+    let mut old: toml::Value = toml::from_str(legacy)?;
+    let new: toml::Value = toml::from_str(current)?;
+    for (key, from, to) in [
+        ("schema", "sy.spark.engine/v3", "sparkplane.engine/v3"),
+        (
+            "model_cache_root",
+            "/var/lib/sy-spark/huggingface",
+            "/var/lib/sparkplane/huggingface",
+        ),
+        (
+            "compile_cache_root",
+            "/var/lib/sy-spark/compile-cache",
+            "/var/lib/sparkplane/compile-cache",
+        ),
+        ("network", "sy-spark-internal", "sparkplane-internal"),
+    ] {
+        ensure!(
+            old.get(key).and_then(toml::Value::as_str) == Some(from),
+            "unexpected legacy engine {key}"
+        );
+        old[key] = to.into();
+    }
+    if let Some(repository) = old
+        .get("image_repository")
+        .and_then(toml::Value::as_str)
+        .and_then(|s| s.strip_prefix("sy-spark/"))
+    {
+        old["image_repository"] = format!("sparkplane/{repository}").into();
+    }
+    ensure!(old == new, "migration changes engine runtime settings");
+    EnginePolicy::parse(current).map_err(anyhow::Error::msg)?;
+    Ok(())
+}
 
 /// Prepare an independent, integrity-checked snapshot. Never modifies the source.
 /// Engine declarations must have been verified against the new signed release first.
@@ -15,42 +108,59 @@ pub fn stage_database(source: &Path, destination: &Path, engines: &[EnginePolicy
         "migration destination already exists"
     );
     let original = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let version: u32 = original.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    ensure!(
-        version == crate::spark::state::STATE_SCHEMA_VERSION,
-        "unsupported migration source schema {version}"
-    );
-    ensure!(
-        original.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))? == "ok",
-        "source database is corrupt"
-    );
-    let active: i64 = original.query_row(
-        "SELECT COUNT(*) FROM operations WHERE state NOT IN ('succeeded','failed','cancelled')",
-        [],
-        |row| row.get(0),
-    )?;
-    ensure!(active == 0, "drain active operations before migration");
+    verify_database(&original)?;
+    let parent = destination
+        .parent()
+        .context("database destination has no parent")?;
+    let stage = tempfile::Builder::new()
+        .prefix(".sparkplane-state-")
+        .tempdir_in(parent)?;
+    let staged_path = stage.path().join("state.sqlite3");
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(destination)?;
-    let mut staged = Connection::open(destination)?;
+        .open(&staged_path)?;
+    let mut staged = Connection::open(&staged_path)?;
     Backup::new(&original, &mut staged)?.run_to_completion(32, Duration::from_millis(10), None)?;
-    ensure!(
-        staged.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))? == "ok",
-        "migration backup verification failed"
-    );
+    // Recheck the actual WAL-inclusive snapshot, not just the earlier source view.
+    verify_database(&staged)?;
     transform_state(&mut staged, engines)?;
     staged.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
     drop(staged);
-    fs::File::open(destination)?.sync_all()?;
+    fs::File::open(&staged_path)?.sync_all()?;
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        &staged_path,
+        rustix::fs::CWD,
+        destination,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )?;
     fs::File::open(
         destination
             .parent()
             .context("database destination has no parent")?,
     )?
     .sync_all()?;
+    Ok(())
+}
+
+fn verify_database(connection: &Connection) -> Result<()> {
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    ensure!(
+        version == crate::spark::state::STATE_SCHEMA_VERSION,
+        "unsupported migration source schema {version}"
+    );
+    ensure!(
+        connection.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))? == "ok",
+        "migration database is corrupt"
+    );
+    let active: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM operations WHERE state NOT IN ('succeeded','failed','cancelled')",
+        [],
+        |row| row.get(0),
+    )?;
+    ensure!(active == 0, "drain active operations before migration");
     Ok(())
 }
 
@@ -76,12 +186,7 @@ fn transform_state(connection: &mut Connection, engines: &[EnginePolicy]) -> Res
         if let Some(artifacts) = &mut model.artifacts {
             migrate_artifacts(artifacts)?;
         }
-        if let Some(relative) = model
-            .snapshot
-            .strip_prefix("/var/lib/sy-spark/huggingface/")
-        {
-            model.snapshot = format!("/var/lib/sparkplane/huggingface/{relative}");
-        }
+        model.snapshot = snapshot_path(&model.snapshot, &model.repository, &model.commit)?;
         // Canonical model/checkpoint identities are content identities, not schema names.
         transaction.execute(
             "UPDATE models SET metadata_json=?2 WHERE id=?1",

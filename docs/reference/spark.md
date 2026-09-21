@@ -238,7 +238,11 @@ instance is re-served under that same managed name. Without `--model`, the saved
 host/integration selection is reused; an interactive terminal can select from
 installed models. `--config` writes only launch-owned state/config and exits.
 `--dry-run` performs no local or remote mutation. `--json` is valid with either
-of those non-agent modes. `--restore` removes only Sparkplane-owned Codex
+of those non-agent modes. Generated files have a private digest-based ownership
+receipt. Launch and restore verify both files before changing either; a user edit,
+symlink or unowned destination is a conflict, not permission to overwrite it.
+Move a conflicting file to your own backup location before regenerating it.
+Interrupted publication can be retried safely. `--restore` removes only Sparkplane-owned Codex
 profile/catalog files. `-y` permits the fixed Claude or OpenCode installer when
 the executable is absent. Only arguments after `--` are forwarded, without a
 shell.

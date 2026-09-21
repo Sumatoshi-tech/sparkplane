@@ -129,6 +129,15 @@ impl Journal {
         self.state.pending
     }
 
+    /// A signed replacement may only affect health checks after state restoration.
+    pub fn restored_checkpoint(&self) -> bool {
+        !self.poisoned
+            && !self.state.committed
+            && self.state.rolling_back
+            && self.state.pending.is_none()
+            && self.state.completed.len() <= 3
+    }
+
     pub fn committed(&self) -> Result<bool> {
         self.require_durable()?;
         Ok(self.state.committed)

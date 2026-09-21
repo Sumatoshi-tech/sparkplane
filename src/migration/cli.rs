@@ -38,6 +38,16 @@ pub struct MigrationArgs {
     /// Restore an interrupted pre-commit transaction; never restores after commit.
     #[arg(long, env = "SPARKPLANE_MIGRATION_RECOVER")]
     pub recover: bool,
+    /// Installed-authority-signed approval of an exact post-restoration recovery handoff.
+    #[arg(long, env = "SPARKPLANE_RECOVERY_APPROVAL", requires_all = ["recover", "recovery_signature"])]
+    pub recovery_approval: Option<PathBuf>,
+    /// Detached signature of --recovery-approval; never authorizes a forward migration.
+    #[arg(
+        long,
+        env = "SPARKPLANE_RECOVERY_SIGNATURE",
+        requires = "recovery_approval"
+    )]
+    pub recovery_signature: Option<PathBuf>,
     /// Finish opening traffic after a committed transaction; never reapplies state.
     #[arg(long, env = "SPARKPLANE_MIGRATION_RESUME")]
     pub resume: bool,
@@ -96,6 +106,51 @@ fn self_digest() -> Result<String> {
     )?))
 }
 
+fn recovery_approval(
+    args: &MigrationArgs,
+    record: &[u8],
+    host: &str,
+    executable: &str,
+) -> Result<Option<(super::recovery::Approval, Vec<u8>, String)>> {
+    let Some(path) = &args.recovery_approval else {
+        return Ok(None);
+    };
+    ensure!(args.recover && !args.resume, "handoff is recovery-only");
+    let bytes = super::release::read(path, 65536)?;
+    let signature = String::from_utf8(super::release::read(
+        args.recovery_signature
+            .as_ref()
+            .context("recovery signature required")?,
+        4096,
+    )?)?;
+    let approval = super::recovery::Approval::verify(
+        &bytes,
+        &signature,
+        &old_authority()?,
+        [host, &appliance::digest(record), executable],
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+    )?;
+    Ok(Some((approval, bytes, signature)))
+}
+
+fn receipt(work: &Path, bytes: &[u8], signature: &[u8]) -> Result<()> {
+    for (suffix, value) in [("json", bytes), ("minisig", signature)] {
+        let path = work.join(format!(
+            "recovery-approval-{}.{suffix}",
+            appliance::digest(bytes)
+        ));
+        if path.try_exists()? {
+            ensure!(
+                super::release::read(&path, 65536)? == value,
+                "recovery receipt changed"
+            );
+        } else {
+            write_private(&path, value)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn dispatch(host: &str, args: MigrationArgs) -> Result<()> {
     ensure!(
         host == "bootstrap",
@@ -119,17 +174,28 @@ pub fn dispatch(host: &str, args: MigrationArgs) -> Result<()> {
         private_directory(base)?;
         let _lock = lock(base)?;
         private_directory(&work)?;
-        let record: Record = serde_json::from_slice(&super::release::read(
-            &work.join("record.json"),
-            8 * 1024 * 1024,
-        )?)?;
+        let record_bytes = super::release::read(&work.join("record.json"), 8 * 1024 * 1024)?;
+        let mut record: Record = serde_json::from_slice(&record_bytes)?;
+        let executable = self_digest()?;
         ensure!(
             record.plan.schema == "sparkplane.appliance-migration/v1"
-                && record.plan.host == appliance::host_identity(root)?
-                && record.plan.executable == self_digest()?,
-            "recovery requires the original approved executable and host"
+                && record.plan.host == appliance::host_identity(root)?,
+            "recovery requires the original approved host and schema"
+        );
+        let approval = recovery_approval(&args, &record_bytes, &record.plan.host, &executable)?;
+        ensure!(
+            approval.is_some() || record.plan.executable == executable,
+            "recovery requires the original executable or signed handoff"
         );
         let mut journal = Journal::open(&work, &record.plan.host, &record.plan.release)?;
+        if let Some((approval, bytes, signature)) = approval {
+            ensure!(
+                journal.restored_checkpoint(),
+                "recovery handoff requires restored pre-commit state"
+            );
+            approval.apply(&mut record.plan, &platform.inventory(Namespace::Legacy)?)?;
+            receipt(&work, &bytes, signature.as_bytes())?;
+        }
         let mut appliance = Host {
             root: root.into(),
             work: work.clone(),

@@ -1085,6 +1085,16 @@ fn write_release_payload(
 ) -> Result<(), InstallError> {
     std::fs::create_dir_all(stage.join("configs/sparkplane/engines"))
         .map_err(|error| configuration_error(format!("create release payload: {error}")))?;
+    for relative in [
+        "",
+        "configs",
+        "configs/sparkplane",
+        "configs/sparkplane/engines",
+    ] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(stage.join(relative), std::fs::Permissions::from_mode(0o755))
+            .map_err(|error| configuration_error(format!("chmod release directory: {error}")))?;
+    }
     for (relative, bytes) in release_payload_files(bundle) {
         let mode = if relative == "sparkplane" {
             0o555
@@ -2363,6 +2373,36 @@ fn restart_control_plane() -> Result<(), InstallError> {
 }
 
 #[cfg(feature = "appliance")]
+fn public_code_permissions(root: &Path) -> Result<(), InstallError> {
+    use std::os::unix::fs::PermissionsExt;
+    if !std::fs::symlink_metadata(root).is_ok_and(|meta| meta.is_dir()) {
+        return Err(configuration_error(
+            "public code root must be a real directory",
+        ));
+    }
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry =
+            entry.map_err(|error| configuration_error(format!("inspect public code: {error}")))?;
+        if entry.file_type().is_dir() || entry.file_type().is_file() {
+            let metadata = entry
+                .metadata()
+                .map_err(|error| configuration_error(format!("stat public code: {error}")))?;
+            let mode = if entry.file_type().is_dir() || metadata.permissions().mode() & 0o111 != 0 {
+                0o755
+            } else {
+                (metadata.permissions().mode() & 0o700) | 0o044
+            };
+            std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(mode))
+                .map_err(|error| configuration_error(format!("chmod public code: {error}")))?;
+            File::open(entry.path())
+                .and_then(|file| file.sync_all())
+                .map_err(|error| configuration_error(format!("sync public code: {error}")))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "appliance")]
 pub(crate) fn ensure_http_fallback() -> Result<(), InstallError> {
     use std::os::unix::fs::symlink;
 
@@ -2399,6 +2439,7 @@ pub(crate) fn ensure_http_fallback() -> Result<(), InstallError> {
             ));
         }
     }
+    public_code_permissions(&release)?;
     let current = root.join("current");
     if std::fs::read_link(&current).ok().as_deref() != Some(Path::new(&digest)) {
         let staged = root.join(format!(".current-{}", uuid::Uuid::new_v4()));
@@ -4196,6 +4237,74 @@ mod tests {
             listen_address: "127.0.0.1",
             hostname: "spark.test",
             active_lsm: "apparmor:enforce",
+        }
+    }
+
+    #[cfg(feature = "appliance")]
+    #[test]
+    fn release_payload_is_traversable_after_private_staging() {
+        use std::os::unix::fs::PermissionsExt;
+        let stage = tempfile::tempdir().unwrap();
+        let bundle = signed_bundle(b"binary", "", "", "");
+        for relative in [
+            "",
+            "configs",
+            "configs/sparkplane",
+            "configs/sparkplane/engines",
+        ] {
+            let path = stage.path().join(relative);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        super::write_release_payload(stage.path(), &bundle, &mut vec![]).unwrap();
+        for relative in [
+            "",
+            "configs",
+            "configs/sparkplane",
+            "configs/sparkplane/engines",
+        ] {
+            assert_eq!(
+                std::fs::metadata(stage.path().join(relative))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755
+            );
+        }
+    }
+
+    #[cfg(feature = "appliance")]
+    #[test]
+    fn fallback_public_code_permissions_do_not_follow_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let code = root.path().join("code");
+        std::fs::create_dir(&code).unwrap();
+        std::fs::set_permissions(&code, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for (name, mode) in [("library.py", 0o600), ("cli", 0o700)] {
+            std::fs::write(code.join(name), b"public code").unwrap();
+            std::fs::set_permissions(code.join(name), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        }
+        let private = root.path().join("private");
+        std::fs::write(&private, b"private").unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&private, code.join("link")).unwrap();
+        super::public_code_permissions(&code).unwrap();
+        assert_eq!(
+            std::fs::metadata(&code).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        for (path, mode) in [
+            (code.join("library.py"), 0o644),
+            (code.join("cli"), 0o755),
+            (private, 0o600),
+        ] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                mode
+            );
         }
     }
 

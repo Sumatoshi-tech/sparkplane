@@ -33,10 +33,27 @@ fn appliance_migration_is_feature_gated_and_requires_one_explicit_mode() {
     };
     let help = invoke(&["bootstrap", "migrate-appliance", "--help"]);
     assert_eq!(help.status.success(), cfg!(feature = "appliance"));
+    if cfg!(feature = "appliance") {
+        assert!(String::from_utf8_lossy(&help.stdout).contains("--recovery-approval"));
+    }
     for args in [
         vec!["bootstrap", "migrate-appliance"],
         vec!["bootstrap", "migrate-appliance", "--yes", "--dry-run"],
         vec!["dgx-spark", "migrate-appliance", "--yes"],
+        vec![
+            "bootstrap",
+            "migrate-appliance",
+            "--yes",
+            "--recovery-approval",
+            "approval.json",
+        ],
+        vec![
+            "bootstrap",
+            "migrate-appliance",
+            "--recover",
+            "--recovery-approval",
+            "approval.json",
+        ],
     ] {
         assert!(!invoke(&args).status.success());
     }

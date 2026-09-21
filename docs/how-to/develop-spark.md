@@ -173,6 +173,11 @@ commit, artifact name, and manifest signature in the release notes. The
 artifact must be the one whose manifest was signed; do not rebuild it after
 signing.
 
+Installation assigns explicit permissions independently of the operator's
+umask. Public release directories are root-owned and traversable by the service
+account; executable and catalog payloads remain read-only. Private credentials,
+state and rollback evidence retain their restricted modes.
+
 ## Install or upgrade Spark
 
 For a new host, use the bootstrap installer. Always inspect the dry run first:
@@ -534,6 +539,11 @@ no host package-update path. Keep those invariants when extending the
 catalogs or the CLI.
 
 ## Release checklist
+
+The agent's initial reconciliation can wait for the engine's 1800-second cold
+start. Its notify service therefore allows 1900 seconds for startup; do not
+restore systemd's shorter default or restart the service while weights load.
+Readiness remains gated on semantic engine health, not merely a running process.
 
 Before tagging:
 

@@ -51,6 +51,8 @@ MemoryMax=256M
 OOMScoreAdjust=-100
 AppArmorProfile=sparkplane-agent
 NotifyAccess=main
+# Initial reconciliation may wait for the engine's 1800-second cold start.
+TimeoutStartSec=1900s
 WatchdogSec=30s
 TimeoutStopSec=15s
 Restart=on-failure

@@ -2,6 +2,27 @@
 use sparkplane::migration::fence;
 
 #[test]
+fn model_warmup_fits_inside_agent_startup_deadline() {
+    let unit = include_str!("../configs/systemd/system/sparkplane-agent.service");
+    assert!(unit.lines().any(|line| line == "TimeoutStartSec=1900s"));
+}
+
+#[test]
+fn recovery_extends_startup_without_rewriting_original_guards() {
+    let root = tempfile::tempdir().unwrap();
+    fence::install_guards(root.path()).unwrap();
+    let path = root
+        .path()
+        .join("etc/systemd/system/sy-spark-agent.service.d/91-sparkplane-migration-startup.conf");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "[Service]\nTimeoutStartSec=1900s\n"
+    );
+    fence::remove_guards(root.path()).unwrap();
+    assert!(!path.exists());
+}
+
+#[test]
 fn reboot_guard_requires_a_volatile_permit_for_both_namespaces() {
     let root = tempfile::tempdir().unwrap();
     fence::install_guards(root.path()).unwrap();

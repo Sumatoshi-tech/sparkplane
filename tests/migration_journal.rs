@@ -2,6 +2,32 @@
 use sparkplane::migration::journal::{Journal, Step};
 
 #[test]
+fn replacement_authority_is_only_valid_after_rollback_restores_state() {
+    let root = tempfile::tempdir().unwrap();
+    let mut journal = Journal::open(root.path(), &"a".repeat(64), &"b".repeat(64)).unwrap();
+    assert!(!journal.restored_checkpoint());
+    for step in [
+        Step::FenceTraffic,
+        Step::Drain,
+        Step::StopLegacyServices,
+        Step::Snapshot,
+    ] {
+        journal.begin(step).unwrap();
+        journal.finish(step).unwrap();
+    }
+    assert!(!journal.restored_checkpoint());
+    assert!(
+        journal
+            .recover(|step| {
+                anyhow::ensure!(step != Step::StopLegacyServices, "wait for health");
+                Ok(())
+            })
+            .is_err()
+    );
+    assert!(journal.restored_checkpoint());
+}
+
+#[test]
 fn interrupted_action_remains_pending_after_reopen() {
     let root = tempfile::tempdir().unwrap();
     {

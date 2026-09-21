@@ -1,6 +1,24 @@
 use std::{fs, path::Path};
 
 #[test]
+fn release_build_installs_all_pinned_toolchain_components() {
+    let workflow = fs::read_to_string(".github/workflows/spark-release.yml").unwrap();
+    let build = workflow.split("  build:\n").nth(1).unwrap();
+    let setup = build
+        .split("      - uses: actions/setup-python@")
+        .next()
+        .unwrap();
+    let toolchain: toml::Value =
+        toml::from_str(&fs::read_to_string("rust-toolchain.toml").unwrap()).unwrap();
+    for component in toolchain["toolchain"]["components"].as_array().unwrap() {
+        assert!(
+            setup.contains(component.as_str().unwrap()),
+            "build setup omits {component}"
+        );
+    }
+}
+
+#[test]
 fn spark_release_inventory_and_policy_are_repository_owned() {
     let workflow = fs::read_to_string(".github/workflows/spark-release.yml").unwrap()
         + &fs::read_to_string("scripts/sign-spark-release.sh").unwrap();

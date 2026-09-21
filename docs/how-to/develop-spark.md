@@ -91,6 +91,9 @@ library, not that executable.
 The Rust toolchain is pinned by `rust-toolchain.toml`. Zig is a separate
 requirement of [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild#installation);
 the release workflow installs it explicitly. Keep local and CI versions aligned.
+Every CI toolchain setup, including cross-build jobs, explicitly installs the
+components from `rust-toolchain.toml`. This avoids a second implicit toolchain
+installation when Cargo first runs in the checkout.
 
 ## Package and sign a release
 

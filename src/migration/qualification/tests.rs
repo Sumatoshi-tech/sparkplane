@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 struct Wire {
     requests: Mutex<Vec<(String, Value)>>,
     bad_usage: bool,
+    reasoning_field: Mutex<&'static str>,
 }
 
 async fn respond(
@@ -43,7 +44,7 @@ async fn respond(
     } else if path == "/metrics" {
         return "vllm:num_requests_running{model=\"model\"} 0\nvllm:num_requests_waiting{model=\"model\"} 0\n".into_response();
     } else if body["reasoning_effort"] == "low" {
-        json!({"choices":[{"message":{"reasoning_content":"Two plus two is four.","content":"4"}}]})
+        json!({"choices":[{"message":{(*wire.reasoning_field.lock().unwrap()):"Two plus two is four.","content":"4"}}]})
     } else if body["stream"] == true {
         assert_eq!(body["stream_options"]["include_usage"], true);
         assert_eq!(body["reasoning_effort"], "none");
@@ -84,6 +85,7 @@ impl Server {
         let wire = Arc::new(Wire {
             requests: Mutex::new(vec![]),
             bad_usage,
+            reasoning_field: Mutex::new("reasoning_content"),
         });
         let router = axum::Router::new()
             .fallback(respond)
@@ -193,6 +195,11 @@ fn pinned_https_qualification_uses_authenticated_control_and_streaming_tool_rout
         let gateway = Gateway::load(root.path(), &plan, legacy).unwrap();
         gateway.healthy(&plan, legacy).unwrap();
         gateway.reasoning(&plan.active[0]).unwrap();
+        *server.wire.reasoning_field.lock().unwrap() = "reasoning";
+        gateway.reasoning(&plan.active[0]).unwrap();
+        *server.wire.reasoning_field.lock().unwrap() = "unsupported_reasoning";
+        assert!(gateway.reasoning(&plan.active[0]).is_err());
+        *server.wire.reasoning_field.lock().unwrap() = "reasoning_content";
         gateway.tools(&plan.active[0]).unwrap();
         let body = gateway.chat(&plan.active[0], "fixture");
         assert!(

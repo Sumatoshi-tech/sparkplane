@@ -16,7 +16,11 @@ jobs:
           components: clippy,rustfmt
       - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
         with:
-          tool: cargo-deny,minisign@0.12
+          tool: cargo-deny
+      - name: Install release signing executable
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y minisign
       - run: cargo deny --no-default-features --features appliance check
       - run: make lint-spark
       - run: make test
@@ -73,9 +77,10 @@ jobs:
           pattern: sparkplane-*
           merge-multiple: true
           path: release
-      - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
-        with:
-          tool: minisign@0.12
+      - name: Install release signing executable
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y minisign
       - name: Sign and publish
         env:
           SPARKPLANE_MINISIGN_SECRET_KEY: ${{ secrets.SPARKPLANE_MINISIGN_SECRET_KEY }}

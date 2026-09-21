@@ -1,5 +1,6 @@
 //! Independent DGX Spark workstation and appliance implementation.
 pub mod client_migration;
+pub mod generated_files;
 #[cfg(feature = "appliance")]
 pub mod migration;
 pub mod spark;

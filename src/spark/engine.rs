@@ -18,6 +18,26 @@ use super::{
 };
 
 pub const ENGINE_SCHEMA: &str = "sparkplane.engine/v3";
+
+#[cfg(feature = "appliance")]
+pub(crate) fn compile_cache_key(
+    config: &EngineConfig,
+    schema: &str,
+    repository: &str,
+    commit: &str,
+    profile: &str,
+    artifact: &str,
+) -> String {
+    let identity = format!(
+        "{schema}\0{}\0{}\0{}\0{}\0{}\0{repository}\0{commit}\0{profile}\0{artifact}",
+        config.id,
+        config.version,
+        config.image_digest,
+        config.image_architecture,
+        config.run_as_uid
+    );
+    format!("sha256-{:x}", Sha256::digest(identity))
+}
 const ALLOWED_PLACEHOLDERS: [&str; 5] = [
     "{model_snapshot}",
     "{model_file}",

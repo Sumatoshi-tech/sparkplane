@@ -118,6 +118,30 @@ is pinned in the operator's local Spark configuration. A manually dispatched
 workflow builds and uploads an artifact but deliberately does not sign it;
 only a `v*` tag invokes the CI signing step.
 
+### Provision the release authority
+
+Generate the dedicated encrypted key in your own terminal. Store its password
+in your password manager; do not send it in chat or put it in a command argument.
+The commands below do not overwrite an existing key pair:
+
+```bash
+sparkplane_signing_dir="${XDG_CONFIG_HOME:-$HOME/.config}/sparkplane-release-signing"
+install -d -m 700 "$sparkplane_signing_dir"
+minisign -G -p "$sparkplane_signing_dir/release.pub" \
+  -s "$sparkplane_signing_dir/release.key"
+gh secret set SPARKPLANE_MINISIGN_SECRET_KEY \
+  --repo Sumatoshi-tech/sparkplane --env release < "$sparkplane_signing_dir/release.key"
+gh secret set SPARKPLANE_MINISIGN_PASSWORD \
+  --repo Sumatoshi-tech/sparkplane --env release
+```
+
+The last command prompts for the same password interactively. Back up the key
+securely and distribute the public key through your established trust channel.
+The protected `release` environment must already exist with maintainer review
+and `v*` tag-only deployment rules. Neither PR checks nor unsigned build jobs
+receive these secrets. Never replace an installed authority merely because a
+new public key accompanies a download.
+
 ## CI/CD lifecycle
 
 The release workflow runs on `workflow_dispatch` and on tags matching

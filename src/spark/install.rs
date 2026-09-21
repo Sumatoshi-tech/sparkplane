@@ -1196,6 +1196,12 @@ pub fn install_release(
     root: &Path,
     bundle: &ReleaseBundle<'_>,
 ) -> Result<(InstallReport, BootstrapMaterial), InstallError> {
+    let legacy = root.join("var/lib/sy-spark");
+    if legacy.exists() || legacy.is_symlink() {
+        return Err(configuration_error(
+            "existing appliance requires the signed namespace migration; fresh install cannot replace it",
+        ));
+    }
     install_release_with_integration(root, bundle, || {
         if root == Path::new("/") {
             apply_host_integration()
@@ -4620,6 +4626,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "appliance")]
+    #[test]
+    fn fresh_install_refuses_an_unmigrated_appliance_before_any_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("var/lib/sy-spark");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("state.sqlite3"), b"legacy state").unwrap();
+        let keys = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+        let signature = minisign::sign(
+            None,
+            &keys.sk,
+            std::io::Cursor::new(test_release_manifest(b"binary")),
+            None,
+            None,
+        )
+        .unwrap()
+        .to_string();
+        let hash = format!("{:x}", sha2::Sha256::digest(b"binary"));
+        let public = keys.pk.to_base64();
+        assert!(
+            super::install_release(
+                root.path(),
+                &signed_bundle(b"binary", &public, &signature, &hash)
+            )
+            .is_err()
+        );
+        assert!(!root.path().join("opt/sparkplane").exists());
     }
 
     #[cfg(feature = "appliance")]

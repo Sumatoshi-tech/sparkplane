@@ -525,20 +525,14 @@ where
         "{port}" => config.port.to_string(),
         _ => value.to_owned(),
     };
-    let compile_identity = format!(
-        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+    let compile_cache_key = super::engine::compile_cache_key(
+        config,
         COMPILE_CACHE_IDENTITY_SCHEMA,
-        config.id,
-        config.version,
-        config.image_digest,
-        config.image_architecture,
-        config.run_as_uid,
-        input.model_repository,
-        input.model_commit,
-        profile.id,
-        artifact_fingerprint,
+        &input.model_repository,
+        &input.model_commit,
+        &profile.id,
+        &artifact_fingerprint,
     );
-    let compile_cache_key = format!("sha256-{:x}", Sha256::digest(compile_identity));
     let labels = [
         ("io.sparkplane.managed", "true".into()),
         ("io.sparkplane.instance", input.instance_id.clone()),

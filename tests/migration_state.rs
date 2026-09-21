@@ -15,6 +15,18 @@ fn unsupported_database_version_is_rejected_without_a_destination() {
 }
 
 #[test]
+fn failed_metadata_conversion_does_not_publish_a_partial_database() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("old.sqlite3");
+    let destination = root.path().join("new.sqlite3");
+    rusqlite::Connection::open(&source).unwrap().execute_batch(
+        "PRAGMA user_version=6; CREATE TABLE operations(state TEXT); CREATE TABLE models(id TEXT,metadata_json TEXT); INSERT INTO models VALUES('bad','invalid json');"
+    ).unwrap();
+    assert!(stage_database(&source, &destination, &[]).is_err());
+    assert!(!destination.exists());
+}
+
+#[test]
 fn wal_snapshot_preserves_identity_credentials_and_historical_audit_bytes() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("old.sqlite3");

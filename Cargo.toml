@@ -37,7 +37,7 @@ publish = false
 
 [features]
 default = []
-appliance = ["dep:axum", "dep:axum-server", "dep:hmac", "dep:governor", "dep:rcgen", "dep:rusqlite", "dep:rusqlite_migration", "dep:rustls", "dep:secrecy", "dep:tower", "dep:utoipa", "dep:x509-parser", "dep:bollard", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:hf-hub", "dep:image", "dep:arc-swap", "dep:sparkplane-ipc"]
+appliance = ["dep:axum", "dep:axum-server", "dep:hmac", "dep:governor", "dep:rcgen", "dep:rusqlite", "dep:rusqlite_migration", "dep:rustls", "dep:secrecy", "dep:tower", "dep:utoipa", "dep:x509-parser", "dep:bollard", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:hf-hub", "dep:image", "dep:arc-swap", "dep:sparkplane-ipc", "dep:tempfile"]
 
 [dependencies]
 anyhow.workspace = true
@@ -53,6 +53,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 sparkplane-core.workspace = true
 sparkplane-ipc = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 toml = "0.8"

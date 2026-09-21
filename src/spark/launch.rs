@@ -560,8 +560,6 @@ fn configure_integration(
     }
     let config = client::codex_client_config(config_dir, host, &instance.name, &model.canonical)?;
     let home = codex_home()?;
-    let profile = home.join(format!("{CODEX_PROFILE}.config.toml"));
-    let catalog = home.join(format!("{CODEX_PROFILE}-models.json"));
     let profile_text = format!("# {OWNED_MARKER}\n{}", config.toml);
     if instance.context_window == 0 {
         return Err(failure(
@@ -572,8 +570,8 @@ fn configure_integration(
     let catalog_value = codex_catalog(model, instance.context_window);
     let catalog_text = serde_json::to_vec_pretty(&catalog_value)
         .map_err(|_| failure(EXIT_INTERNAL, "could not encode Codex model catalog"))?;
-    write_private_atomic(&profile, profile_text.as_bytes())?;
-    write_private_atomic(&catalog, &catalog_text)
+    crate::generated_files::publish(&home, profile_text.as_bytes(), &catalog_text)
+        .map_err(|error| usage(format!("generated client files: {error:#}")))
 }
 
 fn codex_catalog(model: &ModelDocument, context_window: u64) -> Value {
@@ -973,8 +971,8 @@ fn restore(
         )));
     }
     let home = codex_home()?;
-    remove_owned_text(&home.join(format!("{CODEX_PROFILE}.config.toml")))?;
-    remove_owned_json(&home.join(format!("{CODEX_PROFILE}-models.json")))?;
+    crate::generated_files::remove(&home)
+        .map_err(|error| usage(format!("generated client files: {error:#}")))?;
     let mut state = read_state(config_dir)?;
     if let Some(host_state) = state.hosts.get_mut(host) {
         host_state.integrations.remove(integration.as_str());
@@ -982,43 +980,6 @@ fn restore(
     write_state(config_dir, &state)?;
     println!("Codex Spark launch configuration removed.");
     Ok(())
-}
-
-fn remove_owned_text(path: &Path) -> Result<(), ClientError> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err(usage("could not read Codex launch profile")),
-    };
-    if !text
-        .lines()
-        .next()
-        .is_some_and(|line| line.contains(OWNED_MARKER))
-    {
-        return Err(usage("refusing to remove an unowned Codex profile"));
-    }
-    fs::remove_file(path).map_err(|_| usage("could not remove Codex launch profile"))
-}
-
-fn remove_owned_json(path: &Path) -> Result<(), ClientError> {
-    let data = match fs::read(path) {
-        Ok(data) => data,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err(usage("could not read Codex launch catalog")),
-    };
-    let owned = serde_json::from_slice::<serde_json::Value>(&data)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("owned_by")
-                .and_then(|value| value.as_str())
-                .map(str::to_owned)
-        })
-        .is_some_and(|value| value == OWNED_MARKER);
-    if !owned {
-        return Err(usage("refusing to remove an unowned Codex model catalog"));
-    }
-    fs::remove_file(path).map_err(|_| usage("could not remove Codex launch catalog"))
 }
 
 fn codex_home() -> Result<PathBuf, ClientError> {

@@ -403,16 +403,13 @@ pub fn preflight(
             model_commit: model.commit,
         };
         container.verify(value)?;
+        super::container::verify_restart_policy(value)?;
         ensure!(
             value
                 .pointer("/State/Running")
                 .and_then(serde_json::Value::as_bool)
-                == Some(true)
-                && value
-                    .pointer("/HostConfig/RestartPolicy/Name")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("no"),
-            "container must be running without an independent restart policy"
+                == Some(true),
+            "container must be running"
         );
         active.push(Active {
             before: instance,

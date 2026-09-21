@@ -53,7 +53,16 @@ fn identity() -> LegacyContainer {
 fn inspected(running: bool) -> String {
     let expected = identity();
     serde_json::json!({"Id":expected.container_id,"Name":format!("/sy-spark-{}-g8",expected.instance_id),
-        "Image":expected.image_digest,"Config":{"Labels":expected.labels()},"State":{"Running":running}}).to_string()
+        "Image":expected.image_digest,"Config":{"Labels":expected.labels()},"State":{"Running":running},"HostConfig":{"RestartPolicy":{"Name":"unless-stopped"}}}).to_string()
+}
+
+#[test]
+fn recovery_rejects_restart_policy_drift_before_any_start() {
+    let changed = inspected(true).replace("unless-stopped", "always");
+    let requests = exercise(vec![(200, changed)], false, |docker| {
+        docker.restore_legacy(&identity())
+    });
+    assert_eq!(requests.len(), 1);
 }
 
 fn cleanup(responses: Vec<(u16, String)>, succeeds: bool) -> Vec<String> {

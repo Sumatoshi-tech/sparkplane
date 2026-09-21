@@ -433,6 +433,20 @@ fn preflight_accepts_retired_policies_only_for_stopped_history() {
 }
 
 #[test]
+fn preflight_accepts_the_managed_unless_stopped_policy_but_rejects_always() {
+    let fixture = fixture_with_instance(true);
+    let mut containers = fixture.host.platform.old.clone();
+    containers[0]["HostConfig"]["RestartPolicy"]["Name"] = "unless-stopped".into();
+    assert!(
+        appliance::preflight(fixture.root.path(), &fixture.release, &containers, u64::MAX).is_ok()
+    );
+    containers[0]["HostConfig"]["RestartPolicy"]["Name"] = "always".into();
+    assert!(
+        appliance::preflight(fixture.root.path(), &fixture.release, &containers, u64::MAX).is_err()
+    );
+}
+
+#[test]
 fn running_instances_still_require_the_exact_engine_fingerprint() {
     let fixture = fixture_with_instance(true);
     let db = rusqlite::Connection::open(fixture.root.path().join("var/lib/sy-spark/state.sqlite3"))

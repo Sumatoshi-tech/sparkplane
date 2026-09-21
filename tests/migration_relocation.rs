@@ -29,3 +29,33 @@ fn destination_conflict_and_replaced_source_leave_both_trees_untouched() {
     assert!(relocate(&old, &new, &identity).is_err());
     assert!(old.is_dir() && new.is_dir());
 }
+
+#[test]
+fn journaled_file_move_is_idempotent_without_overwriting_a_conflict() {
+    use sparkplane::migration::relocation::{FileIdentity, move_file};
+    let root = tempfile::tempdir().unwrap();
+    let old = root.path().join("source");
+    let new = root.path().join("destination");
+    std::fs::write(&old, b"database fixture").unwrap();
+    let identity = FileIdentity::read(&old).unwrap();
+    move_file(&old, &new, &identity).unwrap();
+    move_file(&old, &new, &identity).unwrap();
+    assert_eq!(FileIdentity::read(&new).unwrap(), identity);
+    std::fs::write(&old, b"unrelated").unwrap();
+    assert!(move_file(&old, &new, &identity).is_err());
+}
+
+#[test]
+fn changed_file_permissions_cannot_be_published() {
+    use sparkplane::migration::relocation::{FileIdentity, move_file};
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let destination = root.path().join("destination");
+    std::fs::write(&source, b"same bytes").unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let expected = FileIdentity::read(&source).unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(move_file(&source, &destination, &expected).is_err());
+    assert!(source.exists() && !destination.exists());
+}

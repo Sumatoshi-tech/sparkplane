@@ -2363,7 +2363,7 @@ fn restart_control_plane() -> Result<(), InstallError> {
 }
 
 #[cfg(feature = "appliance")]
-fn ensure_http_fallback() -> Result<(), InstallError> {
+pub(crate) fn ensure_http_fallback() -> Result<(), InstallError> {
     use std::os::unix::fs::symlink;
 
     let lock = include_bytes!("../../configs/sparkplane/hf-http-fallback.lock");
@@ -2426,7 +2426,8 @@ fn fixed_success(program: &str, args: &[&str]) -> Result<bool, InstallError> {
 
 #[cfg(feature = "appliance")]
 fn require_fixed_success(action: &str, program: &str, args: &[&str]) -> Result<(), InstallError> {
-    let output = Command::new(program)
+    let output = Command::new("/usr/bin/timeout")
+        .args(["--kill-after=5s", "1800s", program])
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -3216,7 +3217,7 @@ fn validate_catalog_approval(
 }
 
 #[cfg(feature = "appliance")]
-fn validate_release(bundle: &ReleaseBundle<'_>) -> Result<(), InstallError> {
+pub(crate) fn validate_release(bundle: &ReleaseBundle<'_>) -> Result<(), InstallError> {
     use minisign_verify::Signature;
     if bundle.version.is_empty()
         || bundle.version.contains('/')

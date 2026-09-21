@@ -20,7 +20,7 @@ pub enum Step {
     Activate,
     Qualify,
 }
-const STEPS: [Step; 8] = [
+pub const STEPS: [Step; 8] = [
     Step::FenceTraffic,
     Step::Drain,
     Step::StopLegacyServices,
@@ -47,6 +47,7 @@ pub struct Journal {
     path: PathBuf,
     state: State,
     _lock: fs::File,
+    poisoned: bool,
 }
 
 impl Journal {
@@ -114,10 +115,11 @@ impl Journal {
                         && !state.rolling_back)),
             "migration journal contains an invalid action history"
         );
-        let journal = Self {
+        let mut journal = Self {
             path,
             state,
             _lock: lock,
+            poisoned: false,
         };
         journal.save()?;
         Ok(journal)
@@ -127,8 +129,23 @@ impl Journal {
         self.state.pending
     }
 
+    pub fn committed(&self) -> Result<bool> {
+        self.require_durable()?;
+        Ok(self.state.committed)
+    }
+
+    pub fn next(&self) -> Result<Option<Step>> {
+        self.require_durable()?;
+        ensure!(
+            self.state.pending.is_none() && !self.state.rolling_back,
+            "recover interrupted migration before continuing"
+        );
+        Ok(STEPS.get(self.state.completed.len()).copied())
+    }
+
     /// Persist the no-rollback boundary BEFORE permitting external mutations.
     pub fn commit(&mut self) -> Result<()> {
+        self.require_durable()?;
         ensure!(
             self.state.completed == STEPS
                 && self.state.pending.is_none()
@@ -141,6 +158,7 @@ impl Journal {
 
     /// `undo` must tolerate an action already reversed before an interrupted fsync.
     pub fn recover(&mut self, mut undo: impl FnMut(Step) -> Result<()>) -> Result<()> {
+        self.require_durable()?;
         ensure!(
             !self.state.committed,
             "committed migrations cannot restore stale state"
@@ -162,6 +180,7 @@ impl Journal {
     }
 
     pub fn finish(&mut self, step: Step) -> Result<()> {
+        self.require_durable()?;
         ensure!(
             !self.state.rolling_back && self.state.pending == Some(step),
             "cannot finish an action without its durable intent"
@@ -172,6 +191,7 @@ impl Journal {
     }
 
     pub fn begin(&mut self, step: Step) -> Result<()> {
+        self.require_durable()?;
         ensure!(
             !self.state.committed && !self.state.rolling_back && self.state.pending.is_none(),
             "recover pending migration before continuing"
@@ -184,7 +204,16 @@ impl Journal {
         self.save()
     }
 
-    fn save(&self) -> Result<()> {
+    fn require_durable(&self) -> Result<()> {
+        ensure!(
+            !self.poisoned,
+            "journal persistence failed; reopen the durable journal before recovery"
+        );
+        Ok(())
+    }
+
+    fn save(&mut self) -> Result<()> {
+        self.poisoned = true;
         let parent = self.path.parent().expect("journal has a parent");
         let stage_path = parent.join(format!(".migration-{}", uuid::Uuid::new_v4()));
         let mut stage = fs::OpenOptions::new()
@@ -197,6 +226,7 @@ impl Journal {
         stage.sync_all()?;
         fs::rename(stage_path, &self.path)?;
         fs::File::open(parent)?.sync_all()?;
+        self.poisoned = false;
         Ok(())
     }
 }

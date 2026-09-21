@@ -3,6 +3,27 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Namespace {
+    Legacy,
+    Current,
+}
+
+impl Namespace {
+    pub const fn prefix(self) -> &'static str {
+        match self {
+            Self::Legacy => "io.sy.spark",
+            Self::Current => "io.sparkplane",
+        }
+    }
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Legacy => "sy-spark",
+            Self::Current => "sparkplane",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LegacyContainer {
@@ -49,6 +70,10 @@ impl LegacyContainer {
     }
 
     pub fn verify(&self, inspect: &serde_json::Value) -> Result<()> {
+        self.verify_as(inspect, Namespace::Legacy)
+    }
+
+    pub fn verify_as(&self, inspect: &serde_json::Value, namespace: Namespace) -> Result<()> {
         ensure!(
             hex(&self.container_id, 64)
                 && self
@@ -85,18 +110,50 @@ impl LegacyContainer {
                     == Some(&self.image_digest)
                 && inspect.get("Name").and_then(serde_json::Value::as_str)
                     == Some(&format!(
-                        "/sy-spark-{}-g{}",
-                        self.instance_id, self.generation
+                        "/{}-{}-g{}",
+                        namespace.name(),
+                        self.instance_id,
+                        self.generation
                     )),
             "container identity differs from preflight"
         );
         let labels = inspect.pointer("/Config/Labels");
         ensure!(
             self.labels().iter().all(|(key, value)| labels
-                .and_then(|l| l.get(key))
+                .and_then(|l| l.get(key.replace("io.sy.spark", namespace.prefix())))
                 .and_then(serde_json::Value::as_str)
                 == Some(value)),
             "container ownership differs from preflight"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Network {
+    pub id: String,
+}
+
+impl Network {
+    pub fn capture(value: &serde_json::Value, namespace: Namespace) -> Result<Self> {
+        let network = Self {
+            id: value["Id"].as_str().unwrap_or_default().into(),
+        };
+        network.verify(value, namespace)?;
+        Ok(network)
+    }
+
+    pub fn verify(&self, value: &serde_json::Value, namespace: Namespace) -> Result<()> {
+        ensure!(
+            hex(&self.id, 64)
+                && value["Id"] == self.id
+                && value["Name"] == format!("{}-internal", namespace.name())
+                && value["Driver"] == "bridge"
+                && value["Internal"] == true
+                && value["Labels"][format!("{}.managed", namespace.prefix())] == "true"
+                && value["Labels"][format!("{}.role", namespace.prefix())] == "network",
+            "network ownership differs from migration identity"
         );
         Ok(())
     }

@@ -266,6 +266,7 @@ impl Gateway {
         ensure!(
             message["reasoning_content"]
                 .as_str()
+                .or_else(|| message["reasoning"].as_str())
                 .is_some_and(|s| !s.trim().is_empty())
                 && message["content"].as_str().is_some_and(|s| s.contains('4')),
             "reasoning probe must return separate reasoning and answer content"

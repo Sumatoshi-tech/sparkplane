@@ -3063,7 +3063,7 @@ dependencies = [
 
 [[package]]
 name = "sparkplane"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3118,7 +3118,7 @@ dependencies = [
 
 [[package]]
 name = "sparkplane-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "sd-notify",
@@ -3132,7 +3132,7 @@ dependencies = [
 
 [[package]]
 name = "sparkplane-ipc"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "bytes",

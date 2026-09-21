@@ -38,6 +38,20 @@ pub struct LegacyContainer {
     pub model_commit: String,
 }
 
+pub fn verify_restart_policy(inspect: &serde_json::Value) -> Result<()> {
+    // An explicit stop survives daemon restarts for both supported policies.
+    ensure!(
+        matches!(
+            inspect
+                .pointer("/HostConfig/RestartPolicy/Name")
+                .and_then(serde_json::Value::as_str),
+            Some("no" | "unless-stopped")
+        ),
+        "unsupported container restart policy"
+    );
+    Ok(())
+}
+
 fn hex(value: &str, length: usize) -> bool {
     value.len() == length
         && value

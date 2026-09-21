@@ -116,6 +116,7 @@ impl Containers {
             return Ok(());
         };
         expected.verify_as(&value, namespace)?;
+        super::container::verify_restart_policy(&value)?;
         let running = value
             .pointer("/State/Running")
             .and_then(Value::as_bool)
@@ -131,6 +132,7 @@ impl Containers {
         }
         if let Some(stopped) = self.inspect_async(&expected.container_id).await? {
             expected.verify_as(&stopped, namespace)?;
+            super::container::verify_restart_policy(&stopped)?;
             ensure!(
                 stopped.pointer("/State/Running").and_then(Value::as_bool) == Some(false),
                 "container is still running"
@@ -148,6 +150,7 @@ impl Containers {
             self.stop_async(expected, namespace).await?;
             if let Some(value) = self.inspect_async(&expected.container_id).await? {
                 expected.verify_as(&value, namespace)?;
+                super::container::verify_restart_policy(&value)?;
                 self.docker
                     .remove_container(
                         &expected.container_id,
@@ -173,6 +176,7 @@ impl Containers {
         self.runtime.block_on(async {
             if let Some(value) = self.inspect_async(&expected.container_id).await? {
                 expected.verify(&value)?;
+                super::container::verify_restart_policy(&value)?;
                 if value.pointer("/State/Running").and_then(Value::as_bool) == Some(false) {
                     self.docker
                         .start_container(&expected.container_id, None)

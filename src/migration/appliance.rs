@@ -301,14 +301,6 @@ pub fn preflight(
                 && instance.quarantine.is_none(),
             "legacy instance is inconsistent or suppressed"
         );
-        let policy = policies
-            .iter()
-            .find(|p| p.config().id == instance.engine_id)
-            .context("instance engine absent from release")?;
-        ensure!(
-            old_fingerprints.get(&instance.engine_id) == Some(&instance.engine_fingerprint),
-            "legacy engine fingerprint differs from running instance"
-        );
         ensure!(
             crate::spark::wire::artifact_fingerprint(&instance.artifacts)
                 .map_err(anyhow::Error::msg)?
@@ -319,13 +311,6 @@ pub fn preflight(
         super::migrate_artifacts(&mut artifacts)?;
         let fingerprint =
             crate::spark::wire::artifact_fingerprint(&artifacts).map_err(anyhow::Error::msg)?;
-        let profile = policy
-            .profile_for(None, &artifacts)
-            .map_err(anyhow::Error::msg)?;
-        ensure!(
-            profile.context_window == instance.context_window,
-            "migration changes context window"
-        );
         let model_json: String = connection.query_row(
             "SELECT metadata_json FROM models WHERE id=?1",
             [&instance.model_id],
@@ -337,6 +322,24 @@ pub fn preflight(
             "instance model identity mismatch"
         );
         super::snapshot_path(&model.snapshot, &model.repository, &model.commit)?;
+        if instance.desired != InstanceDesiredState::Running {
+            continue;
+        }
+        let policy = policies
+            .iter()
+            .find(|p| p.config().id == instance.engine_id)
+            .context("instance engine absent from release")?;
+        ensure!(
+            old_fingerprints.get(&instance.engine_id) == Some(&instance.engine_fingerprint),
+            "legacy engine fingerprint differs from running instance"
+        );
+        let profile = policy
+            .profile_for(None, &artifacts)
+            .map_err(anyhow::Error::msg)?;
+        ensure!(
+            profile.context_window == instance.context_window,
+            "migration changes context window"
+        );
         cache_keys.push(super::cache_keys(
             policy,
             &model.repository,
@@ -345,9 +348,6 @@ pub fn preflight(
             &instance.artifact_fingerprint,
             &fingerprint,
         )?);
-        if instance.desired != InstanceDesiredState::Running {
-            continue;
-        }
         let restart_operation: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM operations WHERE kind='instance.serve' AND target=?1 AND state='succeeded')",
             [&instance.name], |row| row.get(0))?;

@@ -4090,7 +4090,8 @@ mod tests {
 
     fn test_release_name(executable_sha: &str) -> String {
         format!(
-            "0.1.0-{}",
+            "{}-{}",
+            env!("CARGO_PKG_VERSION"),
             test_catalog_digests().release_identity(executable_sha)
         )
     }
@@ -4184,7 +4185,7 @@ mod tests {
     ) -> super::ReleaseBundle<'a> {
         let manifest = Box::leak(test_release_manifest(executable).into_boxed_str());
         super::ReleaseBundle {
-            version: "0.1.0",
+            version: env!("CARGO_PKG_VERSION"),
             executable,
             executable_sha256: sha256,
             release_manifest: manifest.as_bytes(),

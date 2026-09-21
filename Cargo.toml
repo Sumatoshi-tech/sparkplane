@@ -3,7 +3,7 @@ members = [".", "crates/sparkplane-core", "crates/sparkplane-ipc"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -22,8 +22,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "registry", "std"] }
 metrics = "0.24"
 tempfile = "3"
-sparkplane-core = { path = "crates/sparkplane-core", version = "=0.1.4" }
-sparkplane-ipc = { path = "crates/sparkplane-ipc", version = "=0.1.4" }
+sparkplane-core = { path = "crates/sparkplane-core", version = "=0.1.5" }
+sparkplane-ipc = { path = "crates/sparkplane-ipc", version = "=0.1.5" }
 
 [package]
 name = "sparkplane"

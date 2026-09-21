@@ -84,6 +84,19 @@ healthy, and confirm the OpenAI-compatible gateway path answers.
    remediation. `launch` does not edit the primary Claude/OpenCode config or
    the main Codex config.
 
+   Add `--allow-network` when development commands need internet access:
+
+   ```bash
+   sparkplane dgx-spark launch codex --allow-network -- --sandbox workspace-write
+   sparkplane dgx-spark launch claude --allow-network
+   ```
+
+   This is a per-launch opt-in, also available as
+   `SPARKPLANE_LAUNCH_ALLOW_NETWORK=true`; it does not disable filesystem
+   sandboxing or change approval policy. OpenCode already has network access,
+   so its existing tool permissions are left alone. See
+   [network controls and limitations](../reference/spark.md#internet-access-for-development).
+
 7. Stop when you are done. An already-absent instance is an idempotent success:
 
    ```bash

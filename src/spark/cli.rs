@@ -63,6 +63,12 @@ pub struct SparkCli {
 
 #[derive(Debug, Subcommand)]
 pub enum SparkCommand {
+    /// Apply or recover a signed appliance namespace transition; host must be 'bootstrap'.
+    #[cfg(feature = "appliance")]
+    #[command(
+        after_help = "Run locally on the appliance with sudo. Use --dry-run with --bundle, --transition and --transition-signature; repeat with --yes after review. Interrupted pre-commit work uses --recover. A committed transaction uses --resume and can never restore stale state. All paths and privileged actions are fixed; Docker is never restarted."
+    )]
+    MigrateAppliance(crate::migration::cli::MigrationArgs),
     /// Import legacy sy Spark client files without changing the appliance; use host 'local'.
     MigrateClient(ClientMigrationArgs),
     /// Inspect the appliance and print the exact non-mutating installation plan.
@@ -760,6 +766,12 @@ pub fn dispatch(cli: SparkCli) -> anyhow::Result<()> {
         #[cfg(feature = "appliance")]
         SparkCommand::Activate(args) => dispatch_activate(cli.host, args),
         SparkCommand::Inspect => dispatch_bootstrap(cli.host),
+        #[cfg(feature = "appliance")]
+        SparkCommand::MigrateAppliance(args) => crate::migration::cli::dispatch(&cli.host, args)
+            .map_err(|error| SparkError {
+                code: super::EXIT_REJECTED,
+                msg: format!("migration rejected: {error:#}"),
+            }),
     }
     .map_err(Into::into)
 }

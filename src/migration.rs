@@ -1,4 +1,4 @@
-//! Offline, typed namespace transition. Source databases and audit bytes remain untouched.
+//! Signed, journaled appliance transition with typed state conversion and pre-commit recovery.
 use crate::spark::{
     engine::EnginePolicy,
     wire::{InstanceDocument, ModelDocument},
@@ -6,10 +6,21 @@ use crate::spark::{
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, backup::Backup};
 use std::{fs, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
+pub mod appliance;
+pub mod cli;
+pub mod commands;
 pub mod config;
 pub mod container;
+pub mod docker;
+pub mod fence;
+pub mod host;
 pub mod journal;
+pub mod publication;
+pub mod qualification;
+pub mod release;
 pub mod relocation;
+pub mod runner;
+pub mod storage;
 
 pub fn snapshot_path(snapshot: &str, repository: &str, commit: &str) -> Result<String> {
     crate::spark::model::Repository::parse(repository)?;

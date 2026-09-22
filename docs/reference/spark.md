@@ -37,7 +37,7 @@ sparkplane <host> status --json
 sparkplane <host> doctor --json
 sparkplane <host> qualify --manifest <json> --signature <minisig> (--dry-run | --yes) [--detach] [--json]
 sparkplane <host> serve <model> [--name <instance>] [--detach] [--dry-run] [--json]
-sparkplane <host> launch <codex|claude|opencode> [--model <model>] [--allow-network] [--config] [--restore] [-y] [-- <agent-args>...]
+sparkplane <host> launch <codex|claude|opencode> [--mode auto|inherit] [--model <model>] [--allow-network] [--config] [--restore] [-y] [-- <agent-args>...]
 sparkplane <host> ls [--json]
 sparkplane <host> ps [--json]
 sparkplane <host> logs <instance> [--limit N]
@@ -255,18 +255,35 @@ catalog, and OpenCode uses process-local `OPENCODE_CONFIG_CONTENT`.
 
 ### Internet access for development
 
-Use `--allow-network` (or `SPARKPLANE_LAUNCH_ALLOW_NETWORK=true`) when the
+Launches default to `--mode auto` (`SPARKPLANE_LAUNCH_MODE=auto`): full
+filesystem and network access without action approval prompts. This applies
+to the launched local agent session. It is not saved to agent configuration.
+
+| Agent | Auto mode |
+| --- | --- |
+| Codex | `approval_policy="never"`, `sandbox_mode="danger-full-access"` |
+| Claude Code | `bypassPermissions`, sandbox disabled, bypass onboarding prompt skipped |
+| OpenCode | All tool permissions allowed in the generated session configuration |
+
+Use `--mode inherit` to keep the agent's own permissions. Forwarded sandbox,
+approval, or Claude settings options require inherit mode to avoid conflicting
+policies. Managed agent restrictions still apply. Sparkplane's auto mode is
+distinct from an agent's similarly named automatic-review mode.
+`--dry-run --json` includes `mode`; `--config` and `--restore` never launch an
+agent or change its permission settings.
+
+In inherit mode, use `--allow-network` (or `SPARKPLANE_LAUNCH_ALLOW_NETWORK=true`) when the
 agent needs to download dependencies, fetch documentation or use remote APIs:
 
 ```bash
-sparkplane dgx-spark launch codex --allow-network
-sparkplane dgx-spark launch claude --allow-network
+sparkplane dgx-spark launch codex --mode inherit --allow-network
+sparkplane dgx-spark launch claude --mode inherit --allow-network
 ```
 
 The grant applies only to this invocation. It is not saved in launch state or
 agent configuration, and cannot be combined with `--config` or `--restore`.
 `--dry-run --json` reports the requested `allow_network` value without changing
-anything. Without the flag, the agent's existing permissions remain unchanged;
+anything. In inherit mode without the flag, the agent's existing permissions remain unchanged;
 Sparkplane does not impose its own workstation sandbox.
 
 | Agent | Effect of `--allow-network` |
@@ -305,7 +322,7 @@ appliance's private engine networking. Agent controls are documented in the
 ```bash
 sparkplane dgx-spark serve ornith-1.5:9b --dry-run --json
 sparkplane dgx-spark launch codex --model ornith-1.5:9b
-sparkplane dgx-spark launch claude --model ornith-1.5:9b -- --permission-mode plan
+sparkplane dgx-spark launch claude --mode inherit --model ornith-1.5:9b -- --permission-mode plan
 sparkplane dgx-spark launch opencode --model ornith-1.5:9b
 sparkplane dgx-spark serve ornith-1.5:9b --name ornith
 sparkplane dgx-spark ps --json

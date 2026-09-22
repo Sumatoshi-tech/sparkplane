@@ -73,7 +73,7 @@ healthy, and confirm the OpenAI-compatible gateway path answers.
 
    ```bash
    sparkplane dgx-spark launch codex --model ornith-1.5:9b
-   sparkplane dgx-spark launch claude --model ornith-1.5:9b -- --permission-mode plan
+   sparkplane dgx-spark launch claude --mode inherit --model ornith-1.5:9b -- --permission-mode plan
    sparkplane dgx-spark launch opencode --model ornith-1.5:9b
    ```
 
@@ -84,11 +84,12 @@ healthy, and confirm the OpenAI-compatible gateway path answers.
    remediation. `launch` does not edit the primary Claude/OpenCode config or
    the main Codex config.
 
-   Add `--allow-network` when development commands need internet access:
+   Launches default to full access without approvals (`--mode auto`). To retain
+   agent sandbox settings while allowing internet access, use inherit mode:
 
    ```bash
-   sparkplane dgx-spark launch codex --allow-network -- --sandbox workspace-write
-   sparkplane dgx-spark launch claude --allow-network
+   sparkplane dgx-spark launch codex --mode inherit --allow-network -- --sandbox workspace-write
+   sparkplane dgx-spark launch claude --mode inherit --allow-network
    ```
 
    This is a per-launch opt-in, also available as

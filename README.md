@@ -10,7 +10,7 @@ cargo build --locked --release
 ./target/release/sparkplane --help
 ./target/release/sparkplane dgx-spark status --json
 ./target/release/sparkplane dgx-spark serve qwen3.8:flash-next --dry-run --json
-./target/release/sparkplane dgx-spark launch codex --allow-network -- --sandbox workspace-write
+./target/release/sparkplane dgx-spark launch codex
 ```
 
 Use the pinned Rust 1.95.0 toolchain (selected automatically by rustup), a
@@ -19,10 +19,10 @@ Install the Minisign executable for the encrypted release-signing tests.
 The client runs on Linux x86-64/ARM64; the appliance targets Linux ARM64 with
 NVIDIA GB10, Docker and the NVIDIA container toolkit already installed.
 
-Enable sandboxed internet access with `launch --allow-network`;
-[agent-specific network controls](docs/reference/spark.md#internet-access-for-development)
-leave filesystem and approval policies intact. Without the flag, agents retain
-their existing permissions.
+Agent launches default to `--mode auto`: full filesystem and network access
+without action approval prompts. Use `--mode inherit` to keep the agent's own
+permission settings. In inherit mode, `--allow-network` grants network access
+within a supported sandbox. See [launch permissions](docs/reference/spark.md#internet-access-for-development).
 
 ## Architecture
 

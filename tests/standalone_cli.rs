@@ -7,6 +7,27 @@ fn launch_help_exposes_opt_in_network_access() {
         .output()
         .unwrap();
     assert!(String::from_utf8_lossy(&output.stdout).contains("--allow-network"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--mode"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("[default: auto]"));
+}
+
+#[test]
+fn auto_mode_rejects_conflicting_agent_settings_before_contacting_spark() {
+    for (agent, flag, value) in [
+        ("codex", "--sandbox", "read-only"),
+        ("claude", "--permission-mode", "plan"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_sparkplane"))
+            .env_clear()
+            .env("SPARKPLANE_CONFIG_DIR", root.path())
+            .args(["dgx-spark", "launch", agent, "--", flag, value])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--mode inherit"));
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
 }
 
 #[test]
@@ -19,6 +40,8 @@ fn network_opt_in_rejects_shadowing_claude_settings_before_contacting_spark() {
             "dgx-spark",
             "launch",
             "claude",
+            "--mode",
+            "inherit",
             "--allow-network",
             "--",
             "--settings",

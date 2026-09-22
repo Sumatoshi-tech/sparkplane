@@ -44,6 +44,7 @@ struct LaunchPlan {
     token_id: Option<String>,
     extra_argument_count: usize,
     allow_network: bool,
+    mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +181,7 @@ pub fn run(host: &str, config_dir: &Path, args: LaunchArgs) -> Result<(), Client
                 token_id: None,
                 extra_argument_count: args.extra_args.len(),
                 allow_network: args.allow_network,
+                mode: args.mode.clone(),
             },
             args.json,
         );
@@ -254,6 +256,7 @@ pub fn run(host: &str, config_dir: &Path, args: LaunchArgs) -> Result<(), Client
         token_id: Some(token_id),
         extra_argument_count: args.extra_args.len(),
         allow_network: args.allow_network,
+        mode: args.mode.clone(),
     };
     if args.configure {
         return render_plan(&plan, args.json);
@@ -265,7 +268,9 @@ pub fn run(host: &str, config_dir: &Path, args: LaunchArgs) -> Result<(), Client
         model.canonical,
         instance.name
     );
-    if args.allow_network {
+    if args.mode == "auto" {
+        eprintln!("Auto mode: full agent access with no action approvals.");
+    } else if args.allow_network {
         eprintln!(
             "Network access requested for this invocation; filesystem and approval policies are unchanged."
         );
@@ -274,6 +279,7 @@ pub fn run(host: &str, config_dir: &Path, args: LaunchArgs) -> Result<(), Client
         args.integration,
         args.yes,
         args.allow_network,
+        &args.mode,
         ReadyLaunch {
             config_dir,
             host,
@@ -286,6 +292,28 @@ pub fn run(host: &str, config_dir: &Path, args: LaunchArgs) -> Result<(), Client
 }
 
 fn validate_args(args: &LaunchArgs) -> Result<(), ClientError> {
+    if args.mode == "auto"
+        && args.extra_args.iter().any(|arg| {
+            let flag = arg.split('=').next().unwrap_or(arg);
+            matches!(
+                flag,
+                "--settings"
+                    | "--permission-mode"
+                    | "--sandbox"
+                    | "-s"
+                    | "--ask-for-approval"
+                    | "-a"
+                    | "--full-auto"
+                    | "--dangerously-bypass-approvals-and-sandbox"
+                    | "--dangerously-skip-permissions"
+            ) || arg.contains("approval_policy")
+                || arg.contains("sandbox_mode")
+        })
+    {
+        return Err(usage(
+            "custom agent permission settings require --mode inherit",
+        ));
+    }
     if args.allow_network && (args.configure || args.restore) {
         return Err(usage(
             "--allow-network is invocation-only; it cannot be combined with --config or --restore",
@@ -654,16 +682,62 @@ fn configure_network_access(command: &mut Command, integration: LaunchIntegratio
     }
 }
 
+fn configure_launch_permissions(
+    command: &mut Command,
+    integration: LaunchIntegration,
+    mode: &str,
+    allow_network: bool,
+) -> Result<(), ClientError> {
+    if mode == "inherit" {
+        configure_network_access(command, integration, allow_network);
+        return Ok(());
+    }
+    match integration {
+        LaunchIntegration::Codex => {
+            command.args([
+                "-c",
+                "approval_policy=\"never\"",
+                "-c",
+                "sandbox_mode=\"danger-full-access\"",
+            ]);
+        }
+        LaunchIntegration::Claude => {
+            command.args([
+                "--permission-mode",
+                "bypassPermissions",
+                "--settings",
+                r#"{"sandbox":{"enabled":false},"skipDangerousModePermissionPrompt":true}"#,
+            ]);
+        }
+        LaunchIntegration::Opencode => {
+            let content = command
+                .get_envs()
+                .find(|(key, _)| *key == "OPENCODE_CONFIG_CONTENT")
+                .and_then(|(_, value)| value)
+                .ok_or_else(|| usage("missing OpenCode launch configuration"))?;
+            let mut config: Value = serde_json::from_str(&content.to_string_lossy())
+                .map_err(|_| usage("invalid OpenCode launch configuration"))?;
+            config["permission"] = serde_json::json!({"*": "allow"});
+            command.env("OPENCODE_CONFIG_CONTENT", config.to_string());
+            command.env("OPENCODE_PERMISSION", r#"{"*":"allow"}"#);
+        }
+    }
+    Ok(())
+}
+
 fn launch_child(
     integration: LaunchIntegration,
     yes: bool,
     allow_network: bool,
+    mode: &str,
     launch: ReadyLaunch<'_>,
     extra_args: &[String],
 ) -> Result<(), ClientError> {
     let executable = ensure_executable(integration, yes)?;
     let mut command = Command::new(executable);
-    configure_network_access(&mut command, integration, allow_network);
+    if integration != LaunchIntegration::Opencode {
+        configure_launch_permissions(&mut command, integration, mode, allow_network)?;
+    }
     command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -696,6 +770,9 @@ fn launch_child(
             launch.token,
             extra_args,
         )?,
+    }
+    if integration == LaunchIntegration::Opencode {
+        configure_launch_permissions(&mut command, integration, mode, allow_network)?;
     }
     let status = command
         .status()
@@ -1173,13 +1250,16 @@ fn render_plan(plan: &LaunchPlan, json: bool) -> Result<(), ClientError> {
         );
     } else {
         println!(
-            "{} {} with {} on {} ({}; network={})",
+            "{} {} with {} on {} ({}; mode={}; network={})",
             plan.action,
             plan.integration,
             plan.model,
             plan.instance,
             plan.host,
-            if plan.allow_network {
+            plan.mode,
+            if plan.mode == "auto" {
+                "full-access"
+            } else if plan.allow_network {
                 "requested"
             } else {
                 "agent-default"
@@ -1289,6 +1369,70 @@ mod tests {
         configure_network_access(&mut command, LaunchIntegration::Codex, true);
         let args: Vec<_> = command.get_args().collect();
         assert_eq!(args, ["-c", "sandbox_workspace_write.network_access=true"]);
+    }
+
+    #[test]
+    fn auto_mode_grants_codex_full_access_without_approvals() {
+        let mut command = Command::new("codex");
+        configure_launch_permissions(&mut command, LaunchIntegration::Codex, "auto", false)
+            .unwrap();
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "-c",
+                "approval_policy=\"never\"",
+                "-c",
+                "sandbox_mode=\"danger-full-access\""
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_mode_grants_claude_full_access_without_approvals() {
+        let mut command = Command::new("claude");
+        configure_launch_permissions(&mut command, LaunchIntegration::Claude, "auto", true)
+            .unwrap();
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "--permission-mode",
+                "bypassPermissions",
+                "--settings",
+                r#"{"sandbox":{"enabled":false},"skipDangerousModePermissionPrompt":true}"#
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_mode_preserves_opencode_provider_and_allows_tools() {
+        let mut command = Command::new("opencode");
+        command.env(
+            "OPENCODE_CONFIG_CONTENT",
+            r#"{"provider":{"sparkplane":{}},"model":"sparkplane/test"}"#,
+        );
+        configure_launch_permissions(&mut command, LaunchIntegration::Opencode, "auto", false)
+            .unwrap();
+        let content = command_env(&command, "OPENCODE_CONFIG_CONTENT")
+            .unwrap()
+            .unwrap();
+        let config: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(config["permission"]["*"], "allow");
+        assert_eq!(config["model"], "sparkplane/test");
+        assert!(config["provider"]["sparkplane"].is_object());
+    }
+
+    #[test]
+    fn inherit_mode_preserves_agent_permissions() {
+        for integration in [
+            LaunchIntegration::Codex,
+            LaunchIntegration::Claude,
+            LaunchIntegration::Opencode,
+        ] {
+            let mut command = Command::new(integration.as_str());
+            configure_launch_permissions(&mut command, integration, "inherit", false).unwrap();
+            assert_eq!(command.get_args().count(), 0);
+            assert_eq!(command.get_envs().count(), 0);
+        }
     }
 
     #[test]
@@ -1650,6 +1794,7 @@ mod tests {
     fn restore_flags_cannot_be_combined() {
         let args = LaunchArgs {
             integration: LaunchIntegration::Codex,
+            mode: "auto".into(),
             allow_network: false,
             model: Some("ornith".into()),
             configure: false,

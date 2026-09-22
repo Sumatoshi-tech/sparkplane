@@ -139,7 +139,7 @@ sparkplane dgx-spark token create --name reader --scope models:read \
   --scope operations:read --detach --json
 sparkplane dgx-spark client-config ornith --client codex
 sparkplane dgx-spark launch codex --model ornith-1.5:9b
-sparkplane dgx-spark launch claude --model ornith-1.5:9b -- --permission-mode plan
+sparkplane dgx-spark launch claude --mode inherit --model ornith-1.5:9b -- --permission-mode plan
 sparkplane dgx-spark launch opencode --model ornith-1.5:9b
 ```
 

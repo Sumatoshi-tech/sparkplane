@@ -2101,6 +2101,7 @@ mod tests {
                 compile_cache_bytes: 4,
             },
             context_window: 65_536,
+            input_modalities: vec!["text".into()],
             default_reasoning_effort: None,
             generation: 1,
             desired: InstanceDesiredState::Running,

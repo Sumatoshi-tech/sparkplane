@@ -55,6 +55,10 @@ hermetic and do not contact a Spark or allocate a GPU.
 - [CLI and runtime reference](docs/reference/spark.md)
 - [Security and release authority](SECURITY.md)
 
+To build and preview a signed source update, run `make update HOST=dgx-spark`.
+Apply it with `python3 scripts/update-spark.py dgx-spark --apply`; see the
+[workstation update workflow](docs/how-to/develop-spark.md#update-a-spark-from-this-checkout).
+
 Inference URLs use `/openai/<instance>/v1` and `/anthropic/<instance>/v1`.
 The control API uses `/api/sparkplane/v1`. Runtime paths, units, schemas,
 environment variables and Docker ownership use the Sparkplane namespace.

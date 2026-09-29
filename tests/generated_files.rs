@@ -33,6 +33,51 @@ fn unowned_marker_and_symlink_do_not_grant_permission_to_overwrite() {
 }
 
 #[test]
+fn codex_profile_settings_do_not_block_republication_or_restore() {
+    let root = tempfile::tempdir().unwrap();
+    let profile = b"# owned-by: sparkplane launch\nmodel = \"m\"\nmodel_provider = \"p\"\nweb_search = \"disabled\"\n\n[model_providers.p]\nname = \"n\"\nbase_url = \"https://example/v1\"\nenv_key = \"SPARKPLANE_INFERENCE_TOKEN\"\nwire_api = \"responses\"\nsupports_standalone_web_search = false\nsupports_websockets = false\n";
+    sparkplane::generated_files::publish(root.path(), profile, b"catalog").unwrap();
+    let edited = std::str::from_utf8(profile).unwrap().replace(
+        "web_search = \"disabled\"\n",
+        "web_search = \"disabled\"\napprovals_reviewer = \"user\"\n",
+    );
+    let path = root.path().join("sparkplane-launch.config.toml");
+    std::fs::write(&path, &edited).unwrap();
+    let next = b"# owned-by: sparkplane launch\nmodel = \"next\"\nmodel_provider = \"p\"\nweb_search = \"disabled\"\n\n[model_providers.p]\nname = \"n\"\nbase_url = \"https://example/v1\"\nenv_key = \"SPARKPLANE_INFERENCE_TOKEN\"\nwire_api = \"responses\"\nsupports_standalone_web_search = false\nsupports_websockets = false\n";
+    sparkplane::generated_files::publish(root.path(), next, b"next catalog").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), next);
+    std::fs::write(
+        &path,
+        std::str::from_utf8(next).unwrap().replace(
+            "web_search = \"disabled\"\n",
+            "web_search = \"disabled\"\napprovals_reviewer = \"user\"\n",
+        ),
+    )
+    .unwrap();
+    sparkplane::generated_files::remove(root.path()).unwrap();
+    assert!(!path.exists());
+}
+
+#[test]
+fn a_changed_managed_line_names_the_file_and_leaves_it_in_place() {
+    let root = tempfile::tempdir().unwrap();
+    let profile = b"model = \"m\"\nweb_search = \"disabled\"\n";
+    sparkplane::generated_files::publish(root.path(), profile, b"catalog").unwrap();
+    let path = root.path().join("sparkplane-launch.config.toml");
+    std::fs::write(&path, b"model = \"edited\"\nweb_search = \"disabled\"\n").unwrap();
+    let error =
+        sparkplane::generated_files::publish(root.path(), b"model = \"next\"\n", b"catalog")
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains(&path.display().to_string()), "{error}");
+    assert!(error.contains("Move it aside and retry"), "{error}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"model = \"edited\"\nweb_search = \"disabled\"\n"
+    );
+}
+
+#[test]
 fn an_interrupted_pair_update_can_be_completed_without_losing_ownership() {
     use sha2::{Digest, Sha256};
     let root = tempfile::tempdir().unwrap();

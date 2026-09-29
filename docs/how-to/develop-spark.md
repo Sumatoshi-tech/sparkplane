@@ -21,8 +21,8 @@ commit revision.
 
 The laptop is the control plane. `sparkplane <host> ...` talks to the remote
 agent over its pinned TLS endpoint; it does not run Docker commands or copy
-arbitrary files over SSH. SSH/SFTP is used only by the signed bootstrap and
-upgrade protocol.
+arbitrary files over SSH. SSH/SFTP handles signed bootstrap, upgrade and recovery;
+the workstation update helper also reads the installed public release key over SSH.
 
 ## Repository map
 
@@ -30,6 +30,7 @@ upgrade protocol.
 | --- | --- |
 | `.github/workflows/spark-release.yml` | CI contract, ARM64 build, packaging, and tagged signing |
 | `scripts/package-spark-release.sh` | Creates the exact release bundle and checksum manifest |
+| `scripts/update-spark.py` | Builds, signs, previews and applies a local workstation update |
 | `configs/sparkplane/agent.toml`, `executor.toml` | Listener, paths, resource reserves, and pinned host policy |
 | `configs/sparkplane/engines/*.toml` | Digest-pinned runtime recipes, matchers, routes, and profiles |
 | `configs/sparkplane/models.toml` | Reproducible model identities and artifact metadata |
@@ -61,6 +62,82 @@ The tests parse and validate the real files under `configs/`; do not replace
 them with a second test fixture. A new workload or protocol path also needs a
 black-box test against the running daemon where practical.
 
+## Update a Spark from this checkout
+
+Use the workstation helper for a source update. It requires Linux x86-64 or
+ARM64, Python 3.11+, the development dependencies above, Cargo Auditable,
+Cargo Zigbuild, Zig, the Rust ARM64 target, Minisign, and a working OpenSSH alias
+with an existing Sparkplane installation and authenticated client configuration.
+The [workstation signing authority](#reuse-the-workstation-signing-credential)
+must already exist; the helper does not provision or replace keys.
+
+```bash
+# Build, sign and preview the exact candidate; engines continue serving.
+python3 scripts/update-spark.py dgx-spark
+# Equivalent convenience target:
+make update HOST=dgx-spark
+
+# Build, preview and apply, then install the verified workstation client.
+python3 scripts/update-spark.py dgx-spark --apply
+```
+
+Preparation runs `make lint`, `make test`, `make test-client` and `make audit`,
+builds an auditable native client and ARM64 appliance, and packages the shipped
+catalogs using the existing release packager. Each run uses fresh directories
+under ignored `target/spark-updates/`; it never edits an earlier signed bundle.
+The outer signed manifest covers the native client, build metadata, public key,
+and signed appliance manifest. Both inventories and signatures are verified
+against the independently pinned key before the bundled client executes.
+
+By default the key is `release.key`, the pinned public key is `release.pub`, and
+the encrypted user credential is `password.cred`, all under
+`${XDG_CONFIG_HOME:-$HOME/.config}/sparkplane-release-signing/`. Use
+`--signing-dir` and `--public-key` for other established paths. When
+`password.cred` exists, the helper decrypts it with the user-scoped credential
+name `sparkplane-release-password` and feeds Minisign through stdin. The password
+stays in process memory and stdin; it is never an argument, environment variable,
+log or release file. Without that credential, Minisign prompts in your terminal.
+SSH and remote sudo authentication use their existing interactive prompts.
+
+The helper compares the pinned authority with
+`/opt/sparkplane/current/minisign.pub` over authenticated SSH and rejects a
+mismatch. `--apply` performs the managed signed `upgrade` only after the exact
+candidate dry-run succeeds. Afterwards it checks agent/executor versions,
+semantic health, `doctor`, and the running instances' generation, model,
+artifacts, engine fingerprints, resources and context. It then atomically
+updates `~/.local/bin/sparkplane` to a verified client in a fresh digest-named
+release directory. The preceding client remains available, and the published
+client updater's `current` pointer is unchanged. An existing regular executable
+at that path is a conflict; use `--no-install-client` to retain it.
+
+The preview prints its signed release path. Reuse that exact release to apply
+without rebuilding or accessing the signing secret; the helper verifies it and
+performs a fresh host preview:
+
+```bash
+python3 scripts/update-spark.py dgx-spark \
+  --prepared target/spark-updates/release-<id> --apply
+```
+
+Use `--json` for one `sparkplane.workstation-update/v1` result on stdout; progress
+and authentication prompts go to stderr. Check `state`, `appliance_applied`,
+`release` and `evidence`. Every run retains private check logs, before/after
+status and instance inventories, the dry-run, activation result and final
+result. `--evidence-dir` changes the parent of that fresh private run directory;
+`--config-dir` selects an existing Sparkplane client configuration directory.
+If interrupted or if verification fails after activation, inspect the evidence
+and `sparkplane <host> status --json` before choosing the documented recovery
+operation. A failed result does not imply the appliance was unchanged.
+
+This helper updates the control plane and workstation client while preserving
+running engines. For changes requiring a new engine generation or refreshed
+model traits, follow [capability activation](#activate-a-capability-change-on-an-existing-instance)
+and use the helper's signed `appliance/` bundle at the upgrade step. After a
+healthy instance already exposes its new capabilities, add
+`--codex-model qwen3.8:flash-next` to an apply to regenerate the managed Codex
+profile and model catalog. Ownership conflicts still fail through the normal
+launch guard.
+
 ## Build the ARM64 executable
 
 Install the target and the tools used by CI (`cargo-zigbuild` is preferred for
@@ -75,7 +152,7 @@ python3 -m pip install --user ziglang==0.16.0
 Build locally with the same feature boundary as Spark:
 
 ```bash
-cargo zigbuild --release \
+cargo auditable zigbuild --locked --release \
   --target aarch64-unknown-linux-gnu \
   --no-default-features --features appliance --bin sparkplane
 ```
@@ -124,6 +201,35 @@ commit them, place them in the bundle, or print them in a log. The public key
 is pinned in the operator's local Spark configuration. A manually dispatched
 workflow builds and uploads an artifact but deliberately does not sign it;
 only a `v*` tag invokes the CI signing step.
+
+### Reuse the workstation signing credential
+
+The existing workstation authority may already be provisioned under
+`~/.config/sparkplane-release-signing/`. Its encrypted `release.key` uses the
+user-scoped systemd credential `password.cred`, whose embedded name is
+`sparkplane-release-password`. Reuse this authority; do not run key generation
+again for a local activation. Confirm its public key matches the installed,
+trusted authority before signing.
+
+Feed the decrypted credential directly to Minisign, with shell tracing disabled
+and pipeline failures enabled:
+
+```bash
+set +x
+set -o pipefail
+sparkplane_signing_dir="${XDG_CONFIG_HOME:-$HOME/.config}/sparkplane-release-signing"
+systemd-creds --user --name=sparkplane-release-password \
+  decrypt "$sparkplane_signing_dir/password.cred" - |
+  minisign -Sm target/spark-release/SHA256SUMS \
+    -s "$sparkplane_signing_dir/release.key"
+minisign -Vm target/spark-release/SHA256SUMS \
+  -p "$sparkplane_signing_dir/release.pub"
+```
+
+This requires the same workstation user and credential encryption key used at
+provisioning. The plaintext password stays in the pipe. SSH and remote sudo
+authentication remain separate and use the existing OpenSSH transport; do not
+put those credentials in command arguments, documentation, or release assets.
 
 ### Provision the release authority
 
@@ -194,7 +300,9 @@ sparkplane dgx-spark install --yes \
 For an installed host, use the side-by-side upgrade protocol:
 
 ```bash
-sparkplane dgx-spark upgrade --dry-run --json
+sparkplane dgx-spark upgrade --dry-run --json \
+  --probe release/sparkplane-aarch64 \
+  --release-manifest release/SHA256SUMS
 sparkplane dgx-spark upgrade --yes \
   --probe release/sparkplane-aarch64 \
   --release-manifest release/SHA256SUMS \
@@ -236,6 +344,93 @@ sparkplane dgx-spark operations cancel 01K... --dry-run
 Certificate rotation is separate from a software release:
 `sparkplane dgx-spark cert rotate --dry-run --json`, followed by `--yes` after
 review. Use `--ca` only when replacing the certificate authority.
+
+### Activate a capability change on an existing instance
+
+A control-plane-only upgrade can preserve a running engine. Changing an engine
+profile or stored model capability requires a managed stop and a new serving
+generation. Existing model records retain their verified artifact traits;
+deploying a new `models.toml` does not update those records automatically.
+
+For the Qwen3.8 image-input correction, build both the appliance and the
+workstation client from the tested source. The client generates Codex's model
+catalog, while the appliance publishes the live route's supported modalities:
+
+```bash
+cargo auditable build --locked --release --bin sparkplane
+```
+
+Use `target/release/sparkplane` for the following commands if the client on
+`PATH` has not been updated. Package, sign, verify, and dry-run the ARM64 release
+before stopping the model. Save `ps --json`, including the instance name,
+generation, immutable model, image/profile fingerprints, resources and context.
+Confirm the workload has no running or queued requests before the restart.
+
+```bash
+sparkplane dgx-spark ps --json
+sparkplane dgx-spark stop qwen38-vllm --json
+sparkplane dgx-spark upgrade --yes --json \
+  --probe release/sparkplane-aarch64 \
+  --release-manifest release/SHA256SUMS \
+  --release-signature release/SHA256SUMS.minisig \
+  --release-public-key "$sparkplane_signing_dir/release.pub"
+sparkplane dgx-spark download qwen3.8:flash-next --dry-run --json
+sparkplane dgx-spark download qwen3.8:flash-next --update-alias --detach --json
+sparkplane dgx-spark operations <download-operation-id> --follow --json
+sparkplane dgx-spark serve qwen3.8:flash-next --name qwen38-vllm --dry-run --json
+sparkplane dgx-spark serve qwen3.8:flash-next --name qwen38-vllm --detach --json
+sparkplane dgx-spark operations <serve-operation-id> --follow --json
+sparkplane dgx-spark ps --json
+```
+
+The download operation resolves the signed catalog's immutable revision and
+reverifies the existing native cache. With a complete cache, the dry-run reports
+`unique_bytes: 0` and no model weight transfer is needed. Wait for each managed
+operation to succeed before advancing. Retain the previous signed release and
+image for rollback; do not edit the live database, catalogs, or container.
+
+Hub metadata resolution can exceed the workstation host profile's default
+`request_timeout_seconds = 30`, even when all weights are cached. A dry-run
+timeout does not prove the cache is missing. Increase that host's request timeout
+for a bounded retry of the plan. Detached refresh and serving operations return
+their identifiers immediately. Following uses the same request timeout; if it
+reports that the operation is still running, reconnect with the same identifier
+instead of submitting another download or serve request. Advance only after
+`state: "succeeded"`. A complete cache reports zero transfer bytes, but its
+existing files still undergo checksum verification, which can take minutes.
+Refreshing capability traits also changes the artifact fingerprint and selects
+a separate compile-cache namespace. Allow the normal cold start, compilation,
+and semantic probes to finish; retain the previous namespace for rollback.
+
+For this correction, the engine image, launch arguments, resource envelope,
+262,144-token context, BF16 KV and MTP settings stay unchanged. The new profile
+adds a bounded image policy and semantic image health probe. After the new
+generation becomes healthy, `ps --json` must advertise
+`input_modalities: ["text", "image"]`. Verify an inline-image request through the
+authenticated public gateway, then regenerate the owned client configuration:
+
+```bash
+sparkplane dgx-spark launch codex --model qwen3.8:flash-next --config --json
+sparkplane dgx-spark launch codex --model qwen3.8:flash-next
+```
+
+The generated `sparkplane-launch-models.json` must include both `text` and
+`image`. Relaunch Codex so it reads that catalog. Do not hand-edit the catalog
+or its ownership receipt to make an old session accept attachments.
+
+If regeneration reports an ownership conflict, preserve a private backup of the
+affected profile and its receipt, move the indicated profile aside, and rerun
+`launch ... --config --json`. Additional tables such as `[tui]` in an earlier
+profile can cause this conflict. The launcher regenerates both owned files and
+their receipt through the normal publication path.
+
+Verify an actual attachment with a small test image:
+
+```bash
+sparkplane dgx-spark launch codex --model qwen3.8:flash-next --mode inherit -- \
+  exec --sandbox read-only --image ./test-image.png -- \
+  "Describe the attached image."
+```
 
 ## Add an engine
 

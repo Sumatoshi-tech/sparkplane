@@ -1,8 +1,9 @@
-.PHONY: build test lint lint-spark test-client fmt-check audit
+.PHONY: build test lint lint-spark test-client fmt-check audit update
 build:
 	cargo build --locked --release --features appliance
 test:
 	python3 tests/standalone_contract.py
+	python3 tests/spark_update.py
 	cargo test --locked --workspace --all-targets --features appliance
 test-client:
 	cargo test --locked --no-default-features --all-targets
@@ -15,3 +16,6 @@ fmt-check:
 	cargo fmt --all -- --check
 audit:
 	cargo deny --all-features check
+HOST ?= dgx-spark
+update:
+	@python3 scripts/update-spark.py "$(HOST)"

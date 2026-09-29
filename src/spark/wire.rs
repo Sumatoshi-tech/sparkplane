@@ -580,6 +580,9 @@ pub struct InstanceDocument {
     pub resources: RecipeResourceEnvelopeDocument,
     #[serde(default)]
     pub context_window: u64,
+    /// Input supported by the published route for this exact generation.
+    #[serde(default = "default_instance_input_modalities")]
+    pub input_modalities: Vec<String>,
     #[serde(default)]
     pub default_reasoning_effort: Option<String>,
     pub generation: u64,
@@ -605,6 +608,10 @@ pub struct InstanceDocument {
 pub struct InstanceListDocument {
     pub schema: String,
     pub instances: Vec<InstanceDocument>,
+}
+
+fn default_instance_input_modalities() -> Vec<String> {
+    vec!["text".into()]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

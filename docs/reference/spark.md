@@ -239,9 +239,12 @@ host/integration selection is reused; an interactive terminal can select from
 installed models. `--config` writes only launch-owned state/config and exits.
 `--dry-run` performs no local or remote mutation. `--json` is valid with either
 of those non-agent modes. Generated files have a private digest-based ownership
-receipt. Launch and restore verify both files before changing either; a user edit,
-symlink or unowned destination is a conflict, not permission to overwrite it.
-Move a conflicting file to your own backup location before regenerating it.
+receipt. Launch and restore verify both files before changing either. Codex may
+write its own settings, such as `approvals_reviewer`, into the profile; those
+extra lines do not block the next launch, and the profile is rewritten from the
+managed route. A change to a managed line, a symlink, or an unowned destination
+is a conflict. The error prints the path; move that file aside before retrying.
+There is no `--force`.
 Interrupted publication can be retried safely. `--restore` removes only Sparkplane-owned Codex
 profile/catalog files. `-y` permits the fixed Claude or OpenCode installer when
 the executable is absent. Only arguments after `--` are forwarded, without a
@@ -252,6 +255,20 @@ bearer is held separately in a mode-0600 credential file. The child receives an
 inference-only token and pinned CA, never the administrator credential. Claude
 uses the native Anthropic route, Codex uses a Sparkplane-owned Responses profile and
 catalog, and OpenCode uses process-local `OPENCODE_CONFIG_CONTENT`.
+
+Codex image attachments follow `input_modalities` reported by the healthy
+instance's published gateway route. Image support requires the verified model
+and engine vision policy; a vision-capable checkpoint on a text-only route
+still accepts only text. Older agents that omit this field default to text.
+Relaunch Codex after changing the qualified instance so its catalog is refreshed.
+Existing model records retain their verified artifact traits across upgrades.
+When a catalog adds vision support, refresh the record through the managed
+`download --update-alias` operation and re-serve it with the updated engine
+policy before relaunching Codex.
+The Qwen3.8 vLLM policy accepts one inline PNG, JPEG, or WebP image per request,
+at most 512 KiB of image data, with width and height at most 4096 pixels.
+See the [live capability activation procedure](../how-to/develop-spark.md#activate-a-capability-change-on-an-existing-instance)
+for signing, cached-model refresh, managed restart, and attachment verification.
 
 ### Internet access for development
 

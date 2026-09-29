@@ -1699,6 +1699,7 @@ async fn serve_instance(
         objective: "inference".into(),
         resources,
         context_window,
+        input_modalities: vec!["text".into()],
         default_reasoning_effort,
         generation: 0,
         desired: InstanceDesiredState::Running,
@@ -2751,9 +2752,18 @@ async fn list_instances(State(state): State<AgentState>, RawQuery(query): RawQue
 }
 
 fn project_route_health(routes: &RouteRegistry, instances: &mut [InstanceDocument]) {
-    for instance in instances.iter_mut().filter(|instance| instance.healthy) {
-        if !matches!(routes.lookup(&instance.name), RouteLookup::Healthy(route) if route.generation == instance.generation)
+    for instance in instances {
+        instance.input_modalities = vec!["text".into()];
+        if !instance.healthy {
+            continue;
+        }
+        if let RouteLookup::Healthy(route) = routes.lookup(&instance.name)
+            && route.generation == instance.generation
         {
+            if route.profile.capabilities.contains("vision") && route.profile.vision.is_some() {
+                instance.input_modalities.push("image".into());
+            }
+        } else {
             instance.observed = InstanceObservedState::Degraded;
             instance.healthy = false;
             instance.endpoint = None;
@@ -6460,6 +6470,7 @@ mod tests {
                 compile_cache_bytes: 1,
             },
             context_window: 65_536,
+            input_modalities: vec!["text".into()],
             default_reasoning_effort: None,
             generation: 0,
             desired: crate::spark::wire::InstanceDesiredState::Running,
@@ -6543,6 +6554,109 @@ mod tests {
         let mut instance = creating_instance(&ornith_model());
         instance.desired = crate::spark::wire::InstanceDesiredState::Stopped;
         assert!(!super::reconcile_expects_container(&instance));
+    }
+
+    #[tokio::test]
+    async fn instance_image_support_follows_the_published_generation_over_https() {
+        let (state, database, _root) = durable_state().await;
+        let model = ornith_model();
+        database.promote_model(model.clone(), false).await.unwrap();
+        let instance = database
+            .begin_serve(creating_instance(&model))
+            .await
+            .unwrap()
+            .instance;
+        database
+            .set_instance_observed(
+                &instance.id,
+                instance.generation,
+                crate::spark::wire::InstanceObservedState::Healthy,
+                Some("/openai/ornith/v1".into()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let routes = state.routes.clone();
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certificate = cert.pem();
+        let tls = super::tls13_config(
+            certificate.as_bytes().to_vec(),
+            signing_key.serialize_pem().into_bytes(),
+        )
+        .await
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = axum_server::Handle::new();
+        let server_handle = handle.clone();
+        let server = tokio::spawn(async move {
+            axum_server::from_tcp_rustls(listener, tls)
+                .unwrap()
+                .handle(server_handle)
+                .serve(router(state).into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(reqwest::Certificate::from_pem(certificate.as_bytes()).unwrap())
+            .build()
+            .unwrap();
+        let vision = crate::spark::engine::EnginePolicy::parse(include_str!(
+            "../../configs/sparkplane/engines/llama-cpp.toml"
+        ))
+        .unwrap()
+        .gateway_profile(None);
+        let mut missing_policy = vision.clone();
+        missing_policy.vision = None;
+        for (generation, profile, expected) in [
+            (
+                instance.generation,
+                crate::spark::gateway::GatewayProfile::text(),
+                vec!["text"],
+            ),
+            (instance.generation, vision.clone(), vec!["text", "image"]),
+            (instance.generation, missing_policy, vec!["text"]),
+            (instance.generation + 1, vision, vec!["text"]),
+        ] {
+            let upstream = crate::spark::upstream::ObservedRoute::new(
+                &instance.id,
+                generation,
+                "172.30.0.2".parse().unwrap(),
+                8000,
+                [("POST", "/v1/chat/completions")],
+            )
+            .unwrap();
+            routes.publish_with_profile(
+                &instance.name,
+                instance.model.clone(),
+                "Ornith-1.5-9B".into(),
+                profile,
+                upstream,
+            );
+            let list: crate::spark::wire::InstanceListDocument = client
+                .get(format!(
+                    "https://localhost:{}{API_BASE}/instances",
+                    address.port()
+                ))
+                .bearer_auth(TOKEN)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(list.instances[0].input_modalities, expected);
+            assert_eq!(list.instances[0].healthy, generation == instance.generation);
+        }
+        handle.graceful_shutdown(None);
+        server.await.unwrap();
+        database.shutdown().unwrap();
     }
 
     #[tokio::test]
@@ -6785,6 +6899,7 @@ mod tests {
                 compile_cache_bytes: 1,
             },
             context_window: 65_536,
+            input_modalities: vec!["text".into()],
             default_reasoning_effort: None,
             generation: 0,
             desired: crate::spark::wire::InstanceDesiredState::Running,

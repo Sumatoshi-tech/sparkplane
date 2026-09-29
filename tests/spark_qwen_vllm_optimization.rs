@@ -1,3 +1,78 @@
+#[cfg(feature = "appliance")]
+#[test]
+fn qwen38_checkpoint_and_selected_engine_accept_inline_images() {
+    use sparkplane::spark::{engine::EngineCatalog, gateway, model_catalog::ModelCatalog};
+    let models = ModelCatalog::parse(include_str!("../configs/sparkplane/models.toml")).unwrap();
+    let artifacts = models.resolve("qwen3.8:flash-next").unwrap().artifacts();
+    let directory =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("configs/sparkplane/engines");
+    let files = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "toml")
+        })
+        .map(|path| {
+            (
+                path.display().to_string(),
+                std::fs::read_to_string(path).unwrap(),
+            )
+        });
+    let engines = EngineCatalog::parse_files(files).unwrap();
+    let engine = engines.select(artifacts).unwrap();
+    let profile = engine
+        .gateway_profile_for(Some("qwen4_exp"), artifacts, None)
+        .unwrap();
+    let vision = profile
+        .vision
+        .as_ref()
+        .expect("Qwen image input must have a verified vision policy");
+    assert_eq!(
+        vision.processor_sha256,
+        "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+    );
+    let image = serde_json::json!({"type":"input_image", "image_url":format!("data:image/png;base64,{}", vision.health_image_base64)});
+    let mut request = serde_json::json!({"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Name the color."},image]}]});
+    let rewrite = gateway::rewrite_responses_request_with_profile(
+        &serde_json::to_vec(&request).unwrap(),
+        "served-model",
+        &profile,
+    )
+    .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&rewrite.body).unwrap();
+    assert_eq!(
+        body["messages"][0]["content"][1]["image_url"]["url"],
+        image["image_url"]
+    );
+
+    let mut text_only = artifacts.clone();
+    text_only.capabilities.retain(|value| value != "vision");
+    let text_profile = engine
+        .gateway_profile_for(Some("qwen4_exp"), &text_only, None)
+        .unwrap();
+    assert!(
+        gateway::rewrite_responses_request_with_profile(
+            &serde_json::to_vec(&request).unwrap(),
+            "served-model",
+            &text_profile
+        )
+        .is_err()
+    );
+    request["input"][0]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(image);
+    assert!(
+        gateway::rewrite_responses_request_with_profile(
+            &serde_json::to_vec(&request).unwrap(),
+            "served-model",
+            &profile
+        )
+        .is_err()
+    );
+}
+
 #[test]
 fn optimized_runtime_keeps_graphs_without_global_eager_module_loading() {
     let profile: toml::Value = toml::from_str(include_str!(

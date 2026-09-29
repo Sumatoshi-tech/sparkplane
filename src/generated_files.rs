@@ -14,9 +14,24 @@ const FILES: [&str; 2] = [
     "sparkplane-launch.config.toml",
     "sparkplane-launch-models.json",
 ];
+const PROFILE: &str = FILES[0];
 const RECEIPT: &str = "sparkplane-launch.ownership.json";
 const SCHEMA: &str = "sparkplane.generated-files/v1";
 const MAX_BYTES: u64 = 1024 * 1024;
+/// Assignments written by `codex_client_config`. Codex persists other settings,
+/// such as `approvals_reviewer`, into the active profile; those lines are not
+/// a conflict. Edits to these keys still are.
+const MANAGED_KEYS: [&str; 9] = [
+    "model",
+    "model_provider",
+    "web_search",
+    "name",
+    "base_url",
+    "env_key",
+    "wire_api",
+    "supports_standalone_web_search",
+    "supports_websockets",
+];
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -131,13 +146,11 @@ pub fn publish(home: &Path, profile: &[u8], catalog: &[u8]) -> Result<()> {
         let mut owned = vec![hash.clone()];
         if let Some(current) = read(home, name)? {
             let current_hash = format!("{:x}", Sha256::digest(&current));
+            let hashes = pending.files.get(name).map(Vec::as_slice).unwrap_or(&[]);
             ensure!(
-                current == bytes
-                    || pending
-                        .files
-                        .get(name)
-                        .is_some_and(|hashes| hashes.contains(&current_hash)),
-                "refusing to overwrite modified or unowned generated file {name}"
+                current == bytes || still_owned(name, &current, hashes),
+                "{}",
+                conflict(home, name, "overwrite")
             );
             if current_hash != hash {
                 owned.push(current_hash);
@@ -160,13 +173,11 @@ pub fn remove(home: &Path) -> Result<()> {
     let mut present = Vec::new();
     for name in FILES {
         if let Some(bytes) = read(home, name)? {
-            let hash = format!("{:x}", Sha256::digest(bytes));
+            let hashes = receipt.files.get(name).map(Vec::as_slice).unwrap_or(&[]);
             ensure!(
-                receipt
-                    .files
-                    .get(name)
-                    .is_some_and(|hashes| hashes.contains(&hash)),
-                "refusing to remove modified or unowned generated file {name}"
+                still_owned(name, &bytes, hashes),
+                "{}",
+                conflict(home, name, "remove")
             );
             present.push(name);
         }
@@ -181,5 +192,55 @@ pub fn remove(home: &Path) -> Result<()> {
             schema: SCHEMA.into(),
             files: BTreeMap::new(),
         })?,
+    )
+}
+
+fn still_owned(name: &str, bytes: &[u8], hashes: &[String]) -> bool {
+    if owned_digest(bytes, hashes) {
+        return true;
+    }
+    // Codex rewrites the live profile with settings Sparkplane does not generate.
+    // The managed lines must still be exactly the bytes Sparkplane published.
+    name == PROFILE && owned_digest(&without_foreign_assignments(bytes), hashes)
+}
+
+fn owned_digest(bytes: &[u8], hashes: &[String]) -> bool {
+    let digest = format!("{:x}", Sha256::digest(bytes));
+    hashes.iter().any(|hash| hash == &digest)
+}
+
+fn without_foreign_assignments(bytes: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return bytes.to_vec();
+    };
+    let mut kept = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        if !foreign_assignment(line) {
+            kept.push_str(line);
+        }
+    }
+    kept.into_bytes()
+}
+
+fn foreign_assignment(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with(['#', '[']) {
+        return false;
+    }
+    let Some((key, _)) = trimmed.split_once('=') else {
+        return false;
+    };
+    let key = key.trim();
+    !key.is_empty()
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && !MANAGED_KEYS.contains(&key)
+}
+
+fn conflict(home: &Path, name: &str, action: &str) -> String {
+    format!(
+        "refusing to {action} {}: it no longer matches the Sparkplane ownership receipt. Move it aside and retry",
+        home.join(name).display()
     )
 }

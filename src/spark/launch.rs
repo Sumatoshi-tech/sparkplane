@@ -620,22 +620,22 @@ fn configure_integration(
             "Spark instance has no declared context window; restart it with the current engine configuration",
         ));
     }
-    let catalog_value = codex_catalog(model, instance.context_window);
+    let catalog_value = codex_catalog(model, instance);
     let catalog_text = serde_json::to_vec_pretty(&catalog_value)
         .map_err(|_| failure(EXIT_INTERNAL, "could not encode Codex model catalog"))?;
     crate::generated_files::publish(&home, profile_text.as_bytes(), &catalog_text)
         .map_err(|error| usage(format!("generated client files: {error:#}")))
 }
 
-fn codex_catalog(model: &ModelDocument, context_window: u64) -> Value {
+fn codex_catalog(model: &ModelDocument, instance: &InstanceDocument) -> Value {
     serde_json::json!({
         "owned_by": OWNED_MARKER,
         "models": [{
             "slug": model.canonical,
             "display_name": model.aliases.first().unwrap_or(&model.repository),
             "description": model.canonical,
-            "context_window": context_window,
-            "max_context_window": context_window,
+            "context_window": instance.context_window,
+            "max_context_window": instance.context_window,
             "effective_context_window_percent": 100,
             "shell_type": "default",
             "visibility": "list",
@@ -644,7 +644,7 @@ fn codex_catalog(model: &ModelDocument, context_window: u64) -> Value {
             "additional_speed_tiers": [],
             "service_tiers": [],
             "truncation_policy": { "mode": "bytes", "limit": 10000 },
-            "input_modalities": ["text"],
+            "input_modalities": instance.input_modalities,
             "base_instructions": "",
             "default_reasoning_summary": "none",
             "support_verbosity": true,
@@ -1348,6 +1348,7 @@ mod tests {
                 compile_cache_bytes: 0,
             },
             context_window: 65_536,
+            input_modalities: vec!["text".into()],
             default_reasoning_effort: None,
             generation: 1,
             desired: InstanceDesiredState::Running,
@@ -1689,8 +1690,50 @@ mod tests {
     }
 
     #[test]
+    fn codex_catalog_advertises_the_active_instances_image_support() {
+        let model = model("m_one", "vision");
+        let mut instance = instance("vision", &model.id);
+        instance.input_modalities = vec!["text".into(), "image".into()];
+        let catalog = codex_catalog(&model, &instance);
+        assert_eq!(
+            catalog["models"][0]["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+        assert_eq!(
+            catalog["models"][0]["context_window"],
+            instance.context_window
+        );
+    }
+
+    #[test]
+    fn codex_catalog_keeps_a_vision_checkpoint_text_only_on_a_text_route() {
+        let mut model = model("m_one", "vision");
+        let mut artifacts = artifacts();
+        artifacts.capabilities.push("vision".into());
+        model.artifacts = Some(artifacts);
+        let instance = instance("vision", &model.id);
+        let catalog = codex_catalog(&model, &instance);
+        assert_eq!(
+            catalog["models"][0]["input_modalities"],
+            serde_json::json!(["text"])
+        );
+    }
+
+    #[test]
+    fn legacy_instance_documents_default_to_text_input() {
+        let instance = instance("vision", "m_one");
+        let mut document = serde_json::to_value(instance).unwrap();
+        document.as_object_mut().unwrap().remove("input_modalities");
+        let instance: InstanceDocument = serde_json::from_value(document).unwrap();
+        assert_eq!(instance.input_modalities, ["text"]);
+    }
+
+    #[test]
     fn codex_catalog_matches_current_required_shape_without_secret() {
-        let catalog = codex_catalog(&model("m_one", "ornith"), 262_144);
+        let model = model("m_one", "ornith");
+        let mut instance = instance("ornith", &model.id);
+        instance.context_window = 262_144;
+        let catalog = codex_catalog(&model, &instance);
         assert_eq!(catalog["models"][0]["context_window"], 262_144);
         assert_eq!(catalog["models"][0]["max_context_window"], 262_144);
         assert_eq!(

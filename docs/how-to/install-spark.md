@@ -73,11 +73,21 @@ You can now [serve a model](serve-a-model-on-spark.md).
 
 ## Upgrade or recover the control plane
 
+For a workstation source checkout, the [update helper](develop-spark.md#update-a-spark-from-this-checkout)
+automates the checks, build, signing, preview, activation and local client update:
+
+```bash
+python3 scripts/update-spark.py dgx-spark          # build and preview
+python3 scripts/update-spark.py dgx-spark --apply  # build, preview and apply
+```
+
 Preview and approve the same signed ARM64 artifact transaction used at first
 install:
 
 ```bash
-sparkplane dgx-spark upgrade --dry-run --json
+sparkplane dgx-spark upgrade --dry-run --json \
+  --probe release/sparkplane-aarch64 \
+  --release-manifest release/SHA256SUMS
 sparkplane dgx-spark upgrade --yes \
   --probe release/sparkplane-aarch64 \
   --release-manifest release/SHA256SUMS \
@@ -90,6 +100,13 @@ Upgrade verifies a database backup, N/N-1 schema compatibility, active engine id
 and the protected DGX fingerprint. It changes only the control-plane release and
 keeps healthy engine containers running. Failed semantic health requests
 automatic rollback.
+
+An engine profile or model capability change also needs a managed stop and
+re-serve. Existing model records keep their original artifact traits, so refresh
+them through the managed download operation using the new signed catalog.
+Follow [activating a capability change](develop-spark.md#activate-a-capability-change-on-an-existing-instance)
+for the complete sequence, including reuse of cached weights and regeneration
+of Codex's image-capable model catalog.
 
 Use the SSH-only recovery path even when HTTPS is unavailable:
 

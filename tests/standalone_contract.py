@@ -1,5 +1,7 @@
 """Distribution boundary: this checkout must stand on its own."""
 import pathlib
+import hashlib
+import json
 import re
 import tomllib
 import unittest
@@ -8,6 +10,13 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 class StandaloneContract(unittest.TestCase):
+    def test_vendored_rtk_sources_match_pinned_provenance(self):
+        root = ROOT / "crates/sparkplane-rtk"
+        provenance = json.loads((root / "PROVENANCE.json").read_text())
+        for name, digest in provenance["files"].items():
+            self.assertEqual(hashlib.sha256((root / "upstream" / name).read_bytes()).hexdigest(), digest, name)
+        self.assertEqual((root / "LICENSE").read_bytes(), (root / "upstream/LICENSE").read_bytes())
+
     def test_documentation_links_resolve_inside_this_checkout(self):
         for document in [ROOT / "README.md", *ROOT.glob("docs/**/*.md")]:
             for destination in re.findall(r"\]\(([^)]+)\)", document.read_text()):

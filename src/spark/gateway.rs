@@ -17,7 +17,14 @@ use super::upstream::{
     decode_embedding_response,
 };
 
-pub const MAX_COMPLETION_BODY_BYTES: usize = 1024 * 1024;
+pub const MAX_COMPLETION_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+#[path = "gateway_images.rs"]
+mod images;
+// Protocol harnesses also include this file as a private module.
+#[allow(unused_imports)]
+pub use images::{HARD_REQUEST_BYTES, ImageProtocol, IngressLimits, normalize_image_request};
+
 pub const RETRY_AFTER_SECONDS: &str = "1";
 pub const MAX_OUTPUT_TOKENS: u64 = 32_768;
 const MAX_INSTANCE_CONCURRENCY: usize = 4;
@@ -276,17 +283,20 @@ struct AnthropicImageSource {
 #[serde(untagged)]
 enum AnthropicToolResultContent {
     Text(String),
-    Blocks(Vec<AnthropicToolResultText>),
+    Blocks(Vec<AnthropicToolResultBlock>),
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AnthropicToolResultText {
-    #[serde(rename = "type")]
-    kind: String,
-    text: String,
-    #[serde(default)]
-    cache_control: Option<AnthropicCacheControl>,
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum AnthropicToolResultBlock {
+    Text {
+        text: String,
+        #[serde(default)]
+        cache_control: Option<AnthropicCacheControl>,
+    },
+    Image {
+        source: AnthropicImageSource,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -741,6 +751,7 @@ fn omit_empty_tool_controls(object: &mut serde_json::Map<String, Value>) {
 struct ImageBudget {
     count: usize,
     bytes: usize,
+    source_pixels: u64,
 }
 
 fn parse_data_uri(value: &str) -> Result<(&str, &str), OpenAiError> {
@@ -1549,18 +1560,36 @@ pub fn rewrite_chat_request_with_profile(
         .get("messages")
         .and_then(Value::as_array)
         .ok_or_else(|| invalid_request("messages must be an array"))?;
-    if messages.iter().any(|message| {
-        message["content"].as_array().is_some_and(|parts| {
-            parts.iter().any(|part| {
-                matches!(part["type"].as_str(), Some("image_url" | "input_image"))
-                    || part.get("image_url").is_some()
-                    || part.get("file_id").is_some()
-            })
-        })
-    }) {
-        return Err(invalid_request(
-            "chat image inputs are unsupported; use the Responses route",
-        ));
+    let mut images = ImageBudget::default();
+    for message in messages {
+        for part in message["content"].as_array().into_iter().flatten() {
+            if part["type"] == "image_url" {
+                if !matches!(message["role"].as_str(), Some("user" | "tool"))
+                    || part.as_object().is_none_or(|o| {
+                        o.keys()
+                            .any(|key| !matches!(key.as_str(), "type" | "image_url"))
+                    })
+                    || part["image_url"].as_object().is_none_or(|o| {
+                        o.keys()
+                            .any(|key| !matches!(key.as_str(), "url" | "detail"))
+                    })
+                {
+                    return Err(invalid_request(
+                        "chat images must be inline user or tool-result content",
+                    ));
+                }
+                let url = part["image_url"]["url"]
+                    .as_str()
+                    .ok_or_else(|| invalid_request("image_url must be an inline data URI"))?;
+                let (media, data) = parse_data_uri(url)?;
+                decode_image(media, data, profile.vision.as_ref(), &mut images)?;
+            } else if part.get("image_url").is_some()
+                || part.get("file_id").is_some()
+                || part["type"] == "input_image"
+            {
+                return Err(invalid_request("chat image content type is unsupported"));
+            }
+        }
     }
     let stream = object
         .get("stream")
@@ -1991,9 +2020,17 @@ fn anthropic_blocks(
                         "tool_result does not match a prior tool_use",
                     ));
                 }
-                let content = anthropic_tool_result_text(content)?;
+                let content = anthropic_tool_result_content(content, vision, images)?;
                 let content = if is_error {
-                    format!("Tool error: {content}")
+                    match content {
+                        Value::String(text) => Value::String(format!("Tool error: {text}")),
+                        Value::Array(mut parts) => {
+                            parts
+                                .insert(0, serde_json::json!({"type":"text","text":"Tool error:"}));
+                            Value::Array(parts)
+                        }
+                        value => value,
+                    }
                 } else {
                     content
                 };
@@ -2044,22 +2081,45 @@ fn anthropic_blocks(
     Ok(())
 }
 
-fn anthropic_tool_result_text(
+fn anthropic_tool_result_content(
     content: AnthropicToolResultContent,
-) -> Result<String, AnthropicError> {
+    vision: Option<&VisionPolicy>,
+    images: &mut ImageBudget,
+) -> Result<Value, AnthropicError> {
     match content {
-        AnthropicToolResultContent::Text(text) => Ok(text),
+        AnthropicToolResultContent::Text(text) => Ok(text.into()),
         AnthropicToolResultContent::Blocks(blocks) => {
-            blocks
-                .into_iter()
-                .try_fold(String::new(), |mut text, block| {
-                    validate_cache_control(block.cache_control.as_ref())?;
-                    if block.kind != "text" {
-                        return Err(anthropic_invalid("tool_result content type is unsupported"));
+            let mut content = Vec::new();
+            let mut text = String::new();
+            let mut multimodal = false;
+            for block in blocks {
+                match block {
+                    AnthropicToolResultBlock::Text {
+                        text: part,
+                        cache_control,
+                    } => {
+                        validate_cache_control(cache_control.as_ref())?;
+                        text.push_str(&part);
+                        content.push(serde_json::json!({"type":"text","text":part}));
                     }
-                    text.push_str(&block.text);
-                    Ok(text)
-                })
+                    AnthropicToolResultBlock::Image { source } => {
+                        if source.kind != "base64" {
+                            return Err(anthropic_invalid(
+                                "image source must be inline base64 tool-result content",
+                            ));
+                        }
+                        let image = decode_image(&source.media_type, &source.data, vision, images)
+                            .map_err(|error| anthropic_invalid(error.message))?;
+                        content.push(canonical_image(&image));
+                        multimodal = true;
+                    }
+                }
+            }
+            Ok(if multimodal {
+                Value::Array(content)
+            } else {
+                text.into()
+            })
         }
     }
 }
@@ -2537,7 +2597,9 @@ fn response_input_item(
         Some("message") => response_message(item, vision, images),
         Some("function_call") => response_tool_call(item, false),
         Some("custom_tool_call") => response_tool_call(item, true),
-        Some("function_call_output" | "custom_tool_call_output") => response_tool_output(item),
+        Some("function_call_output" | "custom_tool_call_output") => {
+            response_tool_output(item, vision, images)
+        }
         Some("reasoning") => response_reasoning(item),
         Some("computer_call" | "computer_call_output") => Err(OpenAiError {
             code: "unsupported_tool",
@@ -2602,10 +2664,10 @@ fn response_content(
                 "text":part["text"].as_str().ok_or_else(|| invalid_request("text content is invalid"))?
             })),
             Some("input_image") => {
-                if role != "user" || part.as_object().is_none_or(|object| {
+                if !matches!(role, "user" | "tool") || part.as_object().is_none_or(|object| {
                     object.keys().any(|key| !matches!(key.as_str(), "type" | "image_url" | "detail"))
                 }) || part.get("file_id").is_some() {
-                    return Err(invalid_request("image input must be bounded inline user content"));
+                    return Err(invalid_request("image input must be bounded inline user or tool-result content"));
                 }
                 let url = part["image_url"]
                     .as_str()
@@ -2645,17 +2707,36 @@ fn response_tool_call(item: &Value, custom: bool) -> Result<Value, OpenAiError> 
     )
 }
 
-fn response_tool_output(item: &Value) -> Result<Value, OpenAiError> {
+fn response_tool_output(
+    item: &Value,
+    vision: Option<&VisionPolicy>,
+    images: &mut ImageBudget,
+) -> Result<Value, OpenAiError> {
     let call_id = item["call_id"]
         .as_str()
         .ok_or_else(|| invalid_request("tool output call_id is required"))?;
     let output = item
         .get("output")
         .ok_or_else(|| invalid_request("tool output is required"))?;
-    let content = output
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| output.to_string());
+    // Codex view_image returns typed output blocks. Serializing their base64 as
+    // text both loses the image and can consume the entire model context.
+    let content = if output.as_array().is_some_and(|parts| {
+        parts.iter().any(|part| {
+            matches!(
+                part["type"].as_str(),
+                Some("input_text" | "output_text" | "input_image" | "input_file")
+            )
+        })
+    }) {
+        response_content(output, "tool", vision, images)?
+    } else {
+        Value::String(
+            output
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| output.to_string()),
+        )
+    };
     Ok(serde_json::json!({"role": "tool", "tool_call_id": call_id, "content": content}))
 }
 

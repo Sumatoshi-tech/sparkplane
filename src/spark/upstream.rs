@@ -8,7 +8,7 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::{Request, client::conn::http1, header};
 use hyper_util::rt::TokioIo;
 
-pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_ROUTE_COUNT: usize = 32;
 const MAX_PATH_BYTES: usize = 256;
@@ -22,23 +22,107 @@ pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const PROTOCOL_TOOL_MAX_TOKENS: u32 = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpstreamError(&'static str);
+pub struct UpstreamError {
+    message: &'static str,
+    rejection: Option<RequestRejection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestRejection {
+    InvalidRequest,
+    ContextLength,
+    PayloadTooLarge,
+    RateLimited,
+}
+
+impl RequestRejection {
+    pub const fn status(self) -> u16 {
+        match self {
+            Self::InvalidRequest | Self::ContextLength => 400,
+            Self::PayloadTooLarge => 413,
+            Self::RateLimited => 429,
+        }
+    }
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request_error",
+            Self::ContextLength => "context_length_exceeded",
+            Self::PayloadTooLarge => "request_too_large",
+            Self::RateLimited => "rate_limit_error",
+        }
+    }
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "engine rejected the inference request",
+            Self::ContextLength => {
+                "request exceeds the model context window; compact the conversation or reduce requested output"
+            }
+            Self::PayloadTooLarge => "request exceeds the engine body limit",
+            Self::RateLimited => "engine request capacity is exhausted; retry shortly",
+        }
+    }
+    pub fn from_response(status: u16, bytes: &[u8]) -> Option<Self> {
+        match status {
+            400 | 422 => {
+                let value = (bytes.len() <= 16 * 1024)
+                    .then(|| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+                    .flatten();
+                let error = value
+                    .as_ref()
+                    .and_then(|value| value.get("error"))
+                    .or(value.as_ref());
+                let context = error.is_some_and(|error| {
+                    error["code"] == "context_length_exceeded"
+                        || error["type"] == "context_length_exceeded"
+                        || error["message"].as_str().is_some_and(|message| {
+                            let message = message.to_ascii_lowercase();
+                            message.contains("maximum context length")
+                                || message.contains("max_model_len")
+                        })
+                });
+                Some(if context {
+                    Self::ContextLength
+                } else {
+                    Self::InvalidRequest
+                })
+            }
+            413 => Some(Self::PayloadTooLarge),
+            429 => Some(Self::RateLimited),
+            _ => None,
+        }
+    }
+}
 
 impl std::fmt::Display for UpstreamError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.0)
+        formatter.write_str(self.message)
     }
 }
 
 impl std::error::Error for UpstreamError {}
 
 impl UpstreamError {
+    const fn new(message: &'static str) -> Self {
+        Self {
+            message,
+            rejection: None,
+        }
+    }
+    fn rejected(rejection: RequestRejection) -> Self {
+        Self {
+            message: rejection.message(),
+            rejection: Some(rejection),
+        }
+    }
+    pub const fn request_rejection(&self) -> Option<RequestRejection> {
+        self.rejection
+    }
     pub const fn identity_mismatch() -> Self {
-        Self("engine route identity changed")
+        Self::new("engine route identity changed")
     }
 
     pub const fn diagnostic(&self) -> &'static str {
-        self.0
+        self.message
     }
 }
 
@@ -95,23 +179,23 @@ pub fn decode_embedding_response(
     tolerance_ppm: u32,
 ) -> Result<EmbeddingBatch, UpstreamError> {
     if bytes.len() > MAX_RESPONSE_BYTES {
-        return Err(UpstreamError("engine embedding response is too large"));
+        return Err(UpstreamError::new("engine embedding response is too large"));
     }
     let value: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|_| UpstreamError("engine embedding response is invalid"))?;
+        .map_err(|_| UpstreamError::new("engine embedding response is invalid"))?;
     let data = value["data"]
         .as_array()
         .filter(|data| data.len() == expected_count)
-        .ok_or(UpstreamError("engine embedding count changed"))?;
+        .ok_or(UpstreamError::new("engine embedding count changed"))?;
     if value["object"] != "list" || value["model"] != served_model {
-        return Err(UpstreamError("engine embedding identity changed"));
+        return Err(UpstreamError::new("engine embedding identity changed"));
     }
     let mut vectors = Vec::with_capacity(data.len());
     for (expected_index, item) in data.iter().enumerate() {
         let values = item["embedding"]
             .as_array()
             .filter(|values| values.len() == dimensions)
-            .ok_or(UpstreamError("engine embedding dimension changed"))?
+            .ok_or(UpstreamError::new("engine embedding dimension changed"))?
             .iter()
             .map(|value| {
                 value
@@ -119,13 +203,13 @@ pub fn decode_embedding_response(
                     .filter(|value| value.is_finite())
                     .map(|value| value as f32)
                     .filter(|value| value.is_finite())
-                    .ok_or(UpstreamError(
+                    .ok_or(UpstreamError::new(
                         "engine embedding contains a non-finite value",
                     ))
             })
             .collect::<Result<Vec<_>, _>>()?;
         if item["object"] != "embedding" || item["index"].as_u64() != Some(expected_index as u64) {
-            return Err(UpstreamError("engine embedding order changed"));
+            return Err(UpstreamError::new("engine embedding order changed"));
         }
         let norm = values
             .iter()
@@ -134,7 +218,7 @@ pub fn decode_embedding_response(
             .sqrt();
         let tolerance = f64::from(tolerance_ppm) / 1_000_000.0;
         if normalized && (norm - 1.0).abs() > tolerance {
-            return Err(UpstreamError("engine embedding normalization changed"));
+            return Err(UpstreamError::new("engine embedding normalization changed"));
         }
         vectors.push(EmbeddingVector {
             index: expected_index,
@@ -143,11 +227,11 @@ pub fn decode_embedding_response(
     }
     let prompt_tokens = value["usage"]["prompt_tokens"]
         .as_u64()
-        .ok_or(UpstreamError("engine embedding usage is invalid"))?;
+        .ok_or(UpstreamError::new("engine embedding usage is invalid"))?;
     let total_tokens = value["usage"]["total_tokens"]
         .as_u64()
         .filter(|total| *total == prompt_tokens)
-        .ok_or(UpstreamError("engine embedding usage is invalid"))?;
+        .ok_or(UpstreamError::new("engine embedding usage is invalid"))?;
     Ok(EmbeddingBatch {
         vectors,
         prompt_tokens,
@@ -182,7 +266,15 @@ pub enum GenerationEvent {
     Done,
 }
 
+pub trait UsageObserver: std::fmt::Debug + Send + Sync {
+    fn observe(&self, event: &GenerationEvent);
+    fn json(&self, bytes: &[u8], success: bool);
+    fn raw(&self, bytes: &[u8]);
+    fn incomplete(&self) {}
+}
+
 pub struct CompletionStream {
+    meter: Option<Arc<dyn UsageObserver>>,
     receiver: tokio::sync::mpsc::Receiver<Result<GenerationEvent, UpstreamError>>,
     task: tokio::task::JoinHandle<()>,
     connection_task: tokio::task::JoinHandle<()>,
@@ -192,8 +284,22 @@ pub struct CompletionStream {
 impl CompletionStream {
     pub async fn next(&mut self) -> Option<Result<GenerationEvent, UpstreamError>> {
         match tokio::time::timeout(self.idle_timeout, self.receiver.recv()).await {
-            Ok(event) => event,
-            Err(_) => Some(Err(UpstreamError("engine stream idle timeout"))),
+            Ok(event) => {
+                if let Some(meter) = &self.meter {
+                    match &event {
+                        Some(Ok(event)) => meter.observe(event),
+                        Some(Err(_)) => meter.incomplete(),
+                        None => (),
+                    }
+                }
+                event
+            }
+            Err(_) => {
+                if let Some(meter) = &self.meter {
+                    meter.incomplete();
+                }
+                Some(Err(UpstreamError::new("engine stream idle timeout")))
+            }
         }
     }
 }
@@ -206,6 +312,9 @@ impl Drop for CompletionStream {
 }
 
 pub struct RawResponseStream {
+    meter_failed: bool,
+    pending_meter: Vec<u8>,
+    meter: Option<Arc<dyn UsageObserver>>,
     receiver: tokio::sync::mpsc::Receiver<Result<Bytes, UpstreamError>>,
     task: tokio::task::JoinHandle<()>,
     connection_task: tokio::task::JoinHandle<()>,
@@ -214,8 +323,49 @@ pub struct RawResponseStream {
 impl RawResponseStream {
     pub async fn next(&mut self) -> Option<Result<Bytes, UpstreamError>> {
         match tokio::time::timeout(DEFAULT_STREAM_IDLE_TIMEOUT, self.receiver.recv()).await {
-            Ok(chunk) => chunk,
-            Err(_) => Some(Err(UpstreamError("engine stream idle timeout"))),
+            Ok(chunk) => {
+                if let Some(meter) = &self.meter {
+                    match &chunk {
+                        Some(Ok(bytes)) if !self.meter_failed => {
+                            if self.pending_meter.len().saturating_add(bytes.len())
+                                > MAX_RESPONSE_BYTES
+                            {
+                                self.pending_meter.clear();
+                                self.meter_failed = true;
+                                meter.incomplete();
+                            } else {
+                                self.pending_meter.extend_from_slice(bytes);
+                                while let Some((end, size)) = self
+                                    .pending_meter
+                                    .windows(2)
+                                    .position(|v| v == b"\n\n")
+                                    .map(|i| (i, 2))
+                                    .or_else(|| {
+                                        self.pending_meter
+                                            .windows(4)
+                                            .position(|v| v == b"\r\n\r\n")
+                                            .map(|i| (i, 4))
+                                    })
+                                {
+                                    let event =
+                                        self.pending_meter.drain(..end + size).collect::<Vec<_>>();
+                                    meter.raw(&event);
+                                }
+                            }
+                        }
+                        Some(Err(_)) => meter.incomplete(),
+                        None if !self.pending_meter.is_empty() => meter.incomplete(),
+                        _ => (),
+                    }
+                }
+                chunk
+            }
+            Err(_) => {
+                if let Some(meter) = &self.meter {
+                    meter.incomplete();
+                }
+                Some(Err(UpstreamError::new("engine stream idle timeout")))
+            }
         }
     }
 }
@@ -234,6 +384,7 @@ impl Drop for RawResponseStream {
 /// route after another executor inspection.
 #[derive(Debug, Clone)]
 pub struct ObservedRoute {
+    meter: Option<Arc<dyn UsageObserver>>,
     instance_id: String,
     generation: u64,
     process_identity: Option<(u32, u64)>,
@@ -244,6 +395,10 @@ pub struct ObservedRoute {
 }
 
 impl ObservedRoute {
+    pub fn with_meter(mut self, meter: Arc<dyn UsageObserver>) -> Self {
+        self.meter = Some(meter);
+        self
+    }
     pub fn new<'a>(
         instance_id: &str,
         generation: u64,
@@ -252,14 +407,16 @@ impl ObservedRoute {
         allowed: impl IntoIterator<Item = (&'a str, &'a str)>,
     ) -> Result<Self, UpstreamError> {
         if instance_id.is_empty() || instance_id.len() > 96 || generation == 0 || port == 0 {
-            return Err(UpstreamError("invalid observed engine identity"));
+            return Err(UpstreamError::new("invalid observed engine identity"));
         }
         let address_allowed = match address {
             IpAddr::V4(value) => value.is_private(),
             IpAddr::V6(value) => value.is_unique_local(),
         } || cfg!(test) && address.is_loopback();
         if !address_allowed {
-            return Err(UpstreamError("engine address is outside a private bridge"));
+            return Err(UpstreamError::new(
+                "engine address is outside a private bridge",
+            ));
         }
         let allowed = allowed
             .into_iter()
@@ -271,7 +428,7 @@ impl ObservedRoute {
                 .iter()
                 .any(|(method, path)| !valid_method(method) || !valid_path(path))
         {
-            return Err(UpstreamError("recipe route allowlist is invalid"));
+            return Err(UpstreamError::new("recipe route allowlist is invalid"));
         }
         Ok(Self {
             instance_id: instance_id.into(),
@@ -281,6 +438,7 @@ impl ObservedRoute {
             port,
             allowed,
             connections: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
+            meter: None,
         })
     }
 
@@ -300,11 +458,11 @@ impl ObservedRoute {
         body_bytes: usize,
     ) -> Result<UpstreamRequest, UpstreamError> {
         if body_bytes > MAX_BODY_BYTES {
-            return Err(UpstreamError("engine request body is too large"));
+            return Err(UpstreamError::rejected(RequestRejection::PayloadTooLarge));
         }
         let key = (method.to_owned(), path.to_owned());
         if !self.allowed.contains(&key) {
-            return Err(UpstreamError("engine method or route is not allowed"));
+            return Err(UpstreamError::new("engine method or route is not allowed"));
         }
         Ok(UpstreamRequest {
             method: key.0,
@@ -327,9 +485,15 @@ impl ObservedRoute {
         timeout: Duration,
     ) -> Result<UpstreamResponse, UpstreamError> {
         self.request(&request.method, &request.path, body.len())?;
-        tokio::time::timeout(timeout, self.send_inner(request, body))
+        let response = tokio::time::timeout(timeout, self.send_inner(request, body))
             .await
-            .map_err(|_| UpstreamError("engine request timed out"))?
+            .map_err(|_| UpstreamError::new("engine request timed out"))?;
+        if let Ok(response) = &response
+            && let Some(meter) = &self.meter
+        {
+            meter.json(&response.bytes, (200..300).contains(&response.status));
+        }
+        response
     }
 
     pub async fn semantic_probe(
@@ -343,14 +507,14 @@ impl ObservedRoute {
         let models = self.send(&models, &[]).await?;
         let models_status = models.status;
         let models: serde_json::Value = serde_json::from_slice(&models.bytes)
-            .map_err(|_| UpstreamError("engine model identity response is invalid"))?;
+            .map_err(|_| UpstreamError::new("engine model identity response is invalid"))?;
         let identity_matches = models["data"].as_array().is_some_and(|models| {
             models
                 .iter()
                 .any(|model| model["id"].as_str() == Some(served_model))
         });
         if !(200..300).contains(&models_status) || !identity_matches {
-            return Err(UpstreamError("engine served-model identity mismatch"));
+            return Err(UpstreamError::new("engine served-model identity mismatch"));
         }
         let body = serde_json::to_vec(&serde_json::json!({
             "model": served_model,
@@ -360,16 +524,16 @@ impl ObservedRoute {
             "ignore_eos": true,
             "stream": false
         }))
-        .map_err(|_| UpstreamError("semantic probe cannot be encoded"))?;
+        .map_err(|_| UpstreamError::new("semantic probe cannot be encoded"))?;
         let completion = self.request("POST", "/v1/completions", body.len())?;
         let completion = self.send_with_timeout(&completion, &body, timeout).await?;
         let completion_status = completion.status;
         let completion: serde_json::Value = serde_json::from_slice(&completion.bytes)
-            .map_err(|_| UpstreamError("semantic probe response is invalid"))?;
+            .map_err(|_| UpstreamError::new("semantic probe response is invalid"))?;
         if !(200..300).contains(&completion_status)
             || !valid_semantic_completion(&completion, served_model, max_tokens)
         {
-            return Err(UpstreamError("semantic completion contract rejected"));
+            return Err(UpstreamError::new("semantic completion contract rejected"));
         }
         Ok(())
     }
@@ -386,7 +550,7 @@ impl ObservedRoute {
         let models = self.request("GET", "/v1/models", 0)?;
         let models = self.send(&models, &[]).await?;
         let identity: serde_json::Value = serde_json::from_slice(&models.bytes)
-            .map_err(|_| UpstreamError("engine model identity response is invalid"))?;
+            .map_err(|_| UpstreamError::new("engine model identity response is invalid"))?;
         if !(200..300).contains(&models.status)
             || !identity["data"].as_array().is_some_and(|models| {
                 models
@@ -394,16 +558,16 @@ impl ObservedRoute {
                     .any(|model| model["id"].as_str() == Some(served_model))
             })
         {
-            return Err(UpstreamError("engine served-model identity mismatch"));
+            return Err(UpstreamError::new("engine served-model identity mismatch"));
         }
         let body = serde_json::to_vec(&serde_json::json!({
             "model":served_model,"input":input,"encoding_format":"float"
         }))
-        .map_err(|_| UpstreamError("embedding probe cannot be encoded"))?;
+        .map_err(|_| UpstreamError::new("embedding probe cannot be encoded"))?;
         let request = self.request("POST", "/v1/embeddings", body.len())?;
         let response = self.send_with_timeout(&request, &body, timeout).await?;
         if !(200..300).contains(&response.status) {
-            return Err(UpstreamError("embedding probe was rejected"));
+            return Err(UpstreamError::new("embedding probe was rejected"));
         }
         decode_embedding_response(
             &response.bytes,
@@ -432,7 +596,7 @@ impl ObservedRoute {
         let models = self.request("GET", "/v1/models", 0)?;
         let models = self.send(&models, &[]).await?;
         let identity: serde_json::Value = serde_json::from_slice(&models.bytes)
-            .map_err(|_| UpstreamError("engine model identity response is invalid"))?;
+            .map_err(|_| UpstreamError::new("engine model identity response is invalid"))?;
         if !(200..300).contains(&models.status)
             || !identity["data"].as_array().is_some_and(|models| {
                 models
@@ -440,7 +604,7 @@ impl ObservedRoute {
                     .any(|model| model["id"].as_str() == Some(served_model))
             })
         {
-            return Err(UpstreamError("engine served-model identity mismatch"));
+            return Err(UpstreamError::new("engine served-model identity mismatch"));
         }
         let body = serde_json::to_vec(&serde_json::json!({
             "model":served_model,
@@ -453,41 +617,43 @@ impl ObservedRoute {
             "max_tokens":max_tokens,"thinking_budget_tokens":if disable_thinking { 0 } else { -1 },"temperature":0,"stream":false,
             "chat_template_kwargs":{"enable_thinking":!disable_thinking,"reasoning_strength":if disable_thinking { "low" } else { "high" }}
         }))
-        .map_err(|_| UpstreamError("vision probe cannot be encoded"))?;
+        .map_err(|_| UpstreamError::new("vision probe cannot be encoded"))?;
         let request = self.request("POST", "/v1/chat/completions", body.len())?;
         let response = self.send_with_timeout(&request, &body, timeout).await?;
         if !(200..300).contains(&response.status) {
-            return Err(UpstreamError(match response.status {
+            return Err(UpstreamError::new(match response.status {
                 400..=499 => "vision probe rejected with HTTP 4xx",
                 500..=599 => "vision probe rejected with HTTP 5xx",
                 _ => "vision probe returned a non-success HTTP status",
             }));
         }
         let value: serde_json::Value = serde_json::from_slice(&response.bytes)
-            .map_err(|_| UpstreamError("vision probe response is invalid"))?;
+            .map_err(|_| UpstreamError::new("vision probe response is invalid"))?;
         if value["model"] != served_model {
-            return Err(UpstreamError("vision probe model identity changed"));
+            return Err(UpstreamError::new("vision probe model identity changed"));
         }
         let choice = value["choices"]
             .as_array()
             .filter(|choices| choices.len() == 1)
             .map(|choices| &choices[0])
-            .ok_or(UpstreamError("vision probe choice shape is invalid"))?;
+            .ok_or(UpstreamError::new("vision probe choice shape is invalid"))?;
         let content = choice["message"]["content"]
             .as_str()
-            .ok_or(UpstreamError("vision probe final content is missing"))?;
+            .ok_or(UpstreamError::new("vision probe final content is missing"))?;
         if !content
             .to_lowercase()
             .contains(&expected_text.to_lowercase())
         {
-            return Err(UpstreamError("vision probe expected answer is missing"));
+            return Err(UpstreamError::new(
+                "vision probe expected answer is missing",
+            ));
         }
         let prompt_tokens = value["usage"]["prompt_tokens"].as_u64();
         let completion_tokens = value["usage"]["completion_tokens"].as_u64();
         if prompt_tokens.is_none_or(|tokens| tokens == 0)
             || completion_tokens.is_none_or(|tokens| tokens == 0 || tokens > u64::from(max_tokens))
         {
-            return Err(UpstreamError("vision probe usage contract is invalid"));
+            return Err(UpstreamError::new("vision probe usage contract is invalid"));
         }
         Ok(())
     }
@@ -503,7 +669,7 @@ impl ObservedRoute {
             self.protocol_probe_inner(served_model, require_tools),
         )
         .await
-        .map_err(|_| UpstreamError("engine protocol probe timed out"))?
+        .map_err(|_| UpstreamError::new("engine protocol probe timed out"))?
     }
 
     async fn protocol_probe_inner(
@@ -516,7 +682,7 @@ impl ObservedRoute {
             "max_tokens":PROTOCOL_TOOL_MAX_TOKENS,"temperature":0,"stream":true,
             "stream_options":{"include_usage":true},"chat_template_kwargs":{"enable_thinking":false,"reasoning_strength":"low"}
         }))
-        .map_err(|_| UpstreamError("protocol probe cannot be encoded"))?;
+        .map_err(|_| UpstreamError::new("protocol probe cannot be encoded"))?;
         validate_protocol_stream(self.chat_stream(&body).await?, false).await?;
         if require_tools {
             let body = serde_json::to_vec(&serde_json::json!({
@@ -529,7 +695,7 @@ impl ObservedRoute {
                 "parallel_tool_calls":true,"max_tokens":PROTOCOL_TOOL_MAX_TOKENS,
                 "temperature":0,"stream":true,"stream_options":{"include_usage":true},"chat_template_kwargs":{"enable_thinking":false,"reasoning_strength":"low"}
             }))
-            .map_err(|_| UpstreamError("tool protocol probe cannot be encoded"))?;
+            .map_err(|_| UpstreamError::new("tool protocol probe cannot be encoded"))?;
             validate_protocol_stream(self.chat_stream(&body).await?, true).await?;
         }
         Ok(())
@@ -563,13 +729,13 @@ impl ObservedRoute {
         let permit = Arc::clone(&self.connections)
             .acquire_owned()
             .await
-            .map_err(|_| UpstreamError("engine connection pool is closed"))?;
+            .map_err(|_| UpstreamError::new("engine connection pool is closed"))?;
         let stream = tokio::net::TcpStream::connect((self.address, self.port))
             .await
-            .map_err(|_| UpstreamError("engine endpoint is unreachable"))?;
+            .map_err(|_| UpstreamError::new("engine endpoint is unreachable"))?;
         let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
             .await
-            .map_err(|_| UpstreamError("engine HTTP handshake failed"))?;
+            .map_err(|_| UpstreamError::new("engine HTTP handshake failed"))?;
         let connection_task = tokio::spawn(async move {
             let _ = connection.await;
         });
@@ -579,14 +745,15 @@ impl ObservedRoute {
             .header(header::HOST, "engine.internal")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::copy_from_slice(body)))
-            .map_err(|_| UpstreamError("engine request is malformed"))?;
+            .map_err(|_| UpstreamError::new("engine request is malformed"))?;
         let response = sender
             .send_request(outbound)
             .await
-            .map_err(|_| UpstreamError("engine response failed"))?;
+            .map_err(|_| UpstreamError::new("engine response failed"))?;
         if !(200..300).contains(&response.status().as_u16()) {
+            let error = rejected_stream_response(response).await;
             connection_task.abort();
-            return Err(UpstreamError("engine rejected response stream"));
+            return Err(error);
         }
         let (send, receiver) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
         let mut incoming = response.into_body();
@@ -594,7 +761,9 @@ impl ObservedRoute {
             let _permit = permit;
             while let Some(frame) = incoming.frame().await {
                 let Ok(frame) = frame else {
-                    let _ = send.send(Err(UpstreamError("engine stream failed"))).await;
+                    let _ = send
+                        .send(Err(UpstreamError::new("engine stream failed")))
+                        .await;
                     break;
                 };
                 let Ok(data) = frame.into_data() else {
@@ -608,6 +777,9 @@ impl ObservedRoute {
             }
         });
         Ok(RawResponseStream {
+            meter_failed: false,
+            pending_meter: Vec::new(),
+            meter: self.meter.clone(),
             receiver,
             task,
             connection_task,
@@ -624,13 +796,13 @@ impl ObservedRoute {
         let permit = Arc::clone(&self.connections)
             .acquire_owned()
             .await
-            .map_err(|_| UpstreamError("engine connection pool is closed"))?;
+            .map_err(|_| UpstreamError::new("engine connection pool is closed"))?;
         let stream = tokio::net::TcpStream::connect((self.address, self.port))
             .await
-            .map_err(|_| UpstreamError("engine endpoint is unreachable"))?;
+            .map_err(|_| UpstreamError::new("engine endpoint is unreachable"))?;
         let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
             .await
-            .map_err(|_| UpstreamError("engine HTTP handshake failed"))?;
+            .map_err(|_| UpstreamError::new("engine HTTP handshake failed"))?;
         let connection_task = tokio::spawn(async move {
             let _ = connection.await;
         });
@@ -640,13 +812,15 @@ impl ObservedRoute {
             .header(header::HOST, "engine.internal")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::copy_from_slice(body)))
-            .map_err(|_| UpstreamError("engine request is malformed"))?;
+            .map_err(|_| UpstreamError::new("engine request is malformed"))?;
         let response = sender
             .send_request(outbound)
             .await
-            .map_err(|_| UpstreamError("engine response failed"))?;
+            .map_err(|_| UpstreamError::new("engine response failed"))?;
         if !(200..300).contains(&response.status().as_u16()) {
-            return Err(UpstreamError("engine rejected completion stream"));
+            let error = rejected_stream_response(response).await;
+            connection_task.abort();
+            return Err(error);
         }
         let (send, receiver) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
         let mut incoming = response.into_body();
@@ -661,7 +835,7 @@ impl ObservedRoute {
                 pending.extend_from_slice(&data);
                 if pending.len() > MAX_STREAM_EVENT_BYTES {
                     let _ = send
-                        .send(Err(UpstreamError("engine stream event is too large")))
+                        .send(Err(UpstreamError::new("engine stream event is too large")))
                         .await;
                     break;
                 }
@@ -681,6 +855,7 @@ impl ObservedRoute {
             task,
             connection_task,
             idle_timeout,
+            meter: self.meter.clone(),
         })
     }
 
@@ -693,13 +868,13 @@ impl ObservedRoute {
             .connections
             .acquire()
             .await
-            .map_err(|_| UpstreamError("engine connection pool is closed"))?;
+            .map_err(|_| UpstreamError::new("engine connection pool is closed"))?;
         let stream = tokio::net::TcpStream::connect((self.address, self.port))
             .await
-            .map_err(|_| UpstreamError("engine endpoint is unreachable"))?;
+            .map_err(|_| UpstreamError::new("engine endpoint is unreachable"))?;
         let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
             .await
-            .map_err(|_| UpstreamError("engine HTTP handshake failed"))?;
+            .map_err(|_| UpstreamError::new("engine HTTP handshake failed"))?;
         tokio::spawn(async move {
             let _ = connection.await;
         });
@@ -709,16 +884,16 @@ impl ObservedRoute {
             .header(header::HOST, "engine.internal")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::copy_from_slice(body)))
-            .map_err(|_| UpstreamError("engine request is malformed"))?;
+            .map_err(|_| UpstreamError::new("engine request is malformed"))?;
         let response = sender
             .send_request(outbound)
             .await
-            .map_err(|_| UpstreamError("engine response failed"))?;
+            .map_err(|_| UpstreamError::new("engine response failed"))?;
         let status = response.status().as_u16();
         let bytes = Limited::new(response.into_body(), MAX_RESPONSE_BYTES)
             .collect()
             .await
-            .map_err(|_| UpstreamError("engine response is too large"))?
+            .map_err(|_| UpstreamError::new("engine response is too large"))?
             .to_bytes()
             .to_vec();
         Ok(UpstreamResponse { status, bytes })
@@ -727,6 +902,28 @@ impl ObservedRoute {
     pub fn identity(&self) -> (&str, u64) {
         (&self.instance_id, self.generation)
     }
+}
+
+async fn rejected_stream_response(
+    response: hyper::Response<hyper::body::Incoming>,
+) -> UpstreamError {
+    let status = response.status().as_u16();
+    let bytes = if matches!(status, 400 | 422) {
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            Limited::new(response.into_body(), 16 * 1024).collect(),
+        )
+        .await
+        {
+            Ok(Ok(body)) => body.to_bytes(),
+            _ => Bytes::new(),
+        }
+    } else {
+        Bytes::new()
+    };
+    RequestRejection::from_response(status, &bytes)
+        .map(UpstreamError::rejected)
+        .unwrap_or_else(|| UpstreamError::new("engine rejected response stream"))
 }
 
 async fn validate_protocol_stream(
@@ -741,7 +938,7 @@ async fn validate_protocol_stream(
         match event? {
             GenerationEvent::ReasoningDelta { text } | GenerationEvent::TextDelta { text } => {
                 if finish_reason.is_some() || text.is_empty() {
-                    return Err(UpstreamError("engine protocol event order is invalid"));
+                    return Err(UpstreamError::new("engine protocol event order is invalid"));
                 }
                 output = true;
             }
@@ -752,7 +949,7 @@ async fn validate_protocol_stream(
                 arguments,
             } => {
                 if finish_reason.is_some() || !require_tool {
-                    return Err(UpstreamError("engine protocol tool event is invalid"));
+                    return Err(UpstreamError::new("engine protocol tool event is invalid"));
                 }
                 let tool = tools.entry(index).or_default();
                 if let Some(call_id) = call_id {
@@ -767,7 +964,9 @@ async fn validate_protocol_stream(
                 finish_reason: reason,
             } => {
                 if finish_reason.is_some() || reason.is_none() {
-                    return Err(UpstreamError("engine protocol finish event is invalid"));
+                    return Err(UpstreamError::new(
+                        "engine protocol finish event is invalid",
+                    ));
                 }
                 finish_reason = reason;
             }
@@ -777,7 +976,7 @@ async fn validate_protocol_stream(
             } => {
                 if finish_reason.is_none() || usage || prompt_tokens == 0 || completion_tokens == 0
                 {
-                    return Err(UpstreamError("engine protocol usage event is invalid"));
+                    return Err(UpstreamError::new("engine protocol usage event is invalid"));
                 }
                 usage = true;
             }
@@ -798,11 +997,13 @@ async fn validate_protocol_stream(
                 {
                     return Ok(());
                 }
-                return Err(UpstreamError("engine protocol stream is incomplete"));
+                return Err(UpstreamError::new("engine protocol stream is incomplete"));
             }
         }
     }
-    Err(UpstreamError("engine protocol stream ended before done"))
+    Err(UpstreamError::new(
+        "engine protocol stream ended before done",
+    ))
 }
 
 fn valid_semantic_completion(
@@ -855,10 +1056,10 @@ fn decode_sse_events(bytes: &[u8]) -> Vec<Result<GenerationEvent, UpstreamError>
     }
     let value: serde_json::Value = match serde_json::from_str(data) {
         Ok(value) => value,
-        Err(_) => return vec![Err(UpstreamError("engine stream event is invalid"))],
+        Err(_) => return vec![Err(UpstreamError::new("engine stream event is invalid"))],
     };
     if value.get("error").is_some() {
-        return vec![Err(UpstreamError("engine stream returned an error"))];
+        return vec![Err(UpstreamError::new("engine stream returned an error"))];
     }
     let mut events = Vec::new();
     let choice = value["choices"]
@@ -886,7 +1087,7 @@ fn decode_sse_events(bytes: &[u8]) -> Vec<Result<GenerationEvent, UpstreamError>
                     .as_u64()
                     .and_then(|value| value.try_into().ok())
                 else {
-                    return vec![Err(UpstreamError("engine tool call index is invalid"))];
+                    return vec![Err(UpstreamError::new("engine tool call index is invalid"))];
                 };
                 events.push(Ok(GenerationEvent::ToolCallDelta {
                     index,
@@ -907,10 +1108,10 @@ fn decode_sse_events(bytes: &[u8]) -> Vec<Result<GenerationEvent, UpstreamError>
     }
     if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
         let Some(prompt_tokens) = usage["prompt_tokens"].as_u64() else {
-            return vec![Err(UpstreamError("engine stream usage is invalid"))];
+            return vec![Err(UpstreamError::new("engine stream usage is invalid"))];
         };
         let Some(completion_tokens) = usage["completion_tokens"].as_u64() else {
-            return vec![Err(UpstreamError("engine stream usage is invalid"))];
+            return vec![Err(UpstreamError::new("engine stream usage is invalid"))];
         };
         events.push(Ok(GenerationEvent::Usage {
             prompt_tokens,
@@ -1264,6 +1465,7 @@ mod tests {
         });
         let connection_task = tokio::spawn(std::future::pending());
         let stream = CompletionStream {
+            meter: None,
             receiver,
             task,
             connection_task,
@@ -1287,6 +1489,7 @@ mod tests {
         });
         let connection_task = tokio::spawn(std::future::pending());
         let mut stream = CompletionStream {
+            meter: None,
             receiver,
             task,
             connection_task,

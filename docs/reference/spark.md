@@ -37,7 +37,8 @@ sparkplane <host> status --json
 sparkplane <host> doctor --json
 sparkplane <host> qualify --manifest <json> --signature <minisig> (--dry-run | --yes) [--detach] [--json]
 sparkplane <host> serve <model> [--name <instance>] [--detach] [--dry-run] [--json]
-sparkplane <host> launch <codex|claude|opencode> [--mode auto|inherit] [--model <model>] [--allow-network] [--config] [--restore] [-y] [-- <agent-args>...]
+sparkplane <host> launch <codex|claude|opencode> [--mode auto|inherit] [--eco-mode max|none] [--model <model>] [--allow-network] [--config] [--restore] [-y] [-- <agent-args>...]
+sparkplane <host> economics [--session <id>] [--json]
 sparkplane <host> ls [--json]
 sparkplane <host> ps [--json]
 sparkplane <host> logs <instance> [--limit N]
@@ -204,8 +205,10 @@ committed only after exact-container cleanup is acknowledged.
 ## Engine profiles and modalities
 
 - Ornith accepts bounded inline JPEG, PNG, or WebP through OpenAI
-  Responses and Anthropic Messages. The adapters validate media
-  type, file magic, decoded bytes, image count, and dimensions
+  Responses and Anthropic Messages. The gateway resizes and re-encodes oversized
+  images to the selected qualified engine profile, preserving aspect ratio and
+  transparency. Images already within the profile's limits keep their original
+  bytes. The adapters validate media type, file magic, decoded bytes, image count, and dimensions
   before contacting vLLM. Remote URLs, local paths, traversal,
   unsupported media, and images sent to text-only instances are
   rejected.
@@ -265,10 +268,144 @@ Existing model records retain their verified artifact traits across upgrades.
 When a catalog adds vision support, refresh the record through the managed
 `download --update-alias` operation and re-serve it with the updated engine
 policy before relaunching Codex.
-The Qwen3.8 vLLM policy accepts one inline PNG, JPEG, or WebP image per request,
-at most 512 KiB of image data, with width and height at most 4096 pixels.
+### Image history and upload limits
+
+The Qwen3.8 vLLM policy accepts up to 16 inline PNG, JPEG, or WebP images per request,
+sharing at most 512 KiB of image data, with width and height at most 4096 pixels.
+The gateway accepts larger source uploads and normalizes them before either
+native or translated forwarding; the model's image-count limit still applies.
+Each frame receives an equal share of the total image byte budget so earlier
+screenshots cannot consume the space needed by subsequent `view_image` results.
+Long sessions retain a rolling window of images. At 12 images, older images
+already followed by a model response are replaced with explicit text references,
+leaving six recent frames. Large source payloads trigger earlier eviction of
+processed frames to keep their combined inline payload near 16 MiB; this may
+retain fewer than six frames. Frames awaiting their first inspection are
+protected. A batch of 16 new images remains supported, and larger new batches
+must be split.
+Tool calls, call IDs, accompanying text and written observations are retained.
+The same policy handles Responses, Chat Completions and nested Anthropic tool
+results. Text-only profiles continue rejecting image input.
+
+Vision-enabled `launch` invocations run a private, authenticated loopback adapter.
+It streams the historical JSON one item at a time and removes old image payloads
+before uploading to the appliance, so repeatedly viewing images does not make
+the appliance upload grow with every old screenshot. Source histories may exceed
+32 MiB; individual items and the projected request remain capped at 32 MiB, and
+history text is capped at 8 MiB. Upload and projection have 120-second deadlines,
+with two workers. The adapter uses the pinned appliance CA, refuses redirects,
+and exposes only inference routes for the selected instance. Its listener and
+invocation credential disappear when the child exits.
+
+Evicted originals are retained privately in
+`<config-dir>/spark/image-archive/`, under stable content-derived filenames.
+The model receives a path it can reopen with `view_image`; inherited agent
+filesystem permissions still apply. The archive uses 0700 directories and 0600
+files, deduplicates copies, and caps storage at 512 MiB and 4096 images. Writes
+remove the least recently used originals when necessary and expire unused
+originals after 90 days. Older references can therefore expire; existing source
+files remain another way to inspect those images. Direct gateway clients get
+the retention policy, but must prune or compact their own uploads before ingress.
+
+No caption inference is added: descriptions come from the agent's existing
+observations. Codex launches compact the conversation at 75% of the qualified
+context window, preserving room for new tool results and compaction. Image
+retention remains active with `--eco-mode=none`; that switch controls RTK command
+compression. These bounds do not change engine context, sampling or resources.
+Codex `view_image` results and other typed function/custom tool outputs preserve
+inline images as multimodal tool content, including resizing and the shared
+request image budget. Their base64 is never converted into prompt text. Regular
+string and JSON tool outputs retain their text representation.
+The root-owned agent configuration has a separate `[gateway]` upload policy:
+
+```toml
+[gateway]
+request_body_bytes = 33554432 # 32 MiB, including JSON and base64
+image_bytes = 16777216       # 16 MiB per decoded source file
+image_pixels = 32000000      # all source images combined, before resizing
+image_dimension = 16384     # maximum source width or height
+max_parallel_requests = 2   # concurrent uploads and image workers
+```
+
+These defaults also apply to older configurations without a `[gateway]` section.
+Configuration ceilings are 64 MiB requests, 32 MiB source files, 32 million
+total source pixels, 16384 pixels per dimension, and four concurrent workers. Uploads have a
+30-second deadline; image decoding has a 128 MiB allocation limit. The normalized
+inference body and other inference POST bodies are capped at 8 MiB; control API
+bodies retain their 1 MiB limit. Saturated upload workers return JSON 503 with
+`Retry-After: 1`; oversized uploads return protocol-specific JSON 413. Gateway
+rejections do not forward images to the engine. Resizing may reduce fine detail
+to fit the qualified profile's byte budget.
+
+Engine request rejections use safe protocol-specific errors: invalid requests
+return 400, body limits return 413, and engine capacity limits return 429 with
+`Retry-After: 1`. Context overflow returns OpenAI code `context_length_exceeded`
+so clients can compact the conversation. Engine error bodies and private request
+contents are not forwarded. Unavailable engines and transport failures return
+503.
+
 See the [live capability activation procedure](../how-to/develop-spark.md#activate-a-capability-change-on-an-existing-instance)
 for signing, cached-model refresh, managed restart, and attachment verification.
+
+### Eco mode and session economics
+
+`--eco-mode=max` is the default. Sparkplane embeds an Apache-2.0 RTK library,
+pinned to upstream revision `6d4b77eadee1c66dc1f68466ad77e96d1b6e4989`.
+There is no RTK executable download or installer. Invocation-local Codex and
+Claude hooks, and an OpenCode plugin, compact supported shell output. The
+initial profiles cover Git status, Cargo build/check/clippy/test, pytest and
+RTK's bundled declarative filters. Custom RTK configuration is not loaded.
+Unknown commands, shell scripts, pipes, redirects, explicit structured output,
+binary output and unsuccessful commands pass through unchanged. Captures over
+8 MiB per stream pass through; stdout, stderr and the command exit code remain
+separate. For an explicit raw escape, use `sparkplane __eco raw -- <command>`.
+
+`--eco-mode=none` disables Sparkplane's compression hooks while retaining
+inference accounting. Compression stays inactive with `--mode inherit`, so
+rewriting cannot circumvent the agent's own command permissions. Agent hook
+support and trust still apply: for Codex, review the Sparkplane hooks in
+`/hooks`. Sparkplane does not grant hook trust. Disabled, unsupported or
+untrusted hooks leave the session usable and are reported as inactive.
+Persistent agent hook settings are not modified.
+
+On a supporting appliance, every launch gets a unique inference-only
+credential, valid for at most seven days. It is passed only in the child's
+environment and revoked when the coding agent exits. Usage comes from engine
+responses before protocol translation, including streamed and native Responses
+usage; repeated final usage events count once. Other clients' credentials do
+not contribute. The session API is administrator-only. Missing engine usage,
+interrupted streams or unavailable accounting produce an explicit incomplete
+or unavailable result. Older appliances can still launch agents with usage
+shown as unavailable.
+
+The report appears on stderr after normal exit, failure or a handled interrupt.
+Finalization has a five-second client timeout. The managed model keeps running;
+`stop <instance>` continues to stop only that model. A session report includes
+input/output tokens, duration, compressed command counts, estimated output
+reduction and two separate USD columns:
+
+- **Cloud equivalent:** known local inference tokens valued at published
+  standard uncached input/output rates for GPT-6.1 Sol, Claude Sonnet 4.6 and
+  Gemini 3.5 Flash. The GPT comparison applies its longer-context tier per
+  request above 272,000 input tokens.
+- **Estimated RTK savings:** removed tool-output bytes divided by four,
+  valued once at standard input rates. This estimate does not assume repeated
+  context reuse and is unavailable when compression metrics are incomplete.
+
+These columns are not added together. Different tokenizers, prompt caching,
+hardware and electricity can change actual costs; these are comparisons, not
+bills or measured cash savings. The bundled price catalog records official
+source links, verification dates, rates and a version. Launch never fetches
+prices from the network; each report retains the catalog it used.
+
+`sparkplane <host> economics` displays the most recent report;
+`economics --session <id> --json` emits the structured report on stdout.
+Reports are scoped by host under the Sparkplane config directory, with
+mode-0700 directories and mode-0600 files. They contain only aggregate usage
+and comparison data, never credentials, prompts, command text or output.
+Reports older than 90 days are pruned on save or read; the appliance prunes
+session/request ledgers when creating a session. Invocation-local compression
+metrics are removed when the launcher exits.
 
 ### Internet access for development
 

@@ -24,6 +24,17 @@ without action approval prompts. Use `--mode inherit` to keep the agent's own
 permission settings. In inherit mode, `--allow-network` grants network access
 within a supported sandbox. See [launch permissions](docs/reference/spark.md#internet-access-for-development).
 
+Launches also default to `--eco-mode=max`, using RTK filters embedded in the
+Sparkplane executable. Use `--eco-mode=none` to disable compression. When the
+coding session exits, Sparkplane prints token usage and public cloud price
+comparisons; `sparkplane <host> economics --json` reads the latest retained report.
+See [session economics](docs/reference/spark.md#eco-mode-and-session-economics).
+
+Vision launches also retain recent images automatically and archive older
+originals for reopening. A private local adapter prunes historical image payloads
+before upload, while the gateway enforces the qualified model limits. See
+[image history and gateway limits](docs/reference/spark.md#image-history-and-upload-limits).
+
 ## Architecture
 
 The unprivileged HTTPS agent owns state and protocol translation. A separate,

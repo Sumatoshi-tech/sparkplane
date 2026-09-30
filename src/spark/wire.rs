@@ -1356,3 +1356,50 @@ mod tests {
         );
     }
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "appliance", derive(utoipa::ToSchema))]
+pub struct LaunchSessionRequest {
+    pub id: String,
+    pub instance: String,
+    pub integration: String,
+    pub eco_mode: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "appliance", derive(utoipa::ToSchema))]
+pub struct SessionUsage {
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub unknown_usage_requests: u64,
+    pub pending_requests: u64,
+    pub failed_requests: u64,
+    #[serde(default)]
+    pub long_context_input_tokens: u64,
+    #[serde(default)]
+    pub long_context_output_tokens: u64,
+    #[serde(default)]
+    pub accounting_errors: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "appliance", derive(utoipa::ToSchema))]
+pub struct LaunchSessionDocument {
+    pub schema: String,
+    pub id: String,
+    pub instance: String,
+    pub model: String,
+    pub integration: String,
+    pub eco_mode: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub usage: SessionUsage,
+}
+
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "appliance", derive(utoipa::ToSchema))]
+pub struct LaunchSessionCreated {
+    pub session: LaunchSessionDocument,
+    pub bearer_token: Option<String>,
+}

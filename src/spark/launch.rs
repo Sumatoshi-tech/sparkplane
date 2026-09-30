@@ -45,6 +45,8 @@ struct LaunchPlan {
     extra_argument_count: usize,
     allow_network: bool,
     mode: String,
+    eco_mode: String,
+    eco_capability: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +184,8 @@ pub fn run(host: &str, config_dir: &Path, args: LaunchArgs) -> Result<(), Client
                 extra_argument_count: args.extra_args.len(),
                 allow_network: args.allow_network,
                 mode: args.mode.clone(),
+                eco_mode: args.eco_mode.clone(),
+                eco_capability: eco_capability(&args),
             },
             args.json,
         );
@@ -257,6 +261,8 @@ pub fn run(host: &str, config_dir: &Path, args: LaunchArgs) -> Result<(), Client
         extra_argument_count: args.extra_args.len(),
         allow_network: args.allow_network,
         mode: args.mode.clone(),
+        eco_mode: args.eco_mode.clone(),
+        eco_capability: eco_capability(&args),
     };
     if args.configure {
         return render_plan(&plan, args.json);
@@ -275,7 +281,51 @@ pub fn run(host: &str, config_dir: &Path, args: LaunchArgs) -> Result<(), Client
             "Network access requested for this invocation; filesystem and approval policies are unchanged."
         );
     }
-    launch_child(
+    let session_id = ulid::Ulid::new().to_string();
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let created = match client.create_launch_session(&super::wire::LaunchSessionRequest {
+        id: session_id.clone(),
+        instance: instance.name.clone(),
+        integration: args.integration.as_str().into(),
+        eco_mode: args.eco_mode.clone(),
+    }) {
+        Ok(value) => value,
+        Err(_) => {
+            eprintln!("Session accounting unavailable; inference usage will be marked unknown.");
+            // Creation may have committed before its response was lost.
+            let _ = client.finish_launch_session(&session_id);
+            None
+        }
+    };
+    let mut inference = created.as_ref().map(|value| value.session.clone());
+    let session_token = created
+        .and_then(|value| value.bearer_token)
+        .map(LaunchSecret);
+    if inference.is_some() && session_token.is_none() {
+        // A lost one-time credential cannot be recovered. Revoke it rather than
+        // attributing the shared fallback credential to this session.
+        let _ = client.finish_launch_session(&session_id);
+        inference = None;
+    }
+    let eco = match super::eco::EcoSession::create(&session_id, args.eco_mode == "max", &args.mode)
+    {
+        Ok(value) => Some(value),
+        Err(_) => {
+            eprintln!("Eco integration unavailable; launch continues without compression.");
+            None
+        }
+    };
+    if args.eco_mode == "max" {
+        eprintln!(
+            "Eco mode: embedded RTK; {}.",
+            if args.mode == "inherit" {
+                "compression inactive to preserve inherited permissions"
+            } else {
+                "agent hook trust still applies"
+            }
+        );
+    }
+    let result = launch_child(
         args.integration,
         args.yes,
         args.allow_network,
@@ -285,10 +335,59 @@ pub fn run(host: &str, config_dir: &Path, args: LaunchArgs) -> Result<(), Client
             host,
             instance: &instance,
             model: &model,
-            token: &token,
+            token: session_token.as_ref().unwrap_or(&token),
         },
         &args.extra_args,
-    )
+        eco.as_ref(),
+    );
+    if inference.is_some() {
+        match client.finish_launch_session(&session_id) {
+            Ok(value) => inference = Some(value),
+            Err(_) => {
+                inference = None;
+                eprintln!("Session finalization unavailable; inference usage is unknown.");
+            }
+        }
+    }
+    let compression = eco
+        .as_ref()
+        .map(super::eco::EcoSession::summary)
+        .unwrap_or_else(|| super::economics::Compression {
+            status: "unavailable".into(),
+            metrics_errors: 1,
+            ..Default::default()
+        });
+    let mut report = super::economics::Report {
+        schema: super::economics::SCHEMA.into(),
+        session_id,
+        host: host.into(),
+        model: model.canonical.clone(),
+        integration: args.integration.as_str().into(),
+        eco_mode: args.eco_mode.clone(),
+        started_at,
+        finished_at: Some(chrono::Utc::now().to_rfc3339()),
+        exit_code: Some(result.as_ref().err().map(|error| error.code).unwrap_or(0)),
+        inference,
+        compression,
+        catalog: super::economics::catalog().expect("bundled price catalog"),
+        comparisons: Vec::new(),
+    };
+    report.calculate();
+    if super::economics::save(config_dir, &report).is_err() {
+        eprintln!("Could not retain the private economics report.");
+    }
+    super::economics::display(&report);
+    result
+}
+
+fn eco_capability(args: &LaunchArgs) -> &'static str {
+    if args.eco_mode == "none" {
+        "disabled"
+    } else if args.mode == "inherit" {
+        "inactive_policy"
+    } else {
+        "embedded_hooks_require_agent_support_and_trust"
+    }
 }
 
 fn validate_args(args: &LaunchArgs) -> Result<(), ClientError> {
@@ -732,11 +831,17 @@ fn launch_child(
     mode: &str,
     launch: ReadyLaunch<'_>,
     extra_args: &[String],
+    eco: Option<&super::eco::EcoSession>,
 ) -> Result<(), ClientError> {
     let executable = ensure_executable(integration, yes)?;
     let mut command = Command::new(executable);
     if integration != LaunchIntegration::Opencode {
         configure_launch_permissions(&mut command, integration, mode, allow_network)?;
+        if let Some(eco) = eco
+            && eco.configure(&mut command, integration).is_err()
+        {
+            eprintln!("Eco hook setup unavailable; launch continues without compression.");
+        }
     }
     command
         .stdin(Stdio::inherit())
@@ -774,10 +879,86 @@ fn launch_child(
     if integration == LaunchIntegration::Opencode {
         configure_launch_permissions(&mut command, integration, mode, allow_network)?;
     }
-    let status = command
-        .status()
+    if integration == LaunchIntegration::Opencode
+        && let Some(eco) = eco
+        && eco.configure(&mut command, integration).is_err()
+    {
+        eprintln!("Eco hook setup unavailable; launch continues without compression.");
+    }
+    let adapter = if launch
+        .instance
+        .input_modalities
+        .iter()
+        .any(|modality| modality == "image")
+    {
+        let adapter = super::inference_adapter::Adapter::start(
+            launch.config_dir,
+            launch.host,
+            &launch.instance.name,
+            launch.token.expose(),
+        )?;
+        configure_image_adapter(&mut command, integration, &launch.instance.name, &adapter)?;
+        eprintln!("Image history: recent frames retained; older originals can be reopened.");
+        Some(adapter)
+    } else {
+        None
+    };
+    let status = super::eco::wait(command)
         .map_err(|_| usage(format!("could not start {}", integration.as_str())))?;
+    drop(adapter);
     child_result(integration, status)
+}
+
+fn configure_image_adapter(
+    command: &mut Command,
+    integration: LaunchIntegration,
+    instance: &str,
+    adapter: &super::inference_adapter::Adapter,
+) -> Result<(), ClientError> {
+    match integration {
+        LaunchIntegration::Codex => {
+            command
+                .arg("-c")
+                .arg(format!(
+                    "model_providers.{}.base_url={:?}",
+                    provider_name(instance),
+                    format!("{}/openai/v1", adapter.base_url)
+                ))
+                .env("SPARKPLANE_INFERENCE_TOKEN", adapter.token())
+                .env("OPENAI_API_KEY", adapter.token());
+        }
+        LaunchIntegration::Claude => {
+            command
+                .env(
+                    "ANTHROPIC_BASE_URL",
+                    format!("{}/anthropic", adapter.base_url),
+                )
+                .env("ANTHROPIC_AUTH_TOKEN", adapter.token());
+        }
+        LaunchIntegration::Opencode => {
+            let content = command
+                .get_envs()
+                .find(|(key, _)| *key == "OPENCODE_CONFIG_CONTENT")
+                .and_then(|(_, value)| value)
+                .ok_or_else(|| failure(EXIT_INTERNAL, "missing OpenCode session configuration"))?;
+            let mut value: Value = serde_json::from_str(&content.to_string_lossy())
+                .map_err(|_| failure(EXIT_INTERNAL, "invalid OpenCode session configuration"))?;
+            value["provider"]["sparkplane"]["options"]["baseURL"] =
+                format!("{}/openai/v1", adapter.base_url).into();
+            command
+                .env(
+                    "OPENCODE_CONFIG_CONTENT",
+                    serde_json::to_string(&value).map_err(|_| {
+                        failure(
+                            EXIT_INTERNAL,
+                            "cannot encode OpenCode session configuration",
+                        )
+                    })?,
+                )
+                .env("SPARKPLANE_INFERENCE_TOKEN", adapter.token());
+        }
+    }
+    Ok(())
 }
 
 fn configure_claude_command(
@@ -849,6 +1030,11 @@ fn configure_codex_command(
             "responses"
         ),
         format!("model_catalog_json={:?}", catalog),
+        // Leave room for new tool results and a compaction request on local models.
+        format!(
+            "model_auto_compact_token_limit={}",
+            instance.context_window * 3 / 4
+        ),
     ];
     if let Some(effort) = &instance.default_reasoning_effort {
         overrides.push(format!("model_reasoning_effort={effort:?}"));
@@ -1072,10 +1258,7 @@ fn child_result(integration: LaunchIntegration, status: ExitStatus) -> Result<()
     if status.success() {
         return Ok(());
     }
-    let code = status
-        .code()
-        .filter(|code| (1..=125).contains(code))
-        .unwrap_or(1);
+    let code = super::eco::exit_code(status);
     Err(failure(
         code,
         format!("{} exited with status {code}", integration.as_str()),
@@ -1838,6 +2021,7 @@ mod tests {
         let args = LaunchArgs {
             integration: LaunchIntegration::Codex,
             mode: "auto".into(),
+            eco_mode: "max".into(),
             allow_network: false,
             model: Some("ornith".into()),
             configure: false,
@@ -1859,6 +2043,20 @@ mod tests {
                 .unwrap_err()
                 .code,
             7
+        );
+    }
+
+    #[test]
+    fn child_signal_exit_status_is_preserved() {
+        let status = Command::new("sh")
+            .args(["-c", "kill -TERM $$"])
+            .status()
+            .unwrap();
+        assert_eq!(
+            child_result(LaunchIntegration::Codex, status)
+                .unwrap_err()
+                .code,
+            143
         );
     }
 }

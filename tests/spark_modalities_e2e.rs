@@ -1,5 +1,7 @@
 #![cfg(feature = "appliance")]
 
+use sparkplane::spark::image_history;
+
 #[path = "../src/spark/gateway.rs"]
 #[cfg_attr(test, allow(dead_code))]
 mod gateway;

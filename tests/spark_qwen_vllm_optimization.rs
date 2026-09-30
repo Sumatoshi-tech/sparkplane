@@ -32,6 +32,8 @@ fn qwen38_checkpoint_and_selected_engine_accept_inline_images() {
         vision.processor_sha256,
         "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
     );
+    assert_eq!(vision.max_count, 16);
+    assert_eq!(vision.max_total_bytes, 524288);
     let image = serde_json::json!({"type":"input_image", "image_url":format!("data:image/png;base64,{}", vision.health_image_base64)});
     let mut request = serde_json::json!({"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Name the color."},image]}]});
     let rewrite = gateway::rewrite_responses_request_with_profile(
@@ -58,6 +60,15 @@ fn qwen38_checkpoint_and_selected_engine_accept_inline_images() {
             &text_profile
         )
         .is_err()
+    );
+    request["input"][0]["content"] = serde_json::json!(vec![image.clone(); vision.max_count]);
+    assert!(
+        gateway::rewrite_responses_request_with_profile(
+            &serde_json::to_vec(&request).unwrap(),
+            "served-model",
+            &profile
+        )
+        .is_ok()
     );
     request["input"][0]["content"]
         .as_array_mut()

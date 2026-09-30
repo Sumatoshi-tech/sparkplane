@@ -73,6 +73,39 @@ pub struct ClaudeCodeClientConfig {
     pub shell: String,
 }
 
+/// Inference launched through the local adapter keeps the appliance's pinned TLS
+/// authority and never follows redirects carrying its private session credential.
+pub(super) fn inference_transport(
+    config_dir: &Path,
+    host: &str,
+) -> Result<(reqwest::Client, Url), ClientError> {
+    let profiles: Profiles = toml::from_str(&read_text(&config_dir.join("spark.toml"))?)
+        .map_err(|_| usage("invalid Spark host profiles"))?;
+    let profile = profiles
+        .hosts
+        .get(host)
+        .ok_or_else(|| usage("Spark host is not configured"))?;
+    let base = Url::parse(&profile.url).map_err(|_| usage("invalid Spark URL"))?;
+    reject_plaintext_lan(&base)?;
+    let ca = fs::read(config_dir.join("spark").join(format!("{host}.ca.pem")))
+        .map_err(|_| unreachable("pinned Spark CA certificate is unavailable"))?;
+    if format!("sha256:{:x}", Sha256::digest(&ca)) != profile.ca_cert_sha256 {
+        return Err(unreachable("pinned Spark CA fingerprint does not match"));
+    }
+    let certificate = reqwest::Certificate::from_pem(&ca)
+        .map_err(|_| unreachable("pinned Spark CA certificate is invalid"))?;
+    let http = reqwest::Client::builder()
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(certificate)
+        .https_only(base.scheme() == "https")
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(1800))
+        .build()
+        .map_err(|_| unreachable("could not construct pinned inference transport"))?;
+    Ok((http, base))
+}
+
 pub fn codex_client_config(
     config_dir: &Path,
     host: &str,
@@ -230,6 +263,54 @@ impl Drop for SparkClient {
 }
 
 impl SparkClient {
+    pub fn create_launch_session(
+        &self,
+        request: &super::wire::LaunchSessionRequest,
+    ) -> Result<Option<super::wire::LaunchSessionCreated>, ClientError> {
+        let url = self
+            .base
+            .join("api/sparkplane/v1/launch-sessions")
+            .map_err(|_| usage("invalid session route"))?;
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(5))
+            .json(request)
+            .send()
+            .map_err(|_| unreachable("session accounting unavailable"))?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(map_problem(response.status(), response.json().ok()));
+        }
+        decode_response(response).map(Some)
+    }
+
+    pub fn finish_launch_session(
+        &self,
+        id: &str,
+    ) -> Result<super::wire::LaunchSessionDocument, ClientError> {
+        if id.parse::<ulid::Ulid>().is_err() {
+            return Err(usage("invalid session id"));
+        }
+        let url = self
+            .base
+            .join(&format!("api/sparkplane/v1/launch-sessions/{id}/finish"))
+            .map_err(|_| usage("invalid session route"))?;
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .map_err(|_| unreachable("session finalization unavailable"))?;
+        if !response.status().is_success() {
+            return Err(map_problem(response.status(), response.json().ok()));
+        }
+        decode_response(response)
+    }
     pub fn load(config_dir: &Path, host: &str) -> Result<Self, ClientError> {
         let profiles: Profiles = toml::from_str(&read_text(&config_dir.join("spark.toml"))?)
             .map_err(|error| usage(format!("invalid Spark host profiles: {error}")))?;
@@ -658,7 +739,7 @@ fn valid_model_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-fn validate_instance_reference(value: &str) -> Result<(), ClientError> {
+pub(super) fn validate_instance_reference(value: &str) -> Result<(), ClientError> {
     if !value.is_empty()
         && value.len() <= 96
         && value

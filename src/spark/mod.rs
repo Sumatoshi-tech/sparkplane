@@ -2,13 +2,19 @@
 
 pub mod cli;
 pub mod client;
+pub mod eco;
+pub mod economics;
 #[cfg(feature = "appliance")]
 pub mod engine;
+pub mod image_history;
+pub mod inference_adapter;
 pub mod install;
 pub mod launch;
 pub mod qualification;
 #[cfg(feature = "appliance")]
 pub mod reconcile;
+#[cfg(feature = "appliance")]
+pub mod sessions;
 pub mod wire;
 
 #[cfg(feature = "appliance")]

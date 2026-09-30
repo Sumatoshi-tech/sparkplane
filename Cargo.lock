@@ -3097,8 +3097,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "shlex",
  "sparkplane-core",
  "sparkplane-ipc",
+ "sparkplane-rtk",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -3148,6 +3150,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
+]
+
+[[package]]
+name = "sparkplane-rtk"
+version = "0.49.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]

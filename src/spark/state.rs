@@ -297,6 +297,7 @@ enum Command {
         reply: oneshot::Sender<Result<Option<CompatibilityEvaluationDocument>, StateError>>,
     },
     Snapshot(oneshot::Sender<Result<AuthSnapshot, StateError>>),
+    Sessions(super::sessions::Command),
     Shutdown(std_mpsc::SyncSender<()>),
 }
 
@@ -308,6 +309,15 @@ pub struct DbActor {
 }
 
 impl DbActor {
+    pub(crate) fn session_command(
+        &self,
+        command: super::sessions::Command,
+    ) -> Result<(), StateError> {
+        self.sender
+            .try_send(Command::Sessions(command))
+            .map_err(|_| StateError::Overloaded)
+    }
+
     pub fn open(
         path: impl AsRef<Path>,
         backup_dir: impl AsRef<Path>,
@@ -690,7 +700,7 @@ fn open_connection(
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(state_sql)?;
-    if version > 0 && version < 4 {
+    if version > 0 && (version < 4 || super::sessions::migration_needed(&connection)?) {
         verified_backup(&connection, backup_dir, max_backups)?;
     }
     let migrations = Migrations::new(vec![
@@ -705,6 +715,9 @@ fn open_connection(
     migrations
         .to_latest(&mut connection)
         .map_err(state_migration)?;
+    // Additive launch tables have a separate version ledger. Older releases
+    // still read the qualified engine state under the unchanged main schema.
+    super::sessions::migrate(&mut connection)?;
     verified_backup(&connection, backup_dir, max_backups)?;
     Ok(connection)
 }
@@ -777,6 +790,9 @@ fn actor_loop(
 ) {
     while let Some(command) = receiver.blocking_recv() {
         match command {
+            Command::Sessions(command) => {
+                super::sessions::dispatch(&mut connection, &pepper, command)
+            }
             Command::Health(reply) => {
                 let _ = reply.send(database_health(&connection));
             }
@@ -1588,7 +1604,10 @@ fn list_instances(connection: &Connection) -> Result<Vec<InstanceDocument>, Stat
         .collect()
 }
 
-fn read_instance(connection: &Connection, reference: &str) -> Result<InstanceDocument, StateError> {
+pub(crate) fn read_instance(
+    connection: &Connection,
+    reference: &str,
+) -> Result<InstanceDocument, StateError> {
     let values = {
         let mut statement = connection
             .prepare("SELECT metadata_json FROM instances WHERE id=?1 OR name=?1 LIMIT 2")
@@ -2341,7 +2360,11 @@ fn valid_cidr(value: &str) -> bool {
     prefix <= if address.is_ipv4() { 32 } else { 128 }
 }
 
-fn token_hmac(pepper: &SecretString, id: &str, secret: &str) -> Result<[u8; 32], StateError> {
+pub(crate) fn token_hmac(
+    pepper: &SecretString,
+    id: &str,
+    secret: &str,
+) -> Result<[u8; 32], StateError> {
     let mut mac = HmacSha256::new_from_slice(pepper.expose_secret().as_bytes())
         .map_err(|_| StateError::Unavailable("token pepper is invalid".into()))?;
     mac.update(id.as_bytes());
@@ -2349,7 +2372,7 @@ fn token_hmac(pepper: &SecretString, id: &str, secret: &str) -> Result<[u8; 32],
     Ok(mac.finalize().into_bytes().into())
 }
 
-fn random_secret() -> Result<String, StateError> {
+pub(crate) fn random_secret() -> Result<String, StateError> {
     use std::io::Read;
     let mut bytes = [0_u8; 32];
     fs::File::open("/dev/urandom")
@@ -2381,7 +2404,7 @@ fn parse_state(value: &str) -> Result<OperationState, StateError> {
     }
 }
 
-fn now() -> String {
+pub(crate) fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 fn json<T: serde::Serialize>(value: &T) -> Result<String, StateError> {
@@ -2499,6 +2522,123 @@ mod tests {
             ("wal", "FULL", true, QUEUE_CAPACITY)
         );
         actor.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn launch_sessions_isolate_usage_and_finish_idempotently() {
+        use crate::spark::{
+            sessions::UsageMeter, upstream::GenerationEvent, wire::LaunchSessionRequest,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let db = actor(root.path());
+        let model = model_document("m_0123456789abcdef0123456789abcdef", "ornith:9b");
+        db.promote_model(model.clone(), false).await.unwrap();
+        db.begin_serve(instance_document(&model, "ornith", "spark-vllm"))
+            .await
+            .unwrap();
+        let request = LaunchSessionRequest {
+            id: ulid::Ulid::new().to_string(),
+            instance: "ornith".into(),
+            integration: "codex".into(),
+            eco_mode: "max".into(),
+        };
+        let created = db
+            .create_launch_session("admin", request.clone())
+            .await
+            .unwrap();
+        assert!(created.bearer_token.is_some());
+        assert!(
+            db.create_launch_session("admin", request.clone())
+                .await
+                .unwrap()
+                .bearer_token
+                .is_none()
+        );
+        let mut conflict = request.clone();
+        conflict.eco_mode = "none".into();
+        assert!(matches!(
+            db.create_launch_session("admin", conflict).await,
+            Err(StateError::Conflict(_))
+        ));
+        let token = created.bearer_token.unwrap();
+        let token_id = token
+            .strip_prefix("sparkplane_")
+            .unwrap()
+            .split('_')
+            .next()
+            .unwrap();
+        let meter = UsageMeter::begin(Some(&db), token_id, "ornith")
+            .await
+            .unwrap();
+        meter.observe(&GenerationEvent::Usage {
+            prompt_tokens: 272001,
+            completion_tokens: 4,
+        });
+        meter.observe(&GenerationEvent::Usage {
+            prompt_tokens: 272001,
+            completion_tokens: 4,
+        });
+        meter.observe(&GenerationEvent::Done);
+        drop(meter);
+        let missing = UsageMeter::begin(Some(&db), token_id, "ornith")
+            .await
+            .unwrap();
+        drop(missing);
+        for _ in 0..100 {
+            if db
+                .launch_session(&request.id, false, "")
+                .await
+                .unwrap()
+                .usage
+                .pending_requests
+                == 0
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let finished = db.launch_session(&request.id, true, "admin").await.unwrap();
+        assert_eq!(finished.usage.requests, 2);
+        assert_eq!(finished.usage.input_tokens, 272001);
+        assert_eq!(finished.usage.output_tokens, 4);
+        assert_eq!(finished.usage.long_context_input_tokens, 272001);
+        assert_eq!(finished.usage.unknown_usage_requests, 1);
+        assert_eq!(finished.usage.pending_requests, 0);
+        assert_eq!(
+            finished.finished_at,
+            db.launch_session(&request.id, true, "admin")
+                .await
+                .unwrap()
+                .finished_at
+        );
+        assert!(
+            !db.auth_snapshot()
+                .await
+                .unwrap()
+                .tokens
+                .contains_key(token_id)
+        );
+        db.shutdown().unwrap();
+        // The previous release can still open its schema and read the exact
+        // qualified instance after the additive feature migration.
+        let mut legacy = Connection::open(root.path().join("state.sqlite3")).unwrap();
+        Migrations::new(vec![
+            M::up(MIGRATION_1),
+            M::up(MIGRATION_2),
+            M::up(MIGRATION_3),
+            M::up(MIGRATION_4),
+            M::up(MIGRATION_5),
+            M::up(MIGRATION_6),
+        ])
+        .to_latest(&mut legacy)
+        .unwrap();
+        let retained = read_instance(&legacy, "ornith").unwrap();
+        assert_eq!(retained.context_window, 65536);
+        assert_eq!(retained.model, model.canonical);
+        assert_eq!(
+            retained.engine_fingerprint,
+            format!("sha256:{}", "b".repeat(64))
+        );
     }
 
     #[test]

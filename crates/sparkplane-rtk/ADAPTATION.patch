@@ -1,0 +1,280 @@
+--- upstream/src/core/toml_filter.rs
++++ src/core/toml_filter.rs
+@@ -29,7 +29,7 @@
+ use std::sync::LazyLock;
+ 
+ // Built-in filters: concatenated from src/filters/*.toml by build.rs at compile time.
+-const BUILTIN_TOML: &str = include_str!(concat!(env!("OUT_DIR"), "/builtin_filters.toml"));
++const BUILTIN_TOML: &str = include_str!("builtin_filters.toml");
+ 
+ // ---------------------------------------------------------------------------
+ // Deserialization types (TOML schema)
+@@ -188,38 +188,12 @@
+     fn load() -> Self {
+         let mut filters = Vec::new();
+ 
+-        for path in crate::hooks::trust::gated_filter_paths() {
+-            Self::extend_with_trusted(&mut filters, &path);
+-        }
+-
+         match Self::parse_and_compile(BUILTIN_TOML, "builtin") {
+             Ok(f) => filters.extend(f),
+             Err(e) => eprintln!("[rtk] warning: builtin filters: {}", e),
+         }
+ 
+         TomlFilterRegistry { filters }
+-    }
+-
+-    fn extend_with_trusted(filters: &mut Vec<CompiledFilter>, path: &std::path::Path) {
+-        if !path.exists() {
+-            return;
+-        }
+-        let label = path.display().to_string();
+-        let (status, content) = crate::hooks::trust::check_trust_with_content(path)
+-            .unwrap_or((crate::hooks::trust::TrustStatus::Untrusted, None));
+-        match status {
+-            crate::hooks::trust::TrustStatus::Trusted
+-            | crate::hooks::trust::TrustStatus::EnvOverride => {
+-                if let Some(content) = content {
+-                    match Self::parse_and_compile(&content, &label) {
+-                        Ok(f) => filters.extend(f),
+-                        Err(e) => eprintln!("[rtk] warning: {}: {}", label, e),
+-                    }
+-                }
+-            }
+-            crate::hooks::trust::TrustStatus::Untrusted
+-            | crate::hooks::trust::TrustStatus::ContentChanged { .. } => {}
+-        }
+     }
+ 
+     fn parse_and_compile(content: &str, source: &str) -> Result<Vec<CompiledFilter>, String> {
+@@ -447,24 +421,7 @@
+ }
+ 
+ fn collect_match_patterns() -> Vec<String> {
+-    let mut patterns: Vec<String> = Vec::new();
+-    for path in crate::hooks::trust::gated_filter_paths() {
+-        if !path.exists() {
+-            continue;
+-        }
+-        let (status, content) = crate::hooks::trust::check_trust_with_content(&path)
+-            .unwrap_or((crate::hooks::trust::TrustStatus::Untrusted, None));
+-        if matches!(
+-            status,
+-            crate::hooks::trust::TrustStatus::Trusted
+-                | crate::hooks::trust::TrustStatus::EnvOverride
+-        ) && let Some(content) = content
+-        {
+-            patterns.extend(match_patterns_in(&content));
+-        }
+-    }
+-    patterns.extend(match_patterns_in(BUILTIN_TOML));
+-    patterns
++    match_patterns_in(BUILTIN_TOML)
+ }
+ 
+ /// Strip a leading inline-flag group such as `(?i)` so the anchor check sees the
+@@ -722,131 +679,6 @@
+ ///
+ /// - `filter_name_opt`: if `Some`, only run tests for that filter name.
+ /// - Returns `VerifyResults` with all outcomes and filters that have no tests.
+-pub fn run_filter_tests(filter_name_opt: Option<&str>) -> VerifyResults {
+-    let mut outcomes = Vec::new();
+-    let mut all_filter_names: Vec<String> = Vec::new();
+-    let mut tested_filter_names: std::collections::HashSet<String> =
+-        std::collections::HashSet::new();
+-
+-    let builtin = BUILTIN_TOML;
+-    collect_test_outcomes(
+-        builtin,
+-        filter_name_opt,
+-        &mut outcomes,
+-        &mut all_filter_names,
+-        &mut tested_filter_names,
+-    );
+-
+-    // Trust-gated: only verify project-local filters if trusted (SA-2025-RTK-002)
+-    let project_path = std::path::Path::new(".rtk/filters.toml");
+-    if project_path.exists() {
+-        let (trust_status, verified_content) =
+-            crate::hooks::trust::check_trust_with_content(project_path)
+-                .unwrap_or((crate::hooks::trust::TrustStatus::Untrusted, None));
+-        match trust_status {
+-            crate::hooks::trust::TrustStatus::Trusted
+-            | crate::hooks::trust::TrustStatus::EnvOverride => {
+-                if let Some(content) = verified_content {
+-                    collect_test_outcomes(
+-                        &content,
+-                        filter_name_opt,
+-                        &mut outcomes,
+-                        &mut all_filter_names,
+-                        &mut tested_filter_names,
+-                    );
+-                }
+-            }
+-            _ => {
+-                eprintln!("[rtk] WARNING: untrusted project filters skipped in verify");
+-            }
+-        }
+-    }
+-
+-    let filters_without_tests = all_filter_names
+-        .into_iter()
+-        .filter(|name| {
+-            // When a specific filter is requested, only report that one as missing tests
+-            filter_name_opt.is_none_or(|f| name == f)
+-        })
+-        .filter(|name| !tested_filter_names.contains(name))
+-        .collect();
+-
+-    VerifyResults {
+-        outcomes,
+-        filters_without_tests,
+-    }
+-}
+-
+-fn collect_test_outcomes(
+-    content: &str,
+-    filter_name_opt: Option<&str>,
+-    outcomes: &mut Vec<TestOutcome>,
+-    all_filter_names: &mut Vec<String>,
+-    tested_filter_names: &mut std::collections::HashSet<String>,
+-) {
+-    let file: TomlFilterFile = match toml::from_str(content) {
+-        Ok(f) => f,
+-        Err(e) => {
+-            eprintln!("[rtk] warning: TOML parse error during verify: {}", e);
+-            return;
+-        }
+-    };
+-
+-    // Compile all filters and track their names
+-    let mut compiled_filters: BTreeMap<String, CompiledFilter> = BTreeMap::new();
+-    for (name, def) in file.filters {
+-        all_filter_names.push(name.clone());
+-        match compile_filter(name.clone(), def) {
+-            Ok(f) => {
+-                compiled_filters.insert(name, f);
+-            }
+-            Err(e) => eprintln!("[rtk] warning: filter '{}' compilation error: {}", name, e),
+-        }
+-    }
+-
+-    // Run tests
+-    for (filter_name, tests) in file.tests {
+-        if let Some(name) = filter_name_opt
+-            && filter_name != name
+-        {
+-            continue;
+-        }
+-
+-        tested_filter_names.insert(filter_name.clone());
+-
+-        let compiled = match compiled_filters.get(&filter_name) {
+-            Some(f) => f,
+-            None => {
+-                eprintln!(
+-                    "[rtk] warning: [[tests.{}]] references unknown filter",
+-                    filter_name
+-                );
+-                continue;
+-            }
+-        };
+-
+-        for test in tests {
+-            let actual = apply_filter(compiled, &test.input);
+-            // Trim trailing newlines: TOML multiline strings end with a newline
+-            let actual_cmp = actual.trim_end_matches('\n').to_string();
+-            let expected_cmp = test.expected.trim_end_matches('\n').to_string();
+-            outcomes.push(TestOutcome {
+-                filter_name: filter_name.clone(),
+-                test_name: test.name,
+-                passed: actual_cmp == expected_cmp,
+-                actual: actual_cmp,
+-                expected: expected_cmp,
+-            });
+-        }
+-    }
+-}
+-
+-// ---------------------------------------------------------------------------
+-// Convenience wrapper (uses singleton — for run_fallback)
+-// ---------------------------------------------------------------------------
+-
+-/// Find a matching filter from the global registry. Initialises the registry
+-/// lazily on first call. Returns `None` if no filter matches.
+ pub fn find_matching_filter(command: &str) -> Option<&'static CompiledFilter> {
+     if std::env::var("RTK_TOML_DEBUG").is_ok() {
+         eprintln!(
+@@ -2227,3 +2059,71 @@
+         assert_eq!(found.unwrap().name, "my-new-tool");
+     }
+ }
++
++pub fn registry() -> &'static TomlFilterRegistry {
++    &REGISTRY
++}
++
++fn collect_test_outcomes(
++    content: &str,
++    filter_name_opt: Option<&str>,
++    outcomes: &mut Vec<TestOutcome>,
++    all_filter_names: &mut Vec<String>,
++    tested_filter_names: &mut std::collections::HashSet<String>,
++) {
++    let file: TomlFilterFile = match toml::from_str(content) {
++        Ok(f) => f,
++        Err(e) => {
++            eprintln!("[rtk] warning: TOML parse error during verify: {}", e);
++            return;
++        }
++    };
++
++    // Compile all filters and track their names
++    let mut compiled_filters: BTreeMap<String, CompiledFilter> = BTreeMap::new();
++    for (name, def) in file.filters {
++        all_filter_names.push(name.clone());
++        match compile_filter(name.clone(), def) {
++            Ok(f) => {
++                compiled_filters.insert(name, f);
++            }
++            Err(e) => eprintln!("[rtk] warning: filter '{}' compilation error: {}", name, e),
++        }
++    }
++
++    // Run tests
++    for (filter_name, tests) in file.tests {
++        if let Some(name) = filter_name_opt
++            && filter_name != name
++        {
++            continue;
++        }
++
++        tested_filter_names.insert(filter_name.clone());
++
++        let compiled = match compiled_filters.get(&filter_name) {
++            Some(f) => f,
++            None => {
++                eprintln!(
++                    "[rtk] warning: [[tests.{}]] references unknown filter",
++                    filter_name
++                );
++                continue;
++            }
++        };
++
++        for test in tests {
++            let actual = apply_filter(compiled, &test.input);
++            // Trim trailing newlines: TOML multiline strings end with a newline
++            let actual_cmp = actual.trim_end_matches('\n').to_string();
++            let expected_cmp = test.expected.trim_end_matches('\n').to_string();
++            outcomes.push(TestOutcome {
++                filter_name: filter_name.clone(),
++                test_name: test.name,
++                passed: actual_cmp == expected_cmp,
++                actual: actual_cmp,
++                expected: expected_cmp,
++            });
++        }
++    }
++}

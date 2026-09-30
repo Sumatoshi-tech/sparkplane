@@ -1,0 +1,2493 @@
+schema_version = 1
+
+[filters.ansible-playbook]
+description = "Compact ansible-playbook output"
+match_command = "^ansible-playbook\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^ok: \\[",
+  "^skipping: \\[",
+]
+max_lines = 60
+
+[[tests.ansible-playbook]]
+name = "strips ok and skipping lines, keeps changed and failures"
+input = """
+PLAY [all] *********************************************************************
+
+TASK [Gathering Facts] *********************************************************
+ok: [web01]
+ok: [web02]
+
+TASK [Install nginx] ***********************************************************
+changed: [web01]
+skipping: [web02]
+
+PLAY RECAP *********************************************************************
+web01                      : ok=2    changed=1    unreachable=0    failed=0
+web02                      : ok=1    changed=0    unreachable=0    failed=0
+"""
+expected = "PLAY [all] *********************************************************************\nTASK [Gathering Facts] *********************************************************\nTASK [Install nginx] ***********************************************************\nchanged: [web01]\nPLAY RECAP *********************************************************************\nweb01                      : ok=2    changed=1    unreachable=0    failed=0\nweb02                      : ok=1    changed=0    unreachable=0    failed=0"
+
+[[tests.ansible-playbook]]
+name = "failed task preserved"
+input = "TASK [Start service] ***\nfailed: [web01] => {\"msg\": \"Service not found\"}\nPLAY RECAP ***\nweb01 : ok=1 failed=1"
+expected = "TASK [Start service] ***\nfailed: [web01] => {\"msg\": \"Service not found\"}\nPLAY RECAP ***\nweb01 : ok=1 failed=1"
+
+
+[filters.basedpyright]
+description = "Compact basedpyright type checker output — strip blank lines, keep errors"
+match_command = "^basedpyright\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^Searching for source files",
+  "^Found \\d+ source file",
+  "^Pyright \\d+\\.\\d+",
+  "^basedpyright \\d+\\.\\d+",
+]
+max_lines = 50
+on_empty = "basedpyright: ok"
+
+[[tests.basedpyright]]
+name = "strips noise, keeps errors and summary"
+input = """
+basedpyright 1.22.0
+Searching for source files
+Found 42 source files
+
+/home/user/app/main.py
+  /home/user/app/main.py:10:5 - error: "foo" is not defined (reportUndefinedVariable)
+  /home/user/app/main.py:25:1 - error: Type "str" is not assignable to type "int" (reportAssignmentType)
+
+/home/user/app/utils.py
+  /home/user/app/utils.py:8:9 - warning: Variable "x" is not accessed (reportUnusedVariable)
+
+3 errors, 1 warning, 0 informations
+"""
+expected = "/home/user/app/main.py\n  /home/user/app/main.py:10:5 - error: \"foo\" is not defined (reportUndefinedVariable)\n  /home/user/app/main.py:25:1 - error: Type \"str\" is not assignable to type \"int\" (reportAssignmentType)\n/home/user/app/utils.py\n  /home/user/app/utils.py:8:9 - warning: Variable \"x\" is not accessed (reportUnusedVariable)\n3 errors, 1 warning, 0 informations"
+
+[[tests.basedpyright]]
+name = "clean output"
+input = """
+basedpyright 1.22.0
+Searching for source files
+Found 10 source files
+
+0 errors, 0 warnings, 0 informations
+"""
+expected = "0 errors, 0 warnings, 0 informations"
+
+[[tests.basedpyright]]
+name = "empty input returns on_empty message"
+input = ""
+expected = "basedpyright: ok"
+
+
+[filters.biome]
+description = "Compact Biome lint/format output — strip blank lines, keep diagnostics"
+match_command = "^biome\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^Checked \\d+ file",
+  "^Fixed \\d+ file",
+  "^The following command",
+  "^Run it with",
+]
+max_lines = 50
+on_empty = "biome: ok"
+
+[[tests.biome]]
+name = "lint strips noise, keeps diagnostics"
+input = """
+Checked 42 files in 0.5s
+
+src/app.tsx:5:3 lint/suspicious/noExplicitAny ━━━━━━━━━━━━━━━━━━━━
+  × Unexpected any. Specify a different type.
+  3 │ interface Props {
+  4 │   data: any;
+  5 │         ^^^
+
+src/utils.ts:12:1 lint/complexity/noForEach ━━━━━━━━━━━━━━━━━━━━
+  × Prefer for...of instead of forEach.
+ 12 │ items.forEach(item => process(item));
+    │ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Found 2 errors.
+"""
+expected = "src/app.tsx:5:3 lint/suspicious/noExplicitAny ━━━━━━━━━━━━━━━━━━━━\n  × Unexpected any. Specify a different type.\n  3 │ interface Props {\n  4 │   data: any;\n  5 │         ^^^\nsrc/utils.ts:12:1 lint/complexity/noForEach ━━━━━━━━━━━━━━━━━━━━\n  × Prefer for...of instead of forEach.\n 12 │ items.forEach(item => process(item));\n    │ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nFound 2 errors."
+
+[[tests.biome]]
+name = "clean check"
+input = """
+Checked 42 files in 0.3s
+"""
+expected = "biome: ok"
+
+[[tests.biome]]
+name = "empty input returns on_empty message"
+input = ""
+expected = "biome: ok"
+
+
+[filters.brew-install]
+description = "Compact brew install/upgrade output — strip downloads, short-circuit when already installed"
+match_command = "^brew\\s+(install|upgrade)\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^==> Downloading",
+  "^==> Pouring",
+  "^Already downloaded:",
+  "^###",
+  "^==> Fetching",
+]
+match_output = [
+  { pattern = "already installed", message = "ok (already installed)" },
+]
+max_lines = 20
+
+[[tests.brew-install]]
+name = "already installed short-circuits"
+input = """
+Warning: rtk 0.27.1 is already installed and up-to-date.
+To reinstall 0.27.1, run:
+  brew reinstall rtk
+"""
+expected = "ok (already installed)"
+
+[[tests.brew-install]]
+name = "install strips download lines"
+input = """
+==> Fetching jq
+==> Downloading https://homebrew.bintray.com/bottles/jq-1.7.1.arm64_sonoma.bottle.tar.gz
+######################################################################## 100.0%
+==> Pouring jq-1.7.1.arm64_sonoma.bottle.tar.gz
+==> Summary
+/opt/homebrew/Cellar/jq/1.7.1: 18 files, 1.2MB
+"""
+expected = "==> Summary\n/opt/homebrew/Cellar/jq/1.7.1: 18 files, 1.2MB"
+
+
+[filters.bundle-install]
+description = "Compact bundle install/update — strip 'Using' lines, keep installs and errors"
+match_command = "^bundle\\s+(install|update)\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^Using ",
+  "^\\s*$",
+  "^Fetching gem metadata",
+  "^Resolving dependencies",
+]
+match_output = [
+  { pattern = "Bundle complete!", message = "ok bundle: complete" },
+  { pattern = "Bundle updated!", message = "ok bundle: updated" },
+]
+max_lines = 30
+
+[[tests.bundle-install]]
+name = "all cached short-circuits"
+input = """
+Using bundler 2.5.6
+Using rake 13.1.0
+Using ast 2.4.2
+Using base64 0.2.0
+Using minitest 5.22.2
+Bundle complete! 85 Gemfile dependencies, 200 gems now installed.
+Use `bundle info [gemname]` to see where a bundled gem is installed.
+"""
+expected = "ok bundle: complete"
+
+[[tests.bundle-install]]
+name = "mixed install keeps Fetching and Installing lines"
+input = """
+Fetching gem metadata from https://rubygems.org/.........
+Resolving dependencies...
+Using rake 13.1.0
+Using ast 2.4.2
+Fetching rspec 3.13.0
+Installing rspec 3.13.0
+Using rubocop 1.62.0
+Fetching simplecov 0.22.0
+Installing simplecov 0.22.0
+Bundle complete! 85 Gemfile dependencies, 202 gems now installed.
+"""
+expected = "ok bundle: complete"
+
+[[tests.bundle-install]]
+name = "update output"
+input = """
+Fetching gem metadata from https://rubygems.org/.........
+Resolving dependencies...
+Using rake 13.1.0
+Fetching rspec 3.14.0 (was 3.13.0)
+Installing rspec 3.14.0 (was 3.13.0)
+Bundle updated!
+"""
+expected = "ok bundle: updated"
+
+[[tests.bundle-install]]
+name = "empty output"
+input = ""
+expected = ""
+
+
+[filters.composer-install]
+description = "Compact composer install/update/require output — strip downloads, short-circuit when up-to-date"
+match_command = "^composer\\s+(install|update|require)\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^  - Downloading ",
+  "^  - Installing ",
+  "^Loading composer",
+  "^Updating dependencies",
+]
+match_output = [
+  { pattern = "Nothing to install, update or remove", message = "ok (up to date)" },
+]
+max_lines = 30
+
+[[tests.composer-install]]
+name = "nothing to do short-circuits"
+input = """
+Loading composer repositories with package information
+Updating dependencies
+Lock file operations: 0 installs, 0 updates, 0 removals
+Nothing to install, update or remove
+Generating autoload files
+"""
+expected = "ok (up to date)"
+
+[[tests.composer-install]]
+name = "install strips download lines"
+input = """
+Loading composer repositories with package information
+Updating dependencies
+  - Downloading symfony/console (v6.4.0)
+  - Installing symfony/console (v6.4.0): Extracting archive
+  - Downloading psr/log (3.0.0)
+  - Installing psr/log (3.0.0): Extracting archive
+Writing lock file
+Generating autoload files
+"""
+expected = "Writing lock file\nGenerating autoload files"
+
+
+[filters.df]
+description = "Compact df output — truncate wide columns, limit rows"
+match_command = "^df(\\s|$)"
+strip_ansi = true
+truncate_lines_at = 80
+max_lines = 20
+
+[[tests.df]]
+name = "short output passes through unchanged"
+input = "Filesystem     1K-blocks   Used Available Use% Mounted on\n/dev/sda1        4096000 123456   3972544   4% /"
+expected = "Filesystem     1K-blocks   Used Available Use% Mounted on\n/dev/sda1        4096000 123456   3972544   4% /"
+
+[[tests.df]]
+name = "empty input passes through"
+input = ""
+expected = ""
+
+
+[filters.dotnet-build]
+description = "Compact dotnet build output — short-circuit on success, strip banners"
+match_command = "^dotnet\\s+build\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^Microsoft \\(R\\)",
+  "^Copyright \\(C\\)",
+  "^  Determining projects",
+]
+match_output = [
+  { pattern = "0 Warning\\(s\\)\\n\\s+0 Error\\(s\\)", message = "ok (build succeeded)" },
+]
+max_lines = 40
+
+[[tests.dotnet-build]]
+name = "successful build short-circuits to ok"
+input = """
+Microsoft (R) Build Engine version 17.8.3+195e7f5a3
+Copyright (C) Microsoft Corporation. All rights reserved.
+
+  Determining projects to restore...
+  All projects are up-to-date for restore.
+  MyApp -> /home/user/MyApp/bin/Debug/net8.0/MyApp.dll
+
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:00:02.34
+"""
+expected = "ok (build succeeded)"
+
+[[tests.dotnet-build]]
+name = "build with warnings not short-circuited"
+input = """
+Microsoft (R) Build Engine version 17.8.3+195e7f5a3
+Copyright (C) Microsoft Corporation. All rights reserved.
+
+  Determining projects to restore...
+  MyApp -> /home/user/MyApp/bin/Debug/net8.0/MyApp.dll
+
+Build succeeded.
+    3 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:00:01.87
+"""
+expected = "  MyApp -> /home/user/MyApp/bin/Debug/net8.0/MyApp.dll\nBuild succeeded.\n    3 Warning(s)\n    0 Error(s)\nTime Elapsed 00:00:01.87"
+
+[[tests.dotnet-build]]
+name = "build errors pass through"
+input = """
+Microsoft (R) Build Engine version 17.8.3+195e7f5a3
+Copyright (C) Microsoft Corporation. All rights reserved.
+
+  Determining projects to restore...
+src/Program.cs(10,5): error CS1002: ; expected [/home/user/MyApp/MyApp.csproj]
+
+Build FAILED.
+    0 Warning(s)
+    1 Error(s)
+"""
+expected = "src/Program.cs(10,5): error CS1002: ; expected [/home/user/MyApp/MyApp.csproj]\nBuild FAILED.\n    0 Warning(s)\n    1 Error(s)"
+
+
+[filters.du]
+description = "Compact du output"
+match_command = "^du\\b"
+strip_lines_matching = ["^\\s*$"]
+truncate_lines_at = 120
+max_lines = 40
+
+[[tests.du]]
+name = "preserves sizes, strips blank lines"
+input = "4.0K\t./src\n\n8.0K\t./tests\n16K\t."
+expected = "4.0K\t./src\n8.0K\t./tests\n16K\t."
+
+[[tests.du]]
+name = "single line passthrough"
+input = "128K\t."
+expected = "128K\t."
+
+
+[filters.fail2ban-client]
+description = "Compact fail2ban-client output"
+match_command = "^fail2ban-client\\b"
+strip_lines_matching = ["^\\s*$"]
+max_lines = 30
+
+[[tests.fail2ban-client]]
+name = "strips blank lines"
+input = "Status for the jail: sshd\n|- Filter\n|  |- Currently failed: 3\n\n|- Actions\n   `- Total banned: 42"
+expected = "Status for the jail: sshd\n|- Filter\n|  |- Currently failed: 3\n|- Actions\n   `- Total banned: 42"
+
+[[tests.fail2ban-client]]
+name = "single line passthrough"
+input = "Shutdown successful"
+expected = "Shutdown successful"
+
+
+[filters.gcc]
+description = "Compact gcc/g++ compiler output — strip notes, keep errors and warnings"
+match_command = "^g(cc|\\+\\+)\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^\\s+\\|\\s*$",
+  "^In file included from",
+  "^\\s+from\\s",
+  "^\\d+ warnings? generated",
+  "^\\d+ errors? generated",
+]
+max_lines = 50
+on_empty = "gcc: ok"
+
+[[tests.gcc]]
+name = "strips include chain, keeps errors and warnings"
+input = """
+In file included from /usr/include/stdio.h:42:
+                 from main.c:1:
+main.c:10:5: error: use of undeclared identifier 'foo'
+    foo();
+    ^
+main.c:15:12: warning: unused variable 'x' [-Wunused-variable]
+    int x = 42;
+        ^
+2 warnings generated.
+1 error generated.
+"""
+expected = "main.c:10:5: error: use of undeclared identifier 'foo'\n    foo();\n    ^\nmain.c:15:12: warning: unused variable 'x' [-Wunused-variable]\n    int x = 42;\n        ^"
+
+[[tests.gcc]]
+name = "clean compilation"
+input = """
+"""
+expected = "gcc: ok"
+
+[[tests.gcc]]
+name = "linker error kept"
+input = """
+/usr/bin/ld: /tmp/main.o: undefined reference to 'missing_func'
+collect2: error: ld returned 1 exit status
+"""
+expected = "/usr/bin/ld: /tmp/main.o: undefined reference to 'missing_func'\ncollect2: error: ld returned 1 exit status"
+
+[[tests.gcc]]
+name = "empty input returns on_empty message"
+input = ""
+expected = "gcc: ok"
+
+
+[filters.gcloud]
+description = "Compact gcloud output"
+match_command = "^gcloud\\b"
+strip_ansi = true
+strip_lines_matching = ["^\\s*$"]
+truncate_lines_at = 120
+max_lines = 30
+
+[[tests.gcloud]]
+name = "strips blank lines, preserves output"
+input = """
+Updated property [core/project].
+
+NAME        REGION        STATUS
+my-cluster  us-central1   RUNNING
+"""
+expected = "Updated property [core/project].\nNAME        REGION        STATUS\nmy-cluster  us-central1   RUNNING"
+
+[[tests.gcloud]]
+name = "single line passthrough"
+input = "Listed 0 items."
+expected = "Listed 0 items."
+
+
+[filters.hadolint]
+description = "Compact hadolint Dockerfile linting output"
+match_command = "^hadolint\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+]
+truncate_lines_at = 120
+max_lines = 40
+
+[[tests.hadolint]]
+name = "Dockerfile warnings kept, blank lines stripped"
+input = """
+Dockerfile:3 DL3008 warning: Pin versions in apt-get install
+Dockerfile:5 DL3009 info: Delete apt-get lists after installing
+
+Dockerfile:8 DL4006 warning: Set SHELL option -o pipefail before RUN with pipe
+"""
+expected = "Dockerfile:3 DL3008 warning: Pin versions in apt-get install\nDockerfile:5 DL3009 info: Delete apt-get lists after installing\nDockerfile:8 DL4006 warning: Set SHELL option -o pipefail before RUN with pipe"
+
+[[tests.hadolint]]
+name = "empty input passes through"
+input = ""
+expected = ""
+
+
+[filters.helm]
+description = "Compact helm output"
+match_command = "^helm\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^W\\d{4}",
+]
+truncate_lines_at = 120
+
+[[tests.helm]]
+name = "strips blank lines, preserves release info"
+input = """
+NAME: my-release
+LAST DEPLOYED: Mon Jan 15 10:30:00 2024
+NAMESPACE: default
+STATUS: deployed
+REVISION: 3
+
+NOTES:
+Application is running.
+"""
+expected = "NAME: my-release\nLAST DEPLOYED: Mon Jan 15 10:30:00 2024\nNAMESPACE: default\nSTATUS: deployed\nREVISION: 3\nNOTES:\nApplication is running."
+
+[[tests.helm]]
+name = "strips glog W-prefix warnings"
+input = "W0115 10:30:00 warning message from internal\nNAME: my-chart\nSTATUS: deployed"
+expected = "NAME: my-chart\nSTATUS: deployed"
+
+[[tests.helm]]
+name = "helm template output is not truncated"
+input = """
+# Source: my-chart/templates/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: my-ns
+---
+# Source: my-chart/templates/secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-secret
+---
+# Source: my-chart/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-cm
+---
+# Source: my-chart/templates/pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: my-pvc
+---
+# Source: my-chart/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-svc
+---
+# Source: my-chart/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-deploy
+"""
+expected = """# Source: my-chart/templates/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: my-ns
+---
+# Source: my-chart/templates/secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-secret
+---
+# Source: my-chart/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-cm
+---
+# Source: my-chart/templates/pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: my-pvc
+---
+# Source: my-chart/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-svc
+---
+# Source: my-chart/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-deploy"""
+
+
+[filters.iptables]
+description = "Compact iptables output"
+match_command = "^iptables\\b"
+strip_lines_matching = [
+  "^\\s*$",
+  "^Chain DOCKER",
+  "^Chain BR-",
+]
+max_lines = 50
+truncate_lines_at = 120
+
+[[tests.iptables]]
+name = "strips Docker chains, preserves real rules"
+input = """
+Chain INPUT (policy ACCEPT)
+num  target     prot opt source               destination
+1    ACCEPT     all  --  0.0.0.0/0            0.0.0.0/0
+Chain DOCKER (1 references)
+    DOCKER     all  --  0.0.0.0/0            0.0.0.0/0
+Chain BR-abcdef (0 references)
+"""
+expected = "Chain INPUT (policy ACCEPT)\nnum  target     prot opt source               destination\n1    ACCEPT     all  --  0.0.0.0/0            0.0.0.0/0\n    DOCKER     all  --  0.0.0.0/0            0.0.0.0/0"
+
+[[tests.iptables]]
+name = "preserves FORWARD and OUTPUT chains"
+input = "Chain FORWARD (policy DROP)\n1 ACCEPT tcp\nChain OUTPUT (policy ACCEPT)\n1 ACCEPT all"
+expected = "Chain FORWARD (policy DROP)\n1 ACCEPT tcp\nChain OUTPUT (policy ACCEPT)\n1 ACCEPT all"
+
+
+[filters.jira]
+description = "Compact Jira CLI output — strip verbose metadata, keep essentials"
+match_command = "^jira\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^\\s*--",
+]
+truncate_lines_at = 120
+max_lines = 40
+
+[[tests.jira]]
+name = "strips blank lines from issue list"
+input = "TYPE\tKEY\tSUMMARY\tSTATUS\n\nStory\tPROJ-123\tAdd login feature\tIn Progress\n\nBug\tPROJ-456\tFix crash on startup\tOpen"
+expected = "TYPE\tKEY\tSUMMARY\tSTATUS\nStory\tPROJ-123\tAdd login feature\tIn Progress\nBug\tPROJ-456\tFix crash on startup\tOpen"
+
+[[tests.jira]]
+name = "single issue view"
+input = "KEY: PROJ-123\nSummary: Add login feature\nStatus: In Progress\nAssignee: john@example.com"
+expected = "KEY: PROJ-123\nSummary: Add login feature\nStatus: In Progress\nAssignee: john@example.com"
+
+
+[filters.jj]
+description = "Compact Jujutsu (jj) output — strip blank lines, truncate"
+match_command = "^jj\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^Hint:",
+  "^Working copy now at:",
+]
+max_lines = 30
+truncate_lines_at = 120
+
+[[tests.jj]]
+name = "log output stripped of hints"
+input = """
+@  qpvuntsm patrick@example.com 2026-03-10 12:00 abc123
+│  feat: add new feature
+◉  zzzzzzzz root()
+
+Working copy now at: qpvuntsm abc123 feat: add new feature
+Hint: use `jj log` to see the full history
+"""
+expected = "@  qpvuntsm patrick@example.com 2026-03-10 12:00 abc123\n│  feat: add new feature\n◉  zzzzzzzz root()"
+
+[[tests.jj]]
+name = "empty input passes through"
+input = ""
+expected = ""
+
+
+[filters.jq]
+description = "Compact jq output — truncate large JSON results"
+match_command = "^jq\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+]
+max_lines = 40
+truncate_lines_at = 120
+
+[[tests.jq]]
+name = "short output passes through"
+input = """
+{
+  "name": "test",
+  "version": "1.0"
+}
+"""
+expected = "{\n  \"name\": \"test\",\n  \"version\": \"1.0\"\n}"
+
+[[tests.jq]]
+name = "empty input passes through"
+input = ""
+expected = ""
+
+
+[filters.just]
+description = "Compact just task runner output — strip recipe headers, keep command output"
+match_command = "^just\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^\\s*Available recipes:",
+  "^\\s*just --list",
+]
+truncate_lines_at = 150
+max_lines = 50
+
+[[tests.just]]
+name = "preserves command output"
+input = "cargo test\n\ntest result: ok. 42 passed; 0 failed\n"
+expected = "cargo test\ntest result: ok. 42 passed; 0 failed"
+
+[[tests.just]]
+name = "preserves error output"
+input = "error: Compilation failed\nsrc/main.rs:10: expected `;`"
+expected = "error: Compilation failed\nsrc/main.rs:10: expected `;`"
+
+[[tests.just]]
+name = "empty input"
+input = ""
+expected = ""
+
+
+[filters.liquibase]
+description = "Compact liquibase output — strip headers and generic info"
+match_command = "^liquibase(?:\\s|$)"
+strip_ansi = true
+filter_stderr = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^Starting Liquibase at",
+  "^Liquibase (?:Community|Open Source)",
+  "^Liquibase Home:",
+  "^Java Home",
+  "^Libraries:",
+  "^\\s*-\\s+\\S+\\.jar",
+  "^INFO \\[liquibase\\.integration\\]",
+  "^INFO \\[liquibase\\.core\\] Reading resource",
+  "^INFO \\[liquibase\\.core\\] Parsing",
+  "^(?:\\[?INFO\\]?\\s*)?#+$",
+  "^\\s*##"
+]
+on_empty = "liquibase: ok"
+max_lines = 200
+
+[[tests.liquibase]]
+name = "strip ascii banner and info logs from subcommand"
+input = '''
+####################################################
+##   _     _             _ _                      ##
+##  | |   (_)           (_) |                     ##
+####################################################
+Starting Liquibase at 10:12:11 (version 4.29.1)
+Liquibase Version: 4.29.1
+Liquibase Open Source 4.29.1 by Liquibase
+INFO [liquibase.integration] Starting command
+INFO [liquibase.core] Reading resource db/changelog.xml
+INFO [liquibase.core] Parsing db/changelog.xml
+Running Changeset: filepath::id::author
+Changeset filepath::id::author ran successfully
+'''
+expected = '''
+Liquibase Version: 4.29.1
+Running Changeset: filepath::id::author
+Changeset filepath::id::author ran successfully'''
+
+[[tests.liquibase]]
+name = "strip --version noise, keep only version line"
+input = '''
+####################################################
+##   _     _             _ _                      ##
+####################################################
+Starting Liquibase at 13:45:24 using Java 17.0.15 (version 4.30.0 #4943 built at 2024-10-31 17:00+0000)
+Liquibase Home: D:\mcp\bash\lbr\third-party
+Java Home C:\Program Files\Java\jdk-17.0.15 (Version 17.0.15)
+Libraries:
+  - internal\lib\commons-io.jar: Apache Commons IO 2.17.0 By The Apache Software Foundation
+  - internal\lib\picocli.jar: picocli 4.7.6 By Remko Popma
+  - lib\ojdbc10-19.30.0.0.jar: JDBC 19.30.0.0.0 By Oracle Corporation
+
+Liquibase Version: 4.30.0
+Liquibase Open Source 4.30.0 by Liquibase
+'''
+expected = '''
+Liquibase Version: 4.30.0'''
+
+[[tests.liquibase]]
+name = "keep status and error lines"
+input = '''
+####################################################
+##   _     _             _ _                      ##
+####################################################
+Starting Liquibase at 10:00:00 (version 4.30.0)
+Liquibase Version: 4.30.0
+Liquibase Open Source 4.30.0 by Liquibase
+HR@jdbc:oracle:thin:@localhost:1523:XE is up to date
+Liquibase command 'status' was executed successfully.
+'''
+expected = '''
+Liquibase Version: 4.30.0
+HR@jdbc:oracle:thin:@localhost:1523:XE is up to date
+Liquibase command 'status' was executed successfully.'''
+
+[[tests.liquibase]]
+name = "empty input"
+input = ""
+expected = "liquibase: ok"
+
+
+[filters.make]
+description = "Compact make output"
+match_command = "^make\\b"
+strip_lines_matching = [
+  "^make\\[\\d+\\]:",
+  "^\\s*$",
+  "^Nothing to be done",
+]
+max_lines = 50
+on_empty = "make: ok"
+
+[[tests.make]]
+name = "strips entering/leaving lines"
+input = """
+make[1]: Entering directory '/home/user'
+gcc -O2 foo.c
+make[1]: Leaving directory '/home/user'
+"""
+expected = """
+gcc -O2 foo.c
+"""
+
+[[tests.make]]
+name = "strips blank lines"
+input = """
+gcc -O2 foo.c
+
+gcc -O2 bar.c
+"""
+expected = """
+gcc -O2 foo.c
+gcc -O2 bar.c
+"""
+
+[[tests.make]]
+name = "on_empty when all stripped"
+input = """
+make[1]: Entering directory '/home/user'
+make[1]: Leaving directory '/home/user'
+"""
+expected = "make: ok"
+
+
+[filters.markdownlint]
+description = "Compact markdownlint output — strip blank lines, limit rows"
+match_command = "^markdownlint\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+]
+max_lines = 50
+truncate_lines_at = 120
+
+[[tests.markdownlint]]
+name = "linting errors stripped of blank lines"
+input = """
+README.md:1:1 MD041/first-line-heading/first-line-h1 First line in file should be a top level heading
+README.md:10:1 MD022/blanks-around-headings Headings should be surrounded by blank lines
+
+README.md:15:80 MD013/line-length Line length [Expected: 80; Actual: 95]
+"""
+expected = "README.md:1:1 MD041/first-line-heading/first-line-h1 First line in file should be a top level heading\nREADME.md:10:1 MD022/blanks-around-headings Headings should be surrounded by blank lines\nREADME.md:15:80 MD013/line-length Line length [Expected: 80; Actual: 95]"
+
+[[tests.markdownlint]]
+name = "empty input passes through"
+input = ""
+expected = ""
+
+
+[filters.mise]
+description = "Compact mise task runner output — strip status lines, keep task results"
+match_command = "^mise\\s+(run|exec|install|upgrade)\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^mise\\s+(trust|install|upgrade).*✓",
+  "^mise\\s+Installing\\s",
+  "^mise\\s+Downloading\\s",
+  "^mise\\s+Extracting\\s",
+  "^mise\\s+\\w+@[\\d.]+ installed",
+]
+truncate_lines_at = 150
+max_lines = 50
+on_empty = "mise: ok"
+
+[[tests.mise]]
+name = "strips install noise, keeps task output"
+input = "mise Installing node@20.0.0\nmise Downloading node@20.0.0\nmise Extracting node@20.0.0\nmise node@20.0.0 installed\n\nlint check passed\n2 warnings found"
+expected = "lint check passed\n2 warnings found"
+
+[[tests.mise]]
+name = "preserves error output"
+input = "mise run lint\nError: biome check failed\nsrc/index.ts:5 — unused variable"
+expected = "mise run lint\nError: biome check failed\nsrc/index.ts:5 — unused variable"
+
+[[tests.mise]]
+name = "empty after stripping"
+input = "mise trust ~/dev/.mise.toml ✓\nmise install node@20 ✓\n"
+expected = "mise: ok"
+
+
+[filters.mix-compile]
+description = "Compact mix compile output"
+match_command = "^mix\\s+compile(\\s|$)"
+strip_ansi = true
+strip_lines_matching = [
+  "^Compiling \\d+ file",
+  "^\\s*$",
+  "^Generated\\s",
+]
+max_lines = 40
+on_empty = "mix compile: ok"
+
+[[tests.mix-compile]]
+name = "strips compile noise, preserves warnings"
+input = """
+Compiling 12 files (.ex)
+Generated my_app app
+
+warning: variable "conn" is unused
+  lib/router.ex:42
+"""
+expected = "warning: variable \"conn\" is unused\n  lib/router.ex:42"
+
+[[tests.mix-compile]]
+name = "on_empty when only noise"
+input = "Compiling 3 files (.ex)\nGenerated my_app app\n"
+expected = "mix compile: ok"
+
+
+[filters.mix-format]
+description = "Compact mix format output"
+match_command = "^mix\\s+format(\\s|$)"
+on_empty = "mix format: ok"
+max_lines = 20
+
+[[tests.mix-format]]
+name = "empty output returns ok"
+input = ""
+expected = "mix format: ok"
+
+[[tests.mix-format]]
+name = "changed files pass through"
+input = "lib/my_app.ex\ntest/my_app_test.exs"
+expected = "lib/my_app.ex\ntest/my_app_test.exs"
+
+
+[filters.nx]
+description = "Compact Nx monorepo output — strip task graph noise, keep results"
+match_command = "^(pnpm\\s+)?nx\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^\\s*>\\s*NX\\s+Running target",
+  "^\\s*>\\s*NX\\s+Nx read the output",
+  "^\\s*>\\s*NX\\s+View logs",
+  "^———————",
+  "^—————————",
+  "^\\s+Nx \\(powered by",
+]
+truncate_lines_at = 150
+max_lines = 60
+
+[[tests.nx]]
+name = "strips Nx noise, keeps build output"
+input = "\n   > NX   Running target build for project myapp\n\n———————————————————————————————————————\nCompiled successfully.\nOutput: dist/apps/myapp\n\n   > NX   View logs at /tmp/.nx/runs/abc123\n\n   Nx (powered by computation caching)\n"
+expected = "Compiled successfully.\nOutput: dist/apps/myapp"
+
+[[tests.nx]]
+name = "preserves error output"
+input = "ERROR: Cannot find module '@myapp/shared'\n\n   > NX   Running target build for project myapp\n\nFailed at step: build"
+expected = "ERROR: Cannot find module '@myapp/shared'\nFailed at step: build"
+
+
+[filters.ollama]
+description = "Strip ANSI spinners and cursor control from ollama output, keep final text"
+match_command = "^ollama\\s+run\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏\\s]*$",
+  "^\\s*$",
+]
+
+[[tests.ollama]]
+name = "strips spinner lines, keeps response"
+input = "⠋ \n⠙ \n⠹ \nHello! How can I help you today?"
+expected = "Hello! How can I help you today?"
+
+[[tests.ollama]]
+name = "preserves multi-line response"
+input = "⠋ \n⠙ \nLine one of the response.\nLine two of the response."
+expected = "Line one of the response.\nLine two of the response."
+
+[[tests.ollama]]
+name = "empty input"
+input = ""
+expected = ""
+
+
+[filters.oxlint]
+description = "Compact oxlint output — strip blank lines, keep diagnostics"
+match_command = "^oxlint\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^Finished in \\d+",
+  "^Found \\d+ warning",
+]
+max_lines = 50
+on_empty = "oxlint: ok"
+
+[[tests.oxlint]]
+name = "strips noise, keeps diagnostics"
+input = """
+  × eslint(no-console): Unexpected console statement.
+   ╭─[src/app.ts:5:3]
+ 5 │   console.log("debug");
+   │   ^^^^^^^^^^^
+   ╰────
+
+  × eslint(no-unused-vars): 'x' is defined but never used.
+   ╭─[src/utils.ts:2:7]
+ 2 │   let x = 42;
+   │       ^
+   ╰────
+
+Found 2 warnings on 2 files.
+Finished in 12ms on 100 files.
+"""
+expected = "  × eslint(no-console): Unexpected console statement.\n   ╭─[src/app.ts:5:3]\n 5 │   console.log(\"debug\");\n   │   ^^^^^^^^^^^\n   ╰────\n  × eslint(no-unused-vars): 'x' is defined but never used.\n   ╭─[src/utils.ts:2:7]\n 2 │   let x = 42;\n   │       ^\n   ╰────"
+
+[[tests.oxlint]]
+name = "clean output"
+input = """
+Finished in 5ms on 100 files.
+"""
+expected = "oxlint: ok"
+
+[[tests.oxlint]]
+name = "empty input returns on_empty message"
+input = ""
+expected = "oxlint: ok"
+
+
+[filters.ping]
+description = "Compact ping output — strip per-packet lines, keep summary"
+match_command = "^ping\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^PING ",
+  "^Pinging ",
+  "^\\d+ bytes from ",
+  "^Reply from .+: bytes=",
+  "^\\s*$",
+]
+tail_lines = 4
+
+[[tests.ping]]
+name = "success keeps summary only"
+input = """
+PING example.com (93.184.216.34): 56 data bytes
+64 bytes from 93.184.216.34: icmp_seq=0 ttl=56 time=14.2 ms
+64 bytes from 93.184.216.34: icmp_seq=1 ttl=56 time=13.8 ms
+64 bytes from 93.184.216.34: icmp_seq=2 ttl=56 time=14.1 ms
+64 bytes from 93.184.216.34: icmp_seq=3 ttl=56 time=13.9 ms
+
+--- example.com ping statistics ---
+4 packets transmitted, 4 packets received, 0.0% packet loss
+round-trip min/avg/max/stddev = 13.8/14.0/14.2/0.2 ms
+"""
+expected = """--- example.com ping statistics ---
+4 packets transmitted, 4 packets received, 0.0% packet loss
+round-trip min/avg/max/stddev = 13.8/14.0/14.2/0.2 ms"""
+
+[[tests.ping]]
+name = "windows format keeps stats block only"
+input = """
+Pinging 192.0.2.1 with 32 bytes of data:
+Reply from 192.0.2.1: bytes=32 time=14ms TTL=56
+Reply from 192.0.2.1: bytes=32 time=13ms TTL=56
+Reply from 192.0.2.1: bytes=32 time=14ms TTL=56
+Reply from 192.0.2.1: bytes=32 time=13ms TTL=56
+
+Ping statistics for 192.0.2.1:
+    Packets: Sent = 4, Received = 4, Lost = 0 (0% loss),
+Approximate round trip times in milli-seconds:
+    Minimum = 13ms, Maximum = 14ms, Average = 13ms
+"""
+expected = """Ping statistics for 192.0.2.1:
+    Packets: Sent = 4, Received = 4, Lost = 0 (0% loss),
+Approximate round trip times in milli-seconds:
+    Minimum = 13ms, Maximum = 14ms, Average = 13ms"""
+
+[[tests.ping]]
+name = "unreachable host passes error through"
+input = """
+PING unreachable.example.com (192.0.2.1): 56 data bytes
+Request timeout for icmp_seq 0
+Request timeout for icmp_seq 1
+
+--- unreachable.example.com ping statistics ---
+2 packets transmitted, 0 packets received, 100.0% packet loss
+"""
+expected = """Request timeout for icmp_seq 0
+Request timeout for icmp_seq 1
+--- unreachable.example.com ping statistics ---
+2 packets transmitted, 0 packets received, 100.0% packet loss"""
+
+
+[filters.pio-run]
+description = "Compact PlatformIO build output"
+match_command = "^pio\\s+run(\\s|$|[;|&()<>])"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^Verbose mode",
+  "^CONFIGURATION:",
+  "^LDF:",
+  "^Library Manager:",
+  "^Compiling\\s",
+  "^Linking\\s",
+  "^Building\\s",
+  "^Checking size",
+]
+max_lines = 30
+on_empty = "pio run: ok"
+
+[[tests.pio-run]]
+name = "strips build noise, preserves errors"
+input = """
+Verbose mode can be enabled via `-v, --verbose` option
+CONFIGURATION: https://docs.platformio.org/page/boards/espressif32/esp32dev.html
+LDF: Library Dependency Finder -> https://bit.ly/configure-pio-ldf
+Compiling .pio/build/esp32dev/src/main.cpp.o
+Building .pio/build/esp32dev/firmware.elf
+Linking .pio/build/esp32dev/firmware.elf
+Checking size .pio/build/esp32dev/firmware.elf
+src/main.cpp:10:3: error: 'LED_BUILTINN' was not declared
+"""
+expected = "src/main.cpp:10:3: error: 'LED_BUILTINN' was not declared"
+
+[[tests.pio-run]]
+name = "on_empty when clean build with only noise"
+input = """
+Verbose mode can be enabled via `-v, --verbose` option
+Compiling .pio/build/esp32dev/src/main.cpp.o
+Linking .pio/build/esp32dev/firmware.elf
+"""
+expected = "pio run: ok"
+
+
+[filters.poetry-install]
+description = "Compact poetry install/lock/update output — strip downloads, short-circuit when up-to-date"
+match_command = "^poetry\\s+(install|lock|update)\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^  [-•] Downloading ",
+  "^  [-•] Installing .* \\(",
+  "^Creating virtualenv",
+  "^Using virtualenv",
+]
+match_output = [
+  { pattern = "No dependencies to install or update|No changes\\.", message = "ok (up to date)" },
+]
+max_lines = 30
+
+[[tests.poetry-install]]
+name = "up to date short-circuits"
+input = """
+Installing dependencies from lock file
+
+No dependencies to install or update
+"""
+expected = "ok (up to date)"
+
+[[tests.poetry-install]]
+name = "poetry 2.x bullet syntax short-circuits to ok"
+input = """
+• Installing requests (2.31.0)
+• Installing certifi (2023.11.17)
+
+No changes.
+"""
+expected = "ok (up to date)"
+
+[[tests.poetry-install]]
+name = "install strips download lines"
+input = """
+Installing dependencies from lock file
+
+  - Downloading requests-2.31.0-py3-none-any.whl (62.6 kB)
+  - Installing certifi (2023.11.17)
+  - Installing charset-normalizer (3.3.2)
+  - Installing idna (3.6)
+  - Installing urllib3 (2.1.0)
+  - Installing requests (2.31.0)
+
+Writing lock file
+"""
+expected = "Installing dependencies from lock file\nWriting lock file"
+
+
+[filters.pre-commit]
+description = "Compact pre-commit output"
+match_command = "^pre-commit\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\[INFO\\] Installing environment",
+  "^\\[INFO\\] Once installed this environment will be reused",
+  "^\\[INFO\\] This may take a few minutes",
+  "^\\s*$",
+]
+max_lines = 40
+
+[[tests.pre-commit]]
+name = "strips INFO install noise, keeps hook results"
+input = """
+[INFO] Installing environment for https://github.com/psf/black.
+[INFO] Once installed this environment will be reused.
+[INFO] This may take a few minutes...
+Trim Trailing Whitespace.................................................Passed
+Fix End of Files.........................................................Passed
+Check Yaml...............................................................Failed
+- hook id: check-yaml
+- exit code: 1
+"""
+expected = "Trim Trailing Whitespace.................................................Passed\nFix End of Files.........................................................Passed\nCheck Yaml...............................................................Failed\n- hook id: check-yaml\n- exit code: 1"
+
+[[tests.pre-commit]]
+name = "all passed — no INFO noise"
+input = """
+[INFO] Installing environment for https://github.com/pre-commit/mirrors-isort.
+[INFO] Once installed this environment will be reused.
+isort....................................................................Passed
+black....................................................................Passed
+"""
+expected = "isort....................................................................Passed\nblack....................................................................Passed"
+
+
+[filters.ps]
+description = "Compact ps output — truncate wide lines, limit rows"
+match_command = "^ps(\\s|$)"
+strip_ansi = true
+truncate_lines_at = 120
+max_lines = 30
+
+[[tests.ps]]
+name = "short process list passes through unchanged"
+input = "USER   PID %CPU %MEM COMMAND\nroot     1  0.0  0.0 /sbin/launchd\nflorian  42  0.1  0.2 bash"
+expected = "USER   PID %CPU %MEM COMMAND\nroot     1  0.0  0.0 /sbin/launchd\nflorian  42  0.1  0.2 bash"
+
+[[tests.ps]]
+name = "empty input passes through"
+input = ""
+expected = ""
+
+
+[filters.pulumi-destroy]
+description = "Compact Pulumi destroy output"
+match_command = "^pulumi\\s+destroy(\\s|$)"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^Destroying \\(",
+  "^Previewing (update|destroy)",
+  "^View in Browser",
+  "^View Live:",
+  "^Duration:",
+  "^Permalink:",
+  "^\\s*Type\\s+Name\\s+",
+  "^Loading policy packs",
+  "^@ (Previewing (update|destroy)|Destroying)",
+  "^More information at:",
+  "^Use `pulumi ",
+  "^The resources in the stack have been deleted",
+  "^If you want to remove the stack completely",
+  "^\\s+-\\s+.*\\bdeleting\\s+\\(",
+  "^\\s{4,}at\\s+\\S+\\s*\\(",
+  "^\\s{4,}at\\s+/",
+  "^\\s+at\\s+processTicksAndRejections",
+  "^\\s+promise:\\s+Promise",
+  "^\\s+\\[Circular",
+  "^\\s*<ref\\s+\\*\\d",
+]
+on_empty = "pulumi destroy: nothing to destroy"
+
+[[tests.pulumi-destroy]]
+name = "strips destroy header and url banner"
+input = """
+Destroying (dev)
+
+View in Browser (Ctrl+O): https://app.pulumi.com/org/my-proj/dev/updates/43
+
+     Type                          Name              Status
+ -   pulumi:pulumi:Stack           my-proj-dev       deleted
+ -   └─ aws:s3:Bucket              my-bucket         deleted
+
+Resources:
+    - 2 deleted
+
+Duration: 7s
+"""
+expected = """ -   pulumi:pulumi:Stack           my-proj-dev       deleted
+ -   └─ aws:s3:Bucket              my-bucket         deleted
+Resources:
+    - 2 deleted"""
+
+[[tests.pulumi-destroy]]
+name = "on_empty when nothing to destroy"
+input = """
+Destroying (dev)
+
+View in Browser (Ctrl+O): https://app.pulumi.com/org/my-proj/dev/updates/43
+
+Duration: 1s
+"""
+expected = "pulumi destroy: nothing to destroy"
+
+
+[filters.pulumi-preview]
+description = "Compact Pulumi preview output"
+match_command = "^pulumi\\s+preview(\\s|$)"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^Previewing update",
+  "^View in Browser",
+  "^View Live:",
+  "^Duration:",
+  "^Permalink:",
+  "^\\s*Type\\s+Name\\s+",
+  "^Loading policy packs",
+  "^@ Previewing update",
+  "^More information at:",
+  "^Use `pulumi ",
+  "^\\s{4,}at\\s+\\S+\\s*\\(",
+  "^\\s{4,}at\\s+/",
+  "^\\s+at\\s+processTicksAndRejections",
+  "^\\s+promise:\\s+Promise",
+  "^\\s+\\[Circular",
+  "^\\s*<ref\\s+\\*\\d",
+  "^\\s+pulumi:pulumi:Stack\\s+\\S+\\s+running\\s*$",
+  "^\\s+\\S+\\s+\\S+\\s+\\d+\\s+errors?\\s*$",
+  "^\\s+\\S+\\s+\\S+(?:\\s+\\S+)?\\s+\\d+\\s+errors?\\s*$",
+]
+on_empty = "pulumi preview: no changes"
+
+[[tests.pulumi-preview]]
+name = "strips header, url and duration noise"
+input = """
+Previewing update (dev)
+
+View in Browser (Ctrl+O): https://app.pulumi.com/org/my-proj/dev/previews/abc123
+
+     Type                          Name              Plan
+ +   pulumi:pulumi:Stack           my-proj-dev       create
+ +   └─ aws:s3:Bucket              my-bucket         create
+
+Resources:
+    + 2 to create
+
+Duration: 3s
+"""
+expected = """ +   pulumi:pulumi:Stack           my-proj-dev       create
+ +   └─ aws:s3:Bucket              my-bucket         create
+Resources:
+    + 2 to create"""
+
+[[tests.pulumi-preview]]
+name = "on_empty when only noise lines present"
+input = """
+Previewing update (dev)
+
+View in Browser (Ctrl+O): https://app.pulumi.com/org/my-proj/dev/previews/abc123
+
+Duration: 1s
+"""
+expected = "pulumi preview: no changes"
+
+
+[filters.pulumi-refresh]
+description = "Compact Pulumi refresh (state reconciliation) output"
+match_command = "^pulumi\\s+refresh(\\s|$)"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^Refreshing \\(",
+  "^Previewing (refresh|update)",
+  "^View in Browser",
+  "^View Live:",
+  "^Duration:",
+  "^Permalink:",
+  "^\\s*Type\\s+Name\\s+",
+  "^Loading policy packs",
+  "^@ (Previewing refresh|Refreshing)",
+  "^More information at:",
+  "^Use `pulumi ",
+  "^\\s+.*\\brefreshing\\s+\\(",
+  "^\\s+[~+\\-]\\s+[^ ]+\\s+\\S+\\s+refreshing\\s*$",
+  "^\\s{4,}at\\s+\\S+\\s*\\(",
+  "^\\s{4,}at\\s+/",
+  "^\\s+at\\s+processTicksAndRejections",
+  "^\\s+promise:\\s+Promise",
+  "^\\s+\\[Circular",
+  "^\\s*<ref\\s+\\*\\d",
+]
+on_empty = "pulumi refresh: no drift"
+
+[[tests.pulumi-refresh]]
+name = "strips refresh header and passes drift rows"
+input = """
+Refreshing (dev)
+
+View in Browser (Ctrl+O): https://app.pulumi.com/org/my-proj/dev/updates/44
+
+     Type                          Name              Status
+ ~   aws:s3:Bucket                 my-bucket         refreshed
+
+Resources:
+    ~ 1 updated
+
+Duration: 4s
+"""
+expected = """ ~   aws:s3:Bucket                 my-bucket         refreshed
+Resources:
+    ~ 1 updated"""
+
+[[tests.pulumi-refresh]]
+name = "on_empty when no drift detected"
+input = """
+Refreshing (dev)
+
+View in Browser (Ctrl+O): https://app.pulumi.com/org/my-proj/dev/updates/44
+
+Duration: 2s
+"""
+expected = "pulumi refresh: no drift"
+
+
+[filters.pulumi-stack]
+description = "Compact Pulumi stack (ls/output) output"
+match_command = "^pulumi\\s+stack(\\s+(ls|output|history|select|init|rm|rename|tag|unselect|change-secrets-provider)\\b|\\s*$)"
+strip_ansi = true
+match_output = [
+  { pattern = "No stacks found", message = "pulumi stack: empty" },
+]
+strip_lines_matching = [
+  "^\\s*$",
+  "^Please choose a stack",
+  "^More information at:",
+  "^Use `pulumi ",
+  "^Current stack outputs \\(0\\):",
+  "^\\s+No output values currently",
+]
+on_empty = "pulumi stack: ok"
+
+[[tests.pulumi-stack]]
+name = "no stacks short-circuits"
+input = "No stacks found in the current workspace.\n"
+expected = "pulumi stack: empty"
+
+[[tests.pulumi-stack]]
+name = "keeps stack identity, strips prompt noise"
+input = """
+Please choose a stack, or create a new one:
+Current stack is dev:
+    Managed by my-user
+    Owner: my-org
+    Last updated: 2 hours ago
+    Pulumi version used: v3.120.0
+
+Current stack resources (3):
+    TYPE                          NAME
+    pulumi:pulumi:Stack           my-proj-dev
+    aws:s3:Bucket                 my-bucket
+    aws:iam:Role                  my-role
+"""
+expected = """Current stack is dev:
+    Managed by my-user
+    Owner: my-org
+    Last updated: 2 hours ago
+    Pulumi version used: v3.120.0
+Current stack resources (3):
+    TYPE                          NAME
+    pulumi:pulumi:Stack           my-proj-dev
+    aws:s3:Bucket                 my-bucket
+    aws:iam:Role                  my-role"""
+
+
+[filters.pulumi-up]
+description = "Compact Pulumi up (apply) output"
+match_command = "^pulumi\\s+up(\\s|$)"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^Updating \\(",
+  "^Previewing update",
+  "^View in Browser",
+  "^View Live:",
+  "^Duration:",
+  "^Permalink:",
+  "^\\s*Type\\s+Name\\s+",
+  "^Loading policy packs",
+  "^@ (Previewing update|Updating)",
+  "^More information at:",
+  "^Use `pulumi ",
+  "^\\s+\\+\\s+.*\\bcreating\\s+\\(",
+  "^\\s+~\\s+.*\\bupdating\\s+\\(",
+  "^\\s{4,}at\\s+\\S+\\s*\\(",
+  "^\\s{4,}at\\s+/",
+  "^\\s+at\\s+processTicksAndRejections",
+  "^\\s+promise:\\s+Promise",
+  "^\\s+\\[Circular",
+  "^\\s*<ref\\s+\\*\\d",
+]
+on_empty = "pulumi up: no changes"
+
+[[tests.pulumi-up]]
+name = "strips update header and url banner"
+input = """
+Updating (dev)
+
+View in Browser (Ctrl+O): https://app.pulumi.com/org/my-proj/dev/updates/42
+
+     Type                          Name              Status
+ +   pulumi:pulumi:Stack           my-proj-dev       created
+ +   └─ aws:s3:Bucket              my-bucket         created
+
+Outputs:
+    bucket_name: "my-bucket-abc123"
+
+Resources:
+    + 2 created
+
+Duration: 15s
+"""
+expected = """ +   pulumi:pulumi:Stack           my-proj-dev       created
+ +   └─ aws:s3:Bucket              my-bucket         created
+Outputs:
+    bucket_name: \"my-bucket-abc123\"
+Resources:
+    + 2 created"""
+
+[[tests.pulumi-up]]
+name = "on_empty when all noise stripped"
+input = """
+Updating (dev)
+
+View in Browser (Ctrl+O): https://app.pulumi.com/org/my-proj/dev/updates/42
+
+Duration: 2s
+"""
+expected = "pulumi up: no changes"
+
+
+[filters.quarto-render]
+description = "Compact quarto render output"
+match_command = "^quarto\\s+render(\\s|$|[;|&()<>])"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^\\s*processing file:",
+  "^\\s*\\d+/\\d+\\s",
+  "^\\s*running",
+  "^\\s*Rendering",
+  "^pandoc ",
+  "^  Validating",
+  "^  Resolving",
+]
+match_output = [
+  { pattern = "Output created:", message = "ok (output created)" },
+]
+max_lines = 20
+
+[[tests.quarto-render]]
+name = "success short-circuits to ok"
+input = """
+processing file: index.qmd
+  Validating schema
+  Resolving resources
+pandoc to html5
+Output created: _site/index.html
+"""
+expected = "ok (output created)"
+
+[[tests.quarto-render]]
+name = "error passes through"
+input = """
+processing file: broken.qmd
+  Validating schema
+ERROR: Render failed
+
+caused by:
+  syntax error at line 10
+"""
+expected = "ERROR: Render failed\ncaused by:\n  syntax error at line 10"
+
+
+[filters.rsync]
+description = "Compact rsync output — short-circuit on success, strip progress"
+match_command = "^rsync\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^sending incremental file list",
+  "^sent \\d",
+]
+match_output = [
+  { pattern = "total size is", message = "ok (synced)", unless = "error|failed|No such file" },
+]
+max_lines = 20
+
+[[tests.rsync]]
+name = "successful sync short-circuits to ok"
+input = """
+sending incremental file list
+./
+file1.txt
+file2.txt
+
+sent 1,234 bytes  received 42 bytes  2,552.00 bytes/sec
+total size is 98,765  speedup is 77.31
+"""
+expected = "ok (synced)"
+
+[[tests.rsync]]
+name = "error lines pass through"
+input = """
+sending incremental file list
+rsync: [Receiver] mkdir "/remote/path" failed: Permission denied (13)
+rsync error: error in file system (code 11) at receiver.c(741) [Receiver=3.2.7]
+"""
+expected = """rsync: [Receiver] mkdir "/remote/path" failed: Permission denied (13)
+rsync error: error in file system (code 11) at receiver.c(741) [Receiver=3.2.7]"""
+
+[[tests.rsync]]
+name = "errors not swallowed when total size present"
+input = """
+rsync: [sender] error
+error in rsync protocol data stream (code 12)
+sent 100 bytes  received 200 bytes  60.00 bytes/sec
+total size is 1000  speedup is 3.33
+"""
+expected = """rsync: [sender] error
+error in rsync protocol data stream (code 12)
+total size is 1000  speedup is 3.33"""
+
+
+[filters.shellcheck]
+description = "Compact shellcheck output — strip blank lines, keep caret indicators for error position"
+match_command = "^shellcheck\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+]
+max_lines = 50
+
+[[tests.shellcheck]]
+name = "multi-warning output stripped of blank lines only"
+input = """
+In script.sh line 3:
+if [[ $1 == "" ]]
+     ^-- SC2236: Use -z instead of ! -n.
+
+In script.sh line 7:
+echo $var
+     ^-- SC2086: Double quote to prevent globbing.
+
+"""
+expected = "In script.sh line 3:\nif [[ $1 == \"\" ]]\n     ^-- SC2236: Use -z instead of ! -n.\nIn script.sh line 7:\necho $var\n     ^-- SC2086: Double quote to prevent globbing."
+
+[[tests.shellcheck]]
+name = "empty input passes through"
+input = ""
+expected = ""
+
+
+[filters.shopify-theme]
+description = "Compact shopify theme push/pull output"
+match_command = "^shopify\\s+theme\\s+(push|pull)(\\s|$|[;|&()<>])"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^\\s*Uploading",
+  "^\\s*Downloading",
+]
+tail_lines = 5
+max_lines = 15
+on_empty = "shopify theme: ok"
+
+[[tests.shopify-theme]]
+name = "strips upload/download lines, keeps tail"
+input = """
+Uploading assets/app.css
+Uploading assets/app.js
+Uploading templates/index.liquid
+Downloading assets/old.css
+
+Theme 'Development' (id: 12345) pushed to store.example.myshopify.com
+"""
+expected = "Theme 'Development' (id: 12345) pushed to store.example.myshopify.com"
+
+[[tests.shopify-theme]]
+name = "on_empty when all stripped"
+input = "Uploading assets/app.css\nDownloading assets/base.css\n"
+expected = "shopify theme: ok"
+
+
+[filters.skopeo]
+description = "Compact skopeo output — truncate large manifests, strip verbosity"
+match_command = "^skopeo\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^Getting image source signatures",
+  "^Copying blob",
+  "^Copying config",
+  "^Writing manifest",
+  "^Storing signatures",
+]
+max_lines = 30
+truncate_lines_at = 120
+on_empty = "skopeo: ok"
+
+[[tests.skopeo]]
+name = "copy strips progress, keeps result"
+input = """
+Getting image source signatures
+Copying blob sha256:abc123 done
+Copying blob sha256:def456 done
+Copying config sha256:789ghi done
+Writing manifest to image destination
+Storing signatures
+"""
+expected = "skopeo: ok"
+
+[[tests.skopeo]]
+name = "inspect keeps output"
+input = """
+{
+    "Name": "docker.io/library/nginx",
+    "Tag": "latest",
+    "Digest": "sha256:abc123",
+    "RepoTags": ["latest", "1.25"],
+    "Created": "2026-01-01T00:00:00Z"
+}
+"""
+expected = "{\n    \"Name\": \"docker.io/library/nginx\",\n    \"Tag\": \"latest\",\n    \"Digest\": \"sha256:abc123\",\n    \"RepoTags\": [\"latest\", \"1.25\"],\n    \"Created\": \"2026-01-01T00:00:00Z\"\n}"
+
+[[tests.skopeo]]
+name = "empty input returns on_empty message"
+input = ""
+expected = "skopeo: ok"
+
+
+[filters.sops]
+description = "Compact sops output"
+match_command = "^sops\\b"
+strip_ansi = true
+strip_lines_matching = ["^\\s*$"]
+max_lines = 40
+
+[[tests.sops]]
+name = "strips blank lines"
+input = "mac: xyz123\n\nversion: 3.8.1"
+expected = "mac: xyz123\nversion: 3.8.1"
+
+[[tests.sops]]
+name = "preserves non-blank output unchanged"
+input = "mac: abc123\nversion: 3.8.1"
+expected = "mac: abc123\nversion: 3.8.1"
+
+
+[filters.spring-boot]
+description = "Compact Spring Boot output — strip banner and verbose startup logs, keep key events. Matches gradle bootRun, and java -jar only when the jar filename itself contains \"spring\" (mvn spring-boot:run is routed to RTK's dedicated Maven filter and never reaches this one). Jars using the Maven/Gradle default <artifactId>-<version>.jar name, and jars under a path containing spaces, are deliberately left to full passthrough rather than risk misclassifying an unrelated tool."
+match_command = "^(mvn\\s+spring-boot:run|java\\s+-jar\\s+(?:\\S*[/\\\\])?[^/\\\\\\s]*(?i:spring)[^/\\\\\\s]*\\.jar|gradle\\s+.*bootRun)"
+strip_ansi = true
+keep_lines_matching = [
+  "Started\\s.*\\sin\\s",
+  "Tomcat started on port",
+  "ERROR",
+  "WARN",
+  "Exception",
+  "Caused by:",
+  "Application run failed",
+  "BUILD\\s",
+  "Tests run:",
+  "FAILURE",
+  "listening on port",
+]
+max_lines = 30
+
+[[tests.spring-boot]]
+name = "keeps startup summary and errors"
+input = "  .   ____          _ \n /\\\\ / ___'_ __ _ _(_)_ __  \n( ( )\\___ | '_ | '_| | '_ \\ \n \\/  ___)| |_)| | | | | || )\n  '  |____| .__|_| |_|_| |_\\__|\n  :: Spring Boot ::  (v3.2.0)\n2024-01-01 INFO Initializing Spring\n2024-01-01 INFO Bean 'dataSource' created\n2024-01-01 INFO Tomcat started on port 8080\n2024-01-01 INFO Started MyApp in 3.2 seconds"
+expected = "2024-01-01 INFO Tomcat started on port 8080\n2024-01-01 INFO Started MyApp in 3.2 seconds"
+
+[[tests.spring-boot]]
+name = "preserves errors"
+input = "  :: Spring Boot ::  (v3.2.0)\n2024-01-01 INFO Initializing Spring\n2024-01-01 ERROR Application run failed\nCaused by: java.lang.NullPointerException"
+expected = "2024-01-01 ERROR Application run failed\nCaused by: java.lang.NullPointerException"
+
+
+[filters.ssh]
+description = "Compact ssh output — strip connection banners, keep command output"
+match_command = "^ssh(?:\\s|$)"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^Warning: Permanently added",
+  "^Connection to .+ closed",
+  "^Authenticated to",
+  "^debug1:",
+  "^OpenSSH_",
+  "^Pseudo-terminal",
+]
+max_lines = 200
+truncate_lines_at = 120
+
+[[tests.ssh]]
+name = "strips connection banners, keeps command output"
+input = """
+Warning: Permanently added '192.168.1.10' (ED25519) to the list of known hosts.
+
+total 32
+drwxr-xr-x 4 user user 4096 Mar 10 12:00 app
+-rw-r--r-- 1 user user 1234 Mar 10 11:00 config.yaml
+
+Connection to 192.168.1.10 closed.
+"""
+expected = "total 32\ndrwxr-xr-x 4 user user 4096 Mar 10 12:00 app\n-rw-r--r-- 1 user user 1234 Mar 10 11:00 config.yaml"
+
+[[tests.ssh]]
+name = "verbose debug lines stripped"
+input = """
+debug1: Connecting to host.example.com port 22.
+debug1: Connection established.
+Authenticated to host.example.com ([1.2.3.4]:22).
+uptime: 12:00:00 up 42 days, load average: 0.10, 0.15, 0.12
+Connection to host.example.com closed.
+"""
+expected = "uptime: 12:00:00 up 42 days, load average: 0.10, 0.15, 0.12"
+
+[[tests.ssh]]
+name = "empty input passes through"
+input = ""
+expected = ""
+
+
+[filters.stat]
+description = "Compact stat output — strip device/inode/birth noise"
+match_command = "^stat\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^\\s*Device:",
+  "^\\s*Birth:",
+]
+truncate_lines_at = 120
+max_lines = 20
+
+[[tests.stat]]
+name = "linux stat output strips device and birth"
+input = """
+  File: main.rs
+  Size: 12345           Blocks: 24         IO Block: 4096   regular file
+Device: 801h/2049d      Inode: 1234567     Links: 1
+Access: (0644/-rw-r--r--)  Uid: ( 1000/ patrick)   Gid: ( 1000/ patrick)
+Access: 2026-03-10 12:00:00.000000000 +0100
+Modify: 2026-03-10 11:00:00.000000000 +0100
+Change: 2026-03-10 11:00:00.000000000 +0100
+ Birth: 2026-03-09 10:00:00.000000000 +0100
+"""
+expected = "  File: main.rs\n  Size: 12345           Blocks: 24         IO Block: 4096   regular file\nAccess: (0644/-rw-r--r--)  Uid: ( 1000/ patrick)   Gid: ( 1000/ patrick)\nAccess: 2026-03-10 12:00:00.000000000 +0100\nModify: 2026-03-10 11:00:00.000000000 +0100\nChange: 2026-03-10 11:00:00.000000000 +0100"
+
+[[tests.stat]]
+name = "macOS stat -x strips device and birth"
+input = """
+  File: "main.rs"
+  Size: 82848        FileType: Regular File
+  Mode: (0644/-rw-r--r--)         Uid: (  501/ patrick)  Gid: (   20/   staff)
+Device: 1,15   Inode: 66302332    Links: 1
+Access: Wed Mar 18 21:21:15 2026
+Modify: Wed Mar 18 20:56:11 2026
+Change: Wed Mar 18 20:56:11 2026
+ Birth: Wed Mar 18 20:56:11 2026
+"""
+expected = "  File: \"main.rs\"\n  Size: 82848        FileType: Regular File\n  Mode: (0644/-rw-r--r--)         Uid: (  501/ patrick)  Gid: (   20/   staff)\nAccess: Wed Mar 18 21:21:15 2026\nModify: Wed Mar 18 20:56:11 2026\nChange: Wed Mar 18 20:56:11 2026"
+
+[[tests.stat]]
+name = "empty input passes through"
+input = ""
+expected = ""
+
+
+[filters.swift-build]
+description = "Compact swift build output — short-circuit on success, strip Compiling/Linking"
+match_command = "^swift\\s+build\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^Compiling ",
+  "^Linking ",
+]
+match_output = [
+  { pattern = "Build complete!", message = "ok (build complete)", unless = "warning:|error:" },
+]
+max_lines = 40
+
+[[tests.swift-build]]
+name = "successful build short-circuits to ok"
+input = """
+Build complete!
+"""
+expected = "ok (build complete)"
+
+[[tests.swift-build]]
+name = "build errors pass through after stripping noise"
+input = """
+Compiling MyApp MyApp.swift
+/home/user/MyApp/Sources/MyApp/main.swift:5:1: error: use of unresolved identifier 'foo'
+foo()
+^~~
+Linking MyApp
+error: build had 1 command failure
+"""
+expected = "/home/user/MyApp/Sources/MyApp/main.swift:5:1: error: use of unresolved identifier 'foo'\nfoo()\n^~~\nerror: build had 1 command failure"
+
+[[tests.swift-build]]
+name = "warnings not swallowed when Build complete present"
+input = """
+CompileSwift normal x86_64 MyFile.swift
+/path/to/MyFile.swift:42:10: warning: unused variable 'x'
+Build complete! (with warnings)
+"""
+expected = "CompileSwift normal x86_64 MyFile.swift\n/path/to/MyFile.swift:42:10: warning: unused variable 'x'\nBuild complete! (with warnings)"
+
+
+[filters.systemctl-status]
+description = "Compact systemctl status output — strip blank lines, limit to 20 lines"
+match_command = "^systemctl\\s+status\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+]
+max_lines = 20
+
+[[tests.systemctl-status]]
+name = "verbose unit status stripped of blank lines"
+input = """
+● nginx.service - A high performance web server
+     Loaded: loaded (/lib/systemd/system/nginx.service; enabled)
+     Active: active (running) since Mon 2024-01-15 10:30:00 UTC; 2h ago
+       Docs: man:nginx(8)
+   Main PID: 1234 (nginx)
+      Tasks: 3 (limit: 4915)
+     Memory: 8.5M
+
+     CGroup: /system.slice/nginx.service
+             ├─1234 nginx: master process /usr/sbin/nginx
+             └─1235 nginx: worker process
+
+Jan 15 10:30:00 host nginx[1234]: nginx/1.24.0
+Jan 15 10:30:00 host systemd[1]: Started nginx.service
+"""
+expected = "● nginx.service - A high performance web server\n     Loaded: loaded (/lib/systemd/system/nginx.service; enabled)\n     Active: active (running) since Mon 2024-01-15 10:30:00 UTC; 2h ago\n       Docs: man:nginx(8)\n   Main PID: 1234 (nginx)\n      Tasks: 3 (limit: 4915)\n     Memory: 8.5M\n     CGroup: /system.slice/nginx.service\n             ├─1234 nginx: master process /usr/sbin/nginx\n             └─1235 nginx: worker process\nJan 15 10:30:00 host nginx[1234]: nginx/1.24.0\nJan 15 10:30:00 host systemd[1]: Started nginx.service"
+
+[[tests.systemctl-status]]
+name = "empty input passes through"
+input = ""
+expected = ""
+
+
+[filters.task]
+description = "Compact go-task output — strip task headers, keep command results"
+match_command = "^task\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^task: \\[.*\\] ",
+  "^task: Task .* is up to date",
+]
+truncate_lines_at = 150
+max_lines = 50
+on_empty = "task: ok"
+
+[[tests.task]]
+name = "strips task headers, keeps output"
+input = "task: [build] go build ./...\n\ntask: [test] go test ./...\nok  myapp 0.5s\n\ntask: Task \"lint\" is up to date"
+expected = "ok  myapp 0.5s"
+
+[[tests.task]]
+name = "preserves error output"
+input = "task: [build] go build ./...\n./main.go:10: undefined: foo\ntask: Failed to run task \"build\": exit status 1"
+expected = "./main.go:10: undefined: foo\ntask: Failed to run task \"build\": exit status 1"
+
+[[tests.task]]
+name = "all up to date"
+input = "task: Task \"build\" is up to date\ntask: Task \"lint\" is up to date\n"
+expected = "task: ok"
+
+
+[filters.terraform-plan]
+description = "Compact Terraform plan output"
+match_command = "^terraform\\s+plan(\\s|$|[;|&()<>])"
+strip_ansi = true
+strip_lines_matching = [
+  "^Refreshing state",
+  "^\\s*#.*unchanged",
+  "^\\s*$",
+  "^Acquiring state lock",
+  "^Releasing state lock",
+]
+max_lines = 80
+on_empty = "terraform plan: no changes detected"
+
+[[tests.terraform-plan]]
+name = "strips Refreshing state lines and blank lines"
+input = """
+Acquiring state lock. This may take a few moments...
+Refreshing state... [id=vpc-abc]
+Refreshing state... [id=sg-123]
+Releasing state lock. This may take a few moments...
+
+Terraform will perform the following actions:
+
+  # aws_instance.web will be created
+  + resource "aws_instance" "web" {}
+
+Plan: 1 to add, 0 to change, 0 to destroy.
+"""
+expected = "Terraform will perform the following actions:\n  # aws_instance.web will be created\n  + resource \"aws_instance\" \"web\" {}\nPlan: 1 to add, 0 to change, 0 to destroy."
+
+[[tests.terraform-plan]]
+name = "strips noise, preserves non-blank content"
+input = "Refreshing state... [id=vpc-abc]\nNo changes. Your infrastructure matches the configuration."
+expected = "No changes. Your infrastructure matches the configuration."
+
+
+[filters.tofu-fmt]
+description = "Compact OpenTofu fmt output"
+match_command = "^tofu\\s+fmt(\\s|$)"
+strip_ansi = true
+on_empty = "tofu fmt: ok (no changes)"
+max_lines = 30
+
+[[tests.tofu-fmt]]
+name = "empty output returns on_empty message"
+input = ""
+expected = "tofu fmt: ok (no changes)"
+
+[[tests.tofu-fmt]]
+name = "changed files pass through"
+input = "main.tf\nvariables.tf"
+expected = "main.tf\nvariables.tf"
+
+
+[filters.tofu-init]
+description = "Compact OpenTofu init output"
+match_command = "^tofu\\s+init(\\s|$)"
+strip_ansi = true
+strip_lines_matching = [
+  "^- Downloading",
+  "^- Installing",
+  "^- Using previously-installed",
+  "^\\s*$",
+  "^Initializing provider",
+  "^Initializing the backend",
+  "^Initializing modules",
+]
+max_lines = 20
+on_empty = "tofu init: ok"
+
+[[tests.tofu-init]]
+name = "strips downloading/installing lines"
+input = """
+Initializing the backend...
+Initializing provider plugins...
+- Downloading hashicorp/aws 5.0.0...
+- Installing hashicorp/aws 5.0.0...
+- Using previously-installed hashicorp/random 3.5.1
+
+OpenTofu has been successfully initialized!
+"""
+expected = "OpenTofu has been successfully initialized!"
+
+[[tests.tofu-init]]
+name = "on_empty when all noise stripped"
+input = """
+Initializing the backend...
+Initializing provider plugins...
+- Using previously-installed hashicorp/aws 5.0.0
+
+"""
+expected = "tofu init: ok"
+
+
+[filters.tofu-plan]
+description = "Compact OpenTofu plan output"
+match_command = "^tofu\\s+plan(\\s|$)"
+strip_ansi = true
+strip_lines_matching = [
+  "^Refreshing state",
+  "^\\s*#.*unchanged",
+  "^\\s*$",
+  "^Acquiring state lock",
+  "^Releasing state lock",
+]
+max_lines = 80
+on_empty = "tofu plan: no changes detected"
+
+[[tests.tofu-plan]]
+name = "strips Refreshing state and lock lines"
+input = """
+Acquiring state lock. This may take a few moments...
+Refreshing state... [id=vpc-abc123]
+Refreshing state... [id=sg-def456]
+Releasing state lock. This may take a few moments...
+
+OpenTofu will perform the following actions:
+
+  # aws_instance.web will be created
+  + resource "aws_instance" "web" {}
+
+Plan: 1 to add, 0 to change, 0 to destroy.
+"""
+expected = "OpenTofu will perform the following actions:\n  # aws_instance.web will be created\n  + resource \"aws_instance\" \"web\" {}\nPlan: 1 to add, 0 to change, 0 to destroy."
+
+[[tests.tofu-plan]]
+name = "on_empty when all noise stripped"
+input = "Refreshing state... [id=vpc-abc]\nAcquiring state lock. This may take a few moments...\nReleasing state lock. This may take a few moments..."
+expected = "tofu plan: no changes detected"
+
+
+[filters.tofu-validate]
+description = "Compact OpenTofu validate output"
+match_command = "^tofu\\s+validate(\\s|$)"
+strip_ansi = true
+match_output = [
+  { pattern = "Success! The configuration is valid", message = "ok (valid)" },
+]
+
+[[tests.tofu-validate]]
+name = "success short-circuits to ok"
+input = "Success! The configuration is valid."
+expected = "ok (valid)"
+
+[[tests.tofu-validate]]
+name = "error passes through unchanged"
+input = "Error: Invalid resource type\n  on main.tf line 3: resource \"aws_instancee\" \"web\""
+expected = "Error: Invalid resource type\n  on main.tf line 3: resource \"aws_instancee\" \"web\""
+
+
+[filters.trunk-build]
+description = "Compact trunk build output"
+match_command = "^trunk\\s+build(\\s|$|[;|&()<>])"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^\\s*Compiling\\s",
+  "^\\s*Downloading\\s",
+  "^\\s*Fetching\\s",
+  "^\\s*Fresh\\s",
+  "^\\s*Checking\\s",
+]
+tail_lines = 10
+max_lines = 30
+on_empty = "trunk build: ok"
+
+[[tests.trunk-build]]
+name = "strips compile noise, keeps tail summary"
+input = """
+   Compiling tokio v1.35.0
+   Compiling hyper v0.14.28
+   Compiling my-crate v0.1.0
+   Downloading serde v1.0.195
+   Fresh regex v1.10.2
+
+   Finished release [optimized] target(s) in 45.23s
+   Binary: target/release/my-crate (5.2MB)
+"""
+expected = "   Finished release [optimized] target(s) in 45.23s\n   Binary: target/release/my-crate (5.2MB)"
+
+[[tests.trunk-build]]
+name = "on_empty when all noise stripped"
+input = """
+   Compiling my-crate v0.1.0
+   Fresh serde v1.0
+   Checking tokio v1.35.0
+
+"""
+expected = "trunk build: ok"
+
+
+[filters.turbo]
+description = "Compact Turborepo output — strip cache status noise, keep task results"
+match_command = "^turbo\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^\\s*cache (hit|miss|bypass)",
+  "^\\s*\\d+ packages in scope",
+  "^\\s*Tasks:\\s+\\d+",
+  "^\\s*Duration:\\s+",
+  "^\\s*Remote caching (enabled|disabled)",
+]
+truncate_lines_at = 150
+max_lines = 50
+on_empty = "turbo: ok"
+
+[[tests.turbo]]
+name = "strips cache noise, keeps task output"
+input = " cache hit, replaying logs abc123\n cache miss, executing abc456\n\n3 packages in scope\n\n> myapp:build\n\nCompiled successfully.\n\nTasks:    2 successful, 2 total (1 cached)\nDuration: 3.2s"
+expected = "> myapp:build\nCompiled successfully."
+
+[[tests.turbo]]
+name = "preserves error output"
+input = "> myapp:lint\n\nError: src/index.ts(5,1): error TS2304\n\nTasks:    0 successful, 1 total\nDuration: 1.1s"
+expected = "> myapp:lint\nError: src/index.ts(5,1): error TS2304"
+
+[[tests.turbo]]
+name = "empty after stripping"
+input = " cache hit, replaying logs abc\n\n"
+expected = "turbo: ok"
+
+
+[filters.ty]
+description = "Compact ty type checker output — strip blank lines, keep errors"
+match_command = "^ty\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^Checking \\d+ file",
+  "^ty \\d+\\.\\d+",
+]
+max_lines = 50
+on_empty = "ty: ok"
+
+[[tests.ty]]
+name = "strips noise, keeps diagnostics"
+input = """
+ty 0.1.0
+Checking 15 files
+
+error[unresolved-reference]: Name `foo` used when not defined
+  --> app/main.py:10:5
+   |
+10 |     foo()
+   |     ^^^
+   |
+
+warning[unused-variable]: Variable `x` is not used
+  --> app/utils.py:8:9
+   |
+ 8 |     x = 42
+   |     ^
+   |
+
+Found 1 error, 1 warning
+"""
+expected = "error[unresolved-reference]: Name `foo` used when not defined\n  --> app/main.py:10:5\n   |\n10 |     foo()\n   |     ^^^\n   |\nwarning[unused-variable]: Variable `x` is not used\n  --> app/utils.py:8:9\n   |\n 8 |     x = 42\n   |     ^\n   |\nFound 1 error, 1 warning"
+
+[[tests.ty]]
+name = "clean output"
+input = """
+ty 0.1.0
+Checking 10 files
+
+All checks passed!
+"""
+expected = "All checks passed!"
+
+[[tests.ty]]
+name = "empty input returns on_empty message"
+input = ""
+expected = "ty: ok"
+
+
+[filters.uv-sync]
+description = "Compact uv sync/pip install output — strip downloads, short-circuit when up-to-date"
+match_command = "^uv\\s+(sync|pip\\s+install)\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^\\s+Downloading ",
+  "^\\s+Using cached ",
+  "^\\s+Preparing ",
+]
+match_output = [
+  { pattern = "Audited \\d+ package", message = "ok (up to date)" },
+]
+max_lines = 20
+
+[[tests.uv-sync]]
+name = "audited packages short-circuits to ok"
+input = """
+Resolved 42 packages in 123ms
+Audited 42 packages in 0.05ms
+"""
+expected = "ok (up to date)"
+
+[[tests.uv-sync]]
+name = "install strips download and cached lines"
+input = """
+  Downloading requests-2.31.0-py3-none-any.whl (62.6 kB)
+  Using cached certifi-2023.11.17-py3-none-any.whl (162 kB)
+  Preparing packages...
+Installed 5 packages in 23ms
+ + certifi==2023.11.17
+ + charset-normalizer==3.3.2
+ + idna==3.6
+ + requests==2.31.0
+ + urllib3==2.1.0
+"""
+expected = "Installed 5 packages in 23ms\n + certifi==2023.11.17\n + charset-normalizer==3.3.2\n + idna==3.6\n + requests==2.31.0\n + urllib3==2.1.0"
+
+
+[filters.xcodebuild]
+description = "Compact xcodebuild output — strip build phases, keep errors/warnings/summary"
+match_command = "^xcodebuild\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^CompileC\\s",
+  "^CompileSwift\\s",
+  "^Ld\\s",
+  "^CreateBuildDirectory\\s",
+  "^MkDir\\s",
+  "^ProcessInfoPlistFile\\s",
+  "^CopySwiftLibs\\s",
+  "^CodeSign\\s",
+  "^Signing Identity:",
+  "^RegisterWithLaunchServices",
+  "^Validate\\s",
+  "^ProcessProductPackaging",
+  "^Touch\\s",
+  "^LinkStoryboards",
+  "^CompileStoryboard",
+  "^CompileAssetCatalog",
+  "^GenerateDSYMFile",
+  "^PhaseScriptExecution",
+  "^PBXCp\\s",
+  "^SetMode\\s",
+  "^SetOwnerAndGroup\\s",
+  "^Ditto\\s",
+  "^CpResource\\s",
+  "^CpHeader\\s",
+  "^\\s+cd\\s+/",
+  "^\\s+export\\s",
+  "^\\s+/Applications/Xcode",
+  "^\\s+/usr/bin/",
+  "^\\s+builtin-",
+  "^note: Using new build system",
+]
+max_lines = 60
+on_empty = "xcodebuild: ok"
+
+[[tests.xcodebuild]]
+name = "strips build phases, keeps errors and summary"
+input = """
+note: Using new build system
+CompileSwift normal arm64 /Users/dev/App/ViewController.swift
+    cd /Users/dev/App
+    /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift-frontend -c
+CompileSwift normal arm64 /Users/dev/App/AppDelegate.swift
+    cd /Users/dev/App
+    export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+Ld /Users/dev/Build/Products/Debug/App normal arm64
+    cd /Users/dev/App
+    /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang
+CodeSign /Users/dev/Build/Products/Debug/App.app
+    cd /Users/dev/App
+    builtin-codesign --force --sign
+
+/Users/dev/App/ViewController.swift:42:9: error: use of unresolved identifier 'foo'
+/Users/dev/App/Model.swift:18:5: warning: variable 'x' was never used
+
+** BUILD FAILED **
+"""
+expected = "/Users/dev/App/ViewController.swift:42:9: error: use of unresolved identifier 'foo'\n/Users/dev/App/Model.swift:18:5: warning: variable 'x' was never used\n** BUILD FAILED **"
+
+[[tests.xcodebuild]]
+name = "clean build success"
+input = """
+note: Using new build system
+CompileSwift normal arm64 /Users/dev/App/Main.swift
+    cd /Users/dev/App
+Ld /Users/dev/Build/Products/Debug/App normal arm64
+    cd /Users/dev/App
+CodeSign /Users/dev/Build/Products/Debug/App.app
+    cd /Users/dev/App
+    builtin-codesign --force --sign
+
+** BUILD SUCCEEDED **
+"""
+expected = "** BUILD SUCCEEDED **"
+
+[[tests.xcodebuild]]
+name = "test output keeps test results"
+input = """
+note: Using new build system
+CompileSwift normal arm64 /Users/dev/AppTests/Tests.swift
+    cd /Users/dev/App
+Test Suite 'All tests' started at 2026-03-10 12:00:00
+Test Suite 'AppTests' started at 2026-03-10 12:00:00
+Test Case '-[AppTests testExample]' passed (0.001 seconds).
+Test Case '-[AppTests testFailing]' failed (0.002 seconds).
+Test Suite 'AppTests' passed at 2026-03-10 12:00:01
+Executed 2 tests, with 1 failure in 0.003 seconds
+"""
+expected = "Test Suite 'All tests' started at 2026-03-10 12:00:00\nTest Suite 'AppTests' started at 2026-03-10 12:00:00\nTest Case '-[AppTests testExample]' passed (0.001 seconds).\nTest Case '-[AppTests testFailing]' failed (0.002 seconds).\nTest Suite 'AppTests' passed at 2026-03-10 12:00:01\nExecuted 2 tests, with 1 failure in 0.003 seconds"
+
+[[tests.xcodebuild]]
+name = "empty input returns on_empty message"
+input = ""
+expected = "xcodebuild: ok"
+
+
+[filters.yadm]
+description = "Compact yadm (git wrapper) output — same filtering as git"
+match_command = "^yadm\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^\\s*\\(use \"git ",
+  "^\\s*\\(use \"yadm ",
+]
+truncate_lines_at = 120
+max_lines = 40
+
+[[tests.yadm]]
+name = "strips hint lines"
+input = "On branch main\nYour branch is up to date with 'origin/main'.\n\n  (use \"yadm add\" to update what will be committed)\n\nChanges not staged for commit:\n  modified:   .bashrc"
+expected = "On branch main\nYour branch is up to date with 'origin/main'.\nChanges not staged for commit:\n  modified:   .bashrc"
+
+[[tests.yadm]]
+name = "short output preserved"
+input = "Already up to date."
+expected = "Already up to date."
+
+
+[filters.yamllint]
+description = "Compact yamllint output — strip blank lines, limit rows"
+match_command = "^yamllint\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+]
+max_lines = 50
+truncate_lines_at = 120
+
+[[tests.yamllint]]
+name = "multi-warning output stripped of blank lines"
+input = """
+config.yml
+  3:1     warning  missing document start "---"  (document-start)
+  5:12    error    too many spaces inside braces  (braces)
+
+  8:1     error    wrong indentation: expected 2 but found 4  (indentation)
+"""
+expected = "config.yml\n  3:1     warning  missing document start \"---\"  (document-start)\n  5:12    error    too many spaces inside braces  (braces)\n  8:1     error    wrong indentation: expected 2 but found 4  (indentation)"
+
+[[tests.yamllint]]
+name = "empty input passes through"
+input = ""
+expected = ""
+
+

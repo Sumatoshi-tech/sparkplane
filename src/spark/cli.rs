@@ -126,6 +126,8 @@ pub enum SparkCommand {
         after_help = "Examples:\n  sparkplane dgx-spark launch codex --model ornith-1.5:35b\n  sparkplane dgx-spark launch codex --mode inherit --allow-network -- --sandbox workspace-write\n  sparkplane dgx-spark launch claude --mode inherit --model ornith-1.5:35b -- --permission-mode plan\n  sparkplane dgx-spark launch opencode --config --model ornith-1.5:35b\n  sparkplane dgx-spark launch codex --model ornith-1.5:35b --dry-run --json\n\nArguments after `--` are passed directly to the selected local agent without a shell. The Spark administrator credential is never given to the child process.\n\nAuto mode (default) gives agents full access without action approvals. Use --mode inherit to retain agent permissions. --allow-network requests invocation-only network access: Codex workspace-write networking, or Claude sandbox domains. OpenCode already has network access; its tool permissions remain unchanged. Filesystem sandboxing and approval policies are not disabled. Managed restrictions still apply. Claude --settings cannot be forwarded with this flag.\n\nEnvironment:\n  SPARKPLANE_LAUNCH_MODE, SPARKPLANE_LAUNCH_MODEL, SPARKPLANE_LAUNCH_ALLOW_NETWORK, SPARKPLANE_LAUNCH_CONFIG, SPARKPLANE_LAUNCH_RESTORE, SPARKPLANE_YES, SPARKPLANE_DRY_RUN, SPARKPLANE_JSON, SPARKPLANE_CONFIG_DIR"
     )]
     Launch(LaunchArgs),
+    /// View a retained private session economics report.
+    Economics(EconomicsArgs),
     /// List currently active managed model processes.
     #[command(
         after_help = "Examples:\n  sparkplane dgx-spark ps\n  sparkplane dgx-spark ps --json\n\nThe default output is a compact table. Absent and failed historical instances are omitted.\n\nEnvironment:\n  SPARKPLANE_JSON, SPARKPLANE_CONFIG_DIR"
@@ -430,6 +432,9 @@ pub struct LaunchArgs {
     /// Agent permissions: auto grants full access without action approvals; inherit keeps agent settings.
     #[arg(long, default_value = "auto", value_parser = ["auto", "inherit"], env = "SPARKPLANE_LAUNCH_MODE")]
     pub mode: String,
+    /// Embedded RTK compression: max enables supported filters; none disables it.
+    #[arg(long, default_value = "max", value_parser = ["max", "none"], env = "SPARKPLANE_LAUNCH_ECO_MODE")]
+    pub eco_mode: String,
     /// Allow this agent session's sandbox network access; keep filesystem and approval policies.
     #[arg(long, env = "SPARKPLANE_LAUNCH_ALLOW_NETWORK", conflicts_with_all = ["configure", "restore"])]
     pub allow_network: bool,
@@ -449,6 +454,16 @@ pub struct LaunchArgs {
     pub config_dir: Option<PathBuf>,
     #[arg(last = true)]
     pub extra_args: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct EconomicsArgs {
+    #[arg(long)]
+    pub session: Option<String>,
+    #[arg(long, env = "SPARKPLANE_JSON")]
+    pub json: bool,
+    #[arg(long, env = "SPARKPLANE_CONFIG_DIR")]
+    pub config_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -747,6 +762,19 @@ pub fn dispatch(cli: SparkCli) -> anyhow::Result<()> {
         SparkCommand::Download(args) => dispatch_download(&cli.host, args),
         SparkCommand::Serve(args) => dispatch_serve(&cli.host, args),
         SparkCommand::Launch(args) => dispatch_launch(&cli.host, args),
+        SparkCommand::Economics(args) => {
+            let report = super::economics::load(
+                &args.config_dir.unwrap_or_else(default_config_dir),
+                &cli.host,
+                args.session.as_deref(),
+            )?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                super::economics::display(&report);
+            }
+            Ok(())
+        }
         SparkCommand::Ps(args) => dispatch_instances(&cli.host, args),
         SparkCommand::Logs(args) => dispatch_logs(&cli.host, args),
         SparkCommand::Stop(args) => dispatch_stop(&cli.host, args),

@@ -14,6 +14,16 @@ struct Cli {
 }
 
 fn main() {
+    if std::env::args_os().nth(1).is_some_and(|a| a == "__eco") {
+        let code = match sparkplane::spark::eco::run(std::env::args_os().skip(2).collect()) {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("eco: {error}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
     if std::env::args_os().skip(1).eq(["--bridge-protocol"]) {
         println!("sparkplane.bridge/v1");
         return;

@@ -89,6 +89,8 @@ pub struct AgentConfig {
     pub resources: ResourcePolicyConfig,
     pub retention: RetentionConfig,
     pub models: ModelsConfig,
+    #[serde(default)]
+    pub gateway: gateway::IngressLimits,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -130,6 +132,8 @@ pub struct AgentState {
     download_slots: Arc<tokio::sync::Semaphore>,
     start_slots: Arc<tokio::sync::Semaphore>,
     inference_slots: Arc<std::sync::Mutex<InferenceSlots>>,
+    gateway_limits: gateway::IngressLimits,
+    ingress_slots: Arc<tokio::sync::Semaphore>,
     admission: TransitionCoordinator,
     routes: RouteRegistry,
     qualification_authority: Option<Arc<str>>,
@@ -198,6 +202,10 @@ impl AgentState {
             download_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             start_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             inference_slots: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            gateway_limits: gateway::IngressLimits::default(),
+            ingress_slots: Arc::new(tokio::sync::Semaphore::new(
+                gateway::IngressLimits::default().max_parallel_requests,
+            )),
             admission: TransitionCoordinator::new(),
             routes: RouteRegistry::default(),
             qualification_authority: None,
@@ -267,6 +275,12 @@ impl AgentState {
 
     fn with_start_slots(mut self, max_parallel: usize) -> Self {
         self.start_slots = Arc::new(tokio::sync::Semaphore::new(max_parallel));
+        self
+    }
+
+    fn with_gateway_limits(mut self, limits: gateway::IngressLimits) -> Self {
+        self.ingress_slots = Arc::new(tokio::sync::Semaphore::new(limits.max_parallel_requests));
+        self.gateway_limits = limits;
         self
     }
 
@@ -341,6 +355,9 @@ impl Cidr {
         operation_events,
         cancel_operation,
         create_token,
+        create_launch_session,
+        get_launch_session,
+        finish_launch_session,
         list_tokens,
         revoke_token,
         list_models,
@@ -371,6 +388,10 @@ impl Cidr {
         OperationEvent,
         TokenCreateRequest,
         TokenCreatedDocument,
+        super::wire::LaunchSessionRequest,
+        super::wire::LaunchSessionCreated,
+        super::wire::LaunchSessionDocument,
+        super::wire::SessionUsage,
         TokenListDocument,
         DownloadRequest,
         DownloadPlanDocument,
@@ -403,6 +424,18 @@ pub fn router(state: AgentState) -> Router {
     let authenticated = Router::new()
         .route(&format!("{API_BASE}/status"), get(status))
         .route(&format!("{API_BASE}/doctor"), get(doctor))
+        .route(
+            &format!("{API_BASE}/launch-sessions"),
+            axum::routing::post(create_launch_session),
+        )
+        .route(
+            &format!("{API_BASE}/launch-sessions/{{id}}"),
+            get(get_launch_session),
+        )
+        .route(
+            &format!("{API_BASE}/launch-sessions/{{id}}/finish"),
+            axum::routing::post(finish_launch_session),
+        )
         .route(&format!("{API_BASE}/metrics"), get(metrics))
         .route(
             &format!("{API_BASE}/certificates/status"),
@@ -451,6 +484,8 @@ pub fn router(state: AgentState) -> Router {
             get(list_tokens).post(create_token),
         )
         .route(&format!("{API_BASE}/tokens/{{id}}"), delete(revoke_token))
+        .layer(DefaultBodyLimit::max(1024 * 1024));
+    let inference = Router::new()
         .route("/openai/{instance}/v1/models", get(gateway_models))
         .route(
             "/openai/{instance}/v1/completions",
@@ -478,9 +513,158 @@ pub fn router(state: AgentState) -> Router {
             axum::routing::post(gateway_anthropic_count_tokens),
         )
         .route("/anthropic/{instance}/{*path}", any(anthropic_not_found))
-        .layer(DefaultBodyLimit::max(gateway::MAX_COMPLETION_BODY_BYTES))
+        .layer(DefaultBodyLimit::max(gateway::HARD_REQUEST_BYTES))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            inference_ingress,
+        ));
+    let authenticated = authenticated
+        .merge(inference)
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     authenticated.fallback(not_found).with_state(state)
+}
+
+// The worker owns a clone so cancellation cannot free its CPU/memory slot early.
+#[derive(Clone)]
+struct IngressLease(Arc<tokio::sync::OwnedSemaphorePermit>);
+
+fn ingress_error(
+    path: &str,
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+) -> Response {
+    if path.starts_with("/anthropic/") {
+        anthropic_error(
+            status,
+            gateway::AnthropicError {
+                error_type: if status == StatusCode::SERVICE_UNAVAILABLE {
+                    "overloaded_error"
+                } else {
+                    "invalid_request_error"
+                },
+                message,
+            },
+        )
+    } else {
+        openai_error(status, gateway::OpenAiError { code, message })
+    }
+}
+
+async fn inference_ingress(
+    State(state): State<AgentState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.method() != Method::POST {
+        return next.run(request).await;
+    }
+    let path = request.uri().path().to_owned();
+    let limit = if path.ends_with("/v1/responses")
+        || path.ends_with("/v1/messages")
+        || path.ends_with("/v1/chat/completions")
+    {
+        state.gateway_limits.request_body_bytes
+    } else {
+        gateway::MAX_COMPLETION_BODY_BYTES.min(state.gateway_limits.request_body_bytes)
+    };
+    if request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.parse::<u64>().ok())
+        .is_some_and(|size| size > limit as u64)
+    {
+        return ingress_error(
+            &path,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            "request exceeds the gateway upload byte limit",
+        );
+    }
+    let permit = match state.ingress_slots.clone().try_acquire_owned() {
+        Ok(permit) => IngressLease(Arc::new(permit)),
+        Err(_) => {
+            let mut response = ingress_error(
+                &path,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "gateway_busy",
+                "gateway upload and image workers are busy; retry shortly",
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            return response;
+        }
+    };
+    let (mut parts, body) = request.into_parts();
+    let body = match tokio::time::timeout(
+        Duration::from_secs(30),
+        axum::body::to_bytes(body, limit),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(error)) => {
+            if !std::error::Error::source(&error)
+                .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+            {
+                return ingress_error(
+                    &path,
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "gateway upload body cannot be read",
+                );
+            }
+            return ingress_error(
+                &path,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_too_large",
+                "request exceeds the gateway upload byte limit",
+            );
+        }
+        Err(_) => {
+            return ingress_error(
+                &path,
+                StatusCode::REQUEST_TIMEOUT,
+                "request_timeout",
+                "gateway upload deadline exceeded",
+            );
+        }
+    };
+    parts.extensions.insert(permit);
+    next.run(Request::from_parts(parts, Body::from(body))).await
+}
+
+async fn normalize_gateway_images(
+    body: Bytes,
+    protocol: gateway::ImageProtocol,
+    profile: gateway::GatewayProfile,
+    limits: gateway::IngressLimits,
+    lease: IngressLease,
+) -> Result<Vec<u8>, gateway::OpenAiError> {
+    tokio::task::spawn_blocking(move || {
+        let _permit = lease.0;
+        gateway::normalize_image_request(&body, protocol, &profile, &limits)
+    })
+    .await
+    .unwrap_or(Err(gateway::OpenAiError {
+        code: "invalid_request_error",
+        message: "image preprocessing failed",
+    }))
+}
+
+async fn meter_inference_route(
+    state: &AgentState,
+    auth: &AuthenticatedToken,
+    instance: &str,
+    route: Arc<gateway::HealthyRoute>,
+) -> Result<Arc<gateway::HealthyRoute>, StateError> {
+    let mut metered_route = (*route).clone();
+    metered_route.upstream = metered_route.upstream.with_meter(Arc::new(
+        super::sessions::UsageMeter::begin(state.database.as_ref(), &auth.id, instance).await?,
+    ));
+    Ok(Arc::new(metered_route))
 }
 
 async fn openai_not_found() -> Response {
@@ -551,6 +735,7 @@ async fn gateway_anthropic_messages(
     AxumPath(instance): AxumPath<String>,
     RawQuery(query): RawQuery,
     Extension(auth): Extension<AuthenticatedToken>,
+    Extension(lease): Extension<IngressLease>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
@@ -583,6 +768,30 @@ async fn gateway_anthropic_messages(
     if !route.profile.allows(PublicAction::Responses) {
         return anthropic_not_found().await;
     }
+    let body = match normalize_gateway_images(
+        body,
+        gateway::ImageProtocol::Anthropic,
+        route.profile.clone(),
+        state.gateway_limits.clone(),
+        lease,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(error) => {
+            return anthropic_error(
+                if error.code == "request_too_large" {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                gateway::AnthropicError {
+                    error_type: "invalid_request_error",
+                    message: error.message,
+                },
+            );
+        }
+    };
     let request = match gateway::rewrite_anthropic_request_with_profile(
         &body,
         &route.served_model,
@@ -590,6 +799,10 @@ async fn gateway_anthropic_messages(
     ) {
         Ok(request) => request,
         Err(error) => return anthropic_error(StatusCode::BAD_REQUEST, error),
+    };
+    let route = match meter_inference_route(&state, &auth, &instance, route).await {
+        Ok(route) => route,
+        Err(error) => return state_problem(error),
     };
     let token_permit = match auth.acquire_inference().await {
         Ok(permit) => permit,
@@ -605,7 +818,7 @@ async fn gateway_anthropic_messages(
         .await
     {
         Ok(upstream) => upstream,
-        Err(_) => return anthropic_upstream_unavailable(),
+        Err(error) => return anthropic_generation_error(error),
     };
     let encoder = if request.omit_reasoning {
         gateway::AnthropicEncoder::with_omitted_reasoning(route.public_model.clone())
@@ -834,6 +1047,15 @@ async fn gateway_completions(
         RouteLookup::Warming => return gateway_warming(),
         RouteLookup::Missing => return not_found().await,
     };
+    let mut metered_route = (*route).clone();
+    metered_route.upstream = metered_route.upstream.with_meter(Arc::new(
+        match super::sessions::UsageMeter::begin(state.database.as_ref(), &auth.id, &instance).await
+        {
+            Ok(meter) => meter,
+            Err(error) => return state_problem(error),
+        },
+    ));
+    let route = Arc::new(metered_route);
     if !route.profile.allows(PublicAction::Completions) {
         return not_found().await;
     }
@@ -855,7 +1077,7 @@ async fn gateway_completions(
     if streaming {
         let upstream = match route.upstream.completion_stream(&upstream_body).await {
             Ok(stream) => stream,
-            Err(_) => return gateway_upstream_unavailable(),
+            Err(error) => return gateway_generation_error(error),
         };
         let public_model = route.public_model.clone();
         let events = futures_util::stream::unfold(
@@ -913,7 +1135,7 @@ async fn gateway_completions(
         .request("POST", "/v1/completions", upstream_body.len())
     {
         Ok(request) => request,
-        Err(_) => return gateway_upstream_unavailable(),
+        Err(error) => return gateway_generation_error(error),
     };
     match route.upstream.send(&request, &upstream_body).await {
         Ok(response) if (200..300).contains(&response.status) => {
@@ -922,19 +1144,72 @@ async fn gateway_completions(
                 Err(()) => gateway_upstream_unavailable(),
             }
         }
-        _ => gateway_upstream_unavailable(),
+        Ok(response) => gateway_upstream_response_error(response),
+        Err(error) => gateway_generation_error(error),
     }
 }
 
 fn openai_error(status: StatusCode, error: gateway::OpenAiError) -> Response {
-    let error_type = if error.code == "server_error" {
-        "server_error"
-    } else {
-        "invalid_request_error"
+    let error_type = match error.code {
+        "server_error" => "server_error",
+        "rate_limit_error" => "rate_limit_error",
+        _ => "invalid_request_error",
     };
     let body = serde_json::json!({"error": {"message": error.message,
         "type": error_type, "param": null, "code": error.code}});
     (status, Json(body)).into_response()
+}
+
+fn gateway_request_rejected(rejection: super::upstream::RequestRejection) -> Response {
+    let mut response = openai_error(
+        StatusCode::from_u16(rejection.status()).expect("finite engine rejection status"),
+        gateway::OpenAiError {
+            code: rejection.code(),
+            message: rejection.message(),
+        },
+    );
+    if rejection == super::upstream::RequestRejection::RateLimited {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    }
+    response
+}
+
+fn gateway_generation_error(error: super::upstream::UpstreamError) -> Response {
+    error
+        .request_rejection()
+        .map(gateway_request_rejected)
+        .unwrap_or_else(gateway_upstream_unavailable)
+}
+
+fn gateway_upstream_response_error(response: super::upstream::UpstreamResponse) -> Response {
+    super::upstream::RequestRejection::from_response(response.status, &response.bytes)
+        .map(gateway_request_rejected)
+        .unwrap_or_else(gateway_upstream_unavailable)
+}
+
+fn anthropic_generation_error(error: super::upstream::UpstreamError) -> Response {
+    let Some(rejection) = error.request_rejection() else {
+        return anthropic_upstream_unavailable();
+    };
+    let mut response = anthropic_error(
+        StatusCode::from_u16(rejection.status()).expect("finite engine rejection status"),
+        gateway::AnthropicError {
+            error_type: if rejection == super::upstream::RequestRejection::RateLimited {
+                "rate_limit_error"
+            } else {
+                "invalid_request_error"
+            },
+            message: rejection.message(),
+        },
+    );
+    if rejection == super::upstream::RequestRejection::RateLimited {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    }
+    response
 }
 
 fn valid_inference_headers(headers: &HeaderMap) -> bool {
@@ -962,6 +1237,7 @@ async fn gateway_responses(
     AxumPath(instance): AxumPath<String>,
     RawQuery(query): RawQuery,
     Extension(auth): Extension<AuthenticatedToken>,
+    Extension(lease): Extension<IngressLease>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -985,6 +1261,27 @@ async fn gateway_responses(
     if !route.profile.allows(PublicAction::Responses) {
         return openai_not_found().await;
     }
+    let body = match normalize_gateway_images(
+        body,
+        gateway::ImageProtocol::Responses,
+        route.profile.clone(),
+        state.gateway_limits.clone(),
+        lease,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(error) => {
+            return openai_error(
+                if error.code == "request_too_large" {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                error,
+            );
+        }
+    };
     if route.profile.native_responses {
         let request = match gateway::rewrite_native_responses_request_with_profile(
             &body,
@@ -993,6 +1290,10 @@ async fn gateway_responses(
         ) {
             Ok(request) => request,
             Err(error) => return openai_error(StatusCode::BAD_REQUEST, error),
+        };
+        let route = match meter_inference_route(&state, &auth, &instance, route).await {
+            Ok(route) => route,
+            Err(error) => return state_problem(error),
         };
         let token_permit = match auth.acquire_inference().await {
             Ok(permit) => permit,
@@ -1007,6 +1308,10 @@ async fn gateway_responses(
     ) {
         Ok(request) => request,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error),
+    };
+    let route = match meter_inference_route(&state, &auth, &instance, route).await {
+        Ok(route) => route,
+        Err(error) => return state_problem(error),
     };
     let token_permit = match auth.acquire_inference().await {
         Ok(permit) => permit,
@@ -1031,7 +1336,7 @@ async fn gateway_native_responses(
             .await
         {
             Ok(upstream) => upstream,
-            Err(_) => return gateway_upstream_unavailable(),
+            Err(error) => return gateway_generation_error(error),
         };
         let stream = futures_util::stream::unfold(
             (upstream, permit, token_permit),
@@ -1054,7 +1359,7 @@ async fn gateway_native_responses(
         .request("POST", "/v1/responses", request.body.len())
     {
         Ok(request) => request,
-        Err(_) => return gateway_upstream_unavailable(),
+        Err(error) => return gateway_generation_error(error),
     };
     let response = route
         .upstream
@@ -1067,6 +1372,9 @@ async fn gateway_native_responses(
     drop(permit);
     drop(token_permit);
     match response {
+        Ok(response) if !(200..300).contains(&response.status) => {
+            gateway_upstream_response_error(response)
+        }
         Ok(response) => Response::builder()
             .status(
                 StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -1150,8 +1458,9 @@ async fn gateway_chat_completions(
     AxumPath(instance): AxumPath<String>,
     RawQuery(query): RawQuery,
     Extension(auth): Extension<AuthenticatedToken>,
+    Extension(lease): Extension<IngressLease>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
     if reject_query(query).is_some()
         || !valid_inference_headers(&headers)
@@ -1170,9 +1479,50 @@ async fn gateway_chat_completions(
         RouteLookup::Warming => return gateway_warming(),
         RouteLookup::Missing => return not_found().await,
     };
+    let mut metered_route = (*route).clone();
+    metered_route.upstream = metered_route.upstream.with_meter(Arc::new(
+        match super::sessions::UsageMeter::begin(state.database.as_ref(), &auth.id, &instance).await
+        {
+            Ok(meter) => meter,
+            Err(error) => return state_problem(error),
+        },
+    ));
+    let route = Arc::new(metered_route);
     if !route.profile.allows(PublicAction::Chat) {
         return openai_not_found().await;
     }
+    let body = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return ingress_error(
+                "/openai/v1/chat/completions",
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_too_large",
+                "request body is too large",
+            );
+        }
+    };
+    let body = match normalize_gateway_images(
+        body,
+        gateway::ImageProtocol::Chat,
+        route.profile.clone(),
+        state.gateway_limits.clone(),
+        lease,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(error) => {
+            return openai_error(
+                if error.code == "request_too_large" {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                error,
+            );
+        }
+    };
     let request = match gateway::rewrite_chat_request_with_profile(
         &body,
         &route.served_model,
@@ -1204,7 +1554,7 @@ async fn gateway_chat(
             .await
         {
             Ok(upstream) => upstream,
-            Err(_) => return gateway_upstream_unavailable(),
+            Err(error) => return gateway_generation_error(error),
         };
         return chat_sse(upstream, route.public_model.clone(), permit, token_permit);
     }
@@ -1214,7 +1564,7 @@ async fn gateway_chat(
             .request("POST", "/v1/chat/completions", request.body.len())
         {
             Ok(request) => request,
-            Err(_) => return gateway_upstream_unavailable(),
+            Err(error) => return gateway_generation_error(error),
         };
     let response = route.upstream.send(&upstream_request, &request.body).await;
     drop(permit);
@@ -1225,7 +1575,8 @@ async fn gateway_chat(
                 .map(IntoResponse::into_response)
                 .unwrap_or_else(|error| openai_error(StatusCode::BAD_GATEWAY, error))
         }
-        _ => gateway_upstream_unavailable(),
+        Ok(response) => gateway_upstream_response_error(response),
+        Err(error) => gateway_generation_error(error),
     }
 }
 
@@ -1272,7 +1623,7 @@ async fn gateway_responses_stream(
         .await
     {
         Ok(upstream) => upstream,
-        Err(_) => return gateway_upstream_unavailable(),
+        Err(error) => return gateway_generation_error(error),
     };
     let encoder = gateway::ResponsesEncoder::new(route.public_model.clone(), request.custom_tools);
     if request.stream {
@@ -2323,6 +2674,14 @@ async fn reconcile_once(
             .await;
             continue;
         }
+        if let Some(routes) = routes {
+            routes.mark_warming(&instance.name, instance.generation);
+        }
+        // Admission can be temporarily closed while startup telemetry settles.
+        // Only an admitted restart attempt consumes the engine failure budget.
+        if !persistent_restart_allowed(database, executor).await? {
+            continue;
+        }
         let failed = database
             .record_restart_failure(&instance.id, instance.generation, unix_millis() / 1_000)
             .await
@@ -2340,9 +2699,6 @@ async fn reconcile_once(
         else {
             continue;
         };
-        if !persistent_restart_allowed(database, executor).await? {
-            continue;
-        }
         let Ok(prepared) = executor
             .prepare_instance(StartInstanceInput {
                 instance_id: instance.id.clone(),
@@ -2489,7 +2845,7 @@ async fn reconcile_running_engine(
     if let Some(routes) = routes {
         routes.mark_warming(&instance.name, instance.generation);
     }
-    if !observed.running || !persistent_restart_allowed(database, executor).await? {
+    if !observed.running {
         let _ = executor
             .disable_restart(StopInstanceInput {
                 instance_id: instance.id.clone(),
@@ -2501,6 +2857,20 @@ async fn reconcile_running_engine(
             .record_restart_failure(&instance.id, instance.generation, unix_millis() / 1_000)
             .await
             .map_err(|_| ())?;
+        return Ok(());
+    }
+    if !persistent_restart_allowed(database, executor).await? {
+        // Keep the route unpublished and Docker restart disabled, but do not
+        // classify an admission deferral as a failure of this running engine.
+        if observed.restart_policy != "no" {
+            let _ = executor
+                .disable_restart(StopInstanceInput {
+                    instance_id: instance.id.clone(),
+                    generation: instance.generation,
+                    grace_seconds: 0,
+                })
+                .await;
+        }
         return Ok(());
     }
     let address = observed.address.parse().map_err(|_| ())?;
@@ -4216,6 +4586,95 @@ fn qualification_executor_problem(error: ExecutorClientError) -> Response {
     problem(status, code, detail)
 }
 
+#[utoipa::path(post, path = "/api/sparkplane/v1/launch-sessions", request_body = super::wire::LaunchSessionRequest, responses((status = 200, body = super::wire::LaunchSessionCreated)))]
+async fn create_launch_session(
+    State(state): State<AgentState>,
+    Extension(auth): Extension<AuthenticatedToken>,
+    RawQuery(query): RawQuery,
+    Json(body): Json<super::wire::LaunchSessionRequest>,
+) -> Response {
+    if let Some(response) = reject_query(query) {
+        return response;
+    }
+    if let Err(response) = require_executor_for_mutation(&state).await {
+        return response;
+    }
+    let Some(db) = &state.database else {
+        return database_unavailable();
+    };
+    match db.create_launch_session(&auth.id, body).await {
+        Ok(created) => {
+            match db.auth_snapshot().await {
+                Ok(snapshot) => state.store_auth(snapshot),
+                Err(error) => return state_problem(error),
+            }
+            let mut response = Json(created).into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
+        Err(error) => state_problem(error),
+    }
+}
+
+#[utoipa::path(get, path = "/api/sparkplane/v1/launch-sessions/{id}", params(("id" = String, Path)), responses((status = 200, body = super::wire::LaunchSessionDocument)))]
+async fn get_launch_session(
+    State(state): State<AgentState>,
+    AxumPath(id): AxumPath<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    if let Some(response) = reject_query(query) {
+        return response;
+    }
+    if id.parse::<ulid::Ulid>().is_err() {
+        return state_problem(StateError::Invalid("invalid session id".into()));
+    }
+    let Some(db) = &state.database else {
+        return database_unavailable();
+    };
+    match db.launch_session(&id, false, "").await {
+        Ok(session) => Json(session).into_response(),
+        Err(error) => state_problem(error),
+    }
+}
+
+#[utoipa::path(post, path = "/api/sparkplane/v1/launch-sessions/{id}/finish", params(("id" = String, Path)), responses((status = 200, body = super::wire::LaunchSessionDocument)))]
+async fn finish_launch_session(
+    State(state): State<AgentState>,
+    AxumPath(id): AxumPath<String>,
+    Extension(auth): Extension<AuthenticatedToken>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    if let Some(response) = reject_query(query) {
+        return response;
+    }
+    if id.parse::<ulid::Ulid>().is_err() {
+        return state_problem(StateError::Invalid("invalid session id".into()));
+    }
+    let Some(db) = &state.database else {
+        return database_unavailable();
+    };
+    match db.launch_session(&id, true, &auth.id).await {
+        Ok(mut session) => {
+            match db.auth_snapshot().await {
+                Ok(snapshot) => state.store_auth(snapshot),
+                Err(error) => return state_problem(error),
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+            while session.usage.pending_requests > 0 && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                match db.launch_session(&id, false, "").await {
+                    Ok(value) => session = value,
+                    Err(_) => break,
+                }
+            }
+            Json(session).into_response()
+        }
+        Err(error) => state_problem(error),
+    }
+}
+
 #[utoipa::path(post, path = "/api/sparkplane/v1/tokens", request_body = TokenCreateRequest, responses((status = 202, body = TokenCreatedDocument)))]
 async fn create_token(
     State(state): State<AgentState>,
@@ -4520,6 +4979,14 @@ async fn authenticate(
         let Some(verifier) = snapshot.tokens.get(id) else {
             return auth_failed(&request_path);
         };
+        if verifier.token.revoked_at.is_some()
+            || verifier.token.expires_at.as_ref().is_some_and(|expiry| {
+                chrono::DateTime::parse_from_rfc3339(expiry)
+                    .map_or(true, |expiry| expiry <= chrono::Utc::now())
+            })
+        {
+            return auth_failed(&request_path);
+        }
         if !verifier.verify(
             &state
                 .database
@@ -4615,7 +5082,8 @@ fn required_scope(method: &Method, path: &str) -> Option<TokenScope> {
             TokenScope::InstancesWrite
         });
     }
-    if path.starts_with(&format!("{API_BASE}/tokens"))
+    if path.starts_with(&format!("{API_BASE}/launch-sessions"))
+        || path.starts_with(&format!("{API_BASE}/tokens"))
         || path == format!("{API_BASE}/doctor")
         || path.starts_with(&format!("{API_BASE}/certificates"))
     {
@@ -4877,6 +5345,7 @@ pub async fn serve(
         config.schema == "sparkplane.agent/v1",
         "unsupported Spark agent configuration schema"
     );
+    config.gateway.validate().map_err(anyhow::Error::msg)?;
     anyhow::ensure!(
         config.engine_catalog == Path::new("/etc/sparkplane/engines"),
         "engine catalog must use the fixed root-owned path"
@@ -4989,7 +5458,8 @@ pub async fn serve(
             )?,
             config.operations.max_parallel_downloads,
         )
-        .with_start_slots(config.operations.max_parallel_starts);
+        .with_start_slots(config.operations.max_parallel_starts)
+        .with_gateway_limits(config.gateway);
     state = state.with_qualification_authority(Arc::<str>::from(qualification_authority));
     if let Some(executor) = executor {
         state = state.with_executor(executor);
@@ -5190,6 +5660,44 @@ mod tests {
     }
 
     const TOKEN: &str = "test-bootstrap-token-with-at-least-256-bits-of-random-material";
+
+    #[test]
+    fn gateway_limits_default_for_existing_configs_and_have_hard_ceilings() {
+        let mut config: toml::Value =
+            toml::from_str(include_str!("../../configs/sparkplane/agent.toml")).unwrap();
+        let shipped: super::AgentConfig = config.clone().try_into().unwrap();
+        shipped.gateway.validate().unwrap();
+        config.as_table_mut().unwrap().remove("gateway");
+        let legacy: super::AgentConfig = config.try_into().unwrap();
+        assert_eq!(
+            serde_json::to_value(shipped.gateway).unwrap(),
+            serde_json::to_value(legacy.gateway).unwrap()
+        );
+        for field in [
+            "request_body_bytes",
+            "image_bytes",
+            "image_pixels",
+            "image_dimension",
+            "max_parallel_requests",
+        ] {
+            let mut limits =
+                serde_json::to_value(crate::spark::gateway::IngressLimits::default()).unwrap();
+            limits[field] = 0.into();
+            assert!(
+                serde_json::from_value::<crate::spark::gateway::IngressLimits>(limits.clone())
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+            limits[field] = u32::MAX.into();
+            assert!(
+                serde_json::from_value::<crate::spark::gateway::IngressLimits>(limits)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+    }
 
     fn llama_chat_sse() -> String {
         [
@@ -5432,6 +5940,542 @@ mod tests {
             axum::http::StatusCode::SERVICE_UNAVAILABLE
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn inference_upload_rejections_are_json_and_authentication_runs_first() {
+        let state = AgentState::new(TOKEN, Vec::new(), Vec::new());
+        for path in [
+            "/openai/fixture/v1/responses",
+            "/anthropic/fixture/v1/messages",
+        ] {
+            let request = || {
+                Request::post(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(vec![b' '; 33 * 1024 * 1024]))
+                    .unwrap()
+            };
+            let denied = router(state.clone()).oneshot(request()).await.unwrap();
+            assert_eq!(denied.status(), axum::http::StatusCode::UNAUTHORIZED);
+            let mut request = request();
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                format!("Bearer {TOKEN}").parse().unwrap(),
+            );
+            let response = router(state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(
+                document["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("gateway")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn large_image_uploads_fit_the_qualified_profile_over_https() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let engine = axum::Router::new().route("/v1/{*path}", axum::routing::post(
+            move |uri: axum::http::Uri, axum::Json(body): axum::Json<serde_json::Value>| {
+                let sent = sent.clone();
+                async move {
+                    let native = uri.path() == "/v1/responses";
+                    sent.send(body).unwrap();
+                    let body = if native {
+                        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}}\n\n".to_owned()
+                    } else {llama_chat_sse()};
+                    ([(header::CONTENT_TYPE, "text/event-stream")], body)
+                }
+            }
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let engine_address = listener.local_addr().unwrap();
+        let engine_server =
+            tokio::spawn(async move { axum::serve(listener, engine).await.unwrap() });
+        let state = AgentState::new(TOKEN, Vec::new(), Vec::new());
+        let profile = crate::spark::engine::EnginePolicy::parse(include_str!(
+            "../../configs/sparkplane/engines/vllm-qwen38-mmap.toml"
+        ))
+        .unwrap()
+        .gateway_profile(None);
+        for (name, native) in [
+            ("native", true),
+            ("translated", false),
+            ("anthropic", false),
+            ("tool-native", true),
+            ("tool-translated", false),
+        ] {
+            let mut profile = profile.clone();
+            profile.native_responses = native;
+            let upstream = crate::spark::upstream::ObservedRoute::new(
+                "i_11111111111111111111111111111111",
+                1,
+                engine_address.ip(),
+                engine_address.port(),
+                [("POST", "/v1/responses"), ("POST", "/v1/chat/completions")],
+            )
+            .unwrap();
+            state.routes.publish_with_profile(
+                name,
+                "public-model".into(),
+                "served-model".into(),
+                profile,
+                upstream,
+            );
+        }
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certificate = cert.pem();
+        let tls = super::tls13_config(
+            certificate.as_bytes().to_vec(),
+            signing_key.serialize_pem().into_bytes(),
+        )
+        .await
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = axum_server::Handle::new();
+        let server_handle = handle.clone();
+        let server = tokio::spawn(async move {
+            axum_server::from_tcp_rustls(listener, tls)
+                .unwrap()
+                .handle(server_handle)
+                .serve(router(state).into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(reqwest::Certificate::from_pem(certificate.as_bytes()).unwrap())
+            .build()
+            .unwrap();
+        let mut seed = 0x12345678_u32;
+        let pixels = (0..1024 * 512 * 3)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect();
+        let image =
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_raw(1024, 512, pixels).unwrap());
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+        for name in [
+            "native",
+            "translated",
+            "anthropic",
+            "tool-native",
+            "tool-translated",
+        ] {
+            let mut request = if name == "anthropic" {
+                serde_json::json!({"model":"public-model","max_tokens":8,"stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"describe"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":encoded}}]}]})
+            } else {
+                serde_json::json!({"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_image","image_url":format!("data:image/png;base64,{encoded}"),"detail":"high"}]}],"stream":true,"store":false})
+            };
+            if name.starts_with("tool-") {
+                let image = request["input"][0]["content"][1].clone();
+                request["input"] = serde_json::json!([
+                    {"type":"message","role":"user","content":"inspect the screenshot"},
+                    {"type":"function_call","call_id":"call_view","name":"view_image","arguments":"{}"},
+                    {"type":"function_call_output","call_id":"call_view","output":[{"type":"input_text","text":"Screenshot from the tool."},image]}
+                ]);
+            }
+            assert!(serde_json::to_vec(&request).unwrap().len() > 1024 * 1024);
+            let path = if name == "anthropic" {
+                format!("/anthropic/{name}/v1/messages")
+            } else {
+                format!("/openai/{name}/v1/responses")
+            };
+            let response = client
+                .post(format!("https://localhost:{}{path}", address.port()))
+                .bearer_auth(TOKEN)
+                .header("anthropic-version", "2023-06-01")
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.bytes().await.unwrap();
+            assert_eq!(
+                status,
+                reqwest::StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&body)
+            );
+            let forwarded = received.recv().await.unwrap();
+            let url = if name == "tool-native" {
+                forwarded["input"][2]["output"][1]["image_url"]
+                    .as_str()
+                    .unwrap()
+            } else if name == "tool-translated" {
+                assert_eq!(forwarded["messages"][2]["role"], "tool");
+                assert_eq!(forwarded["messages"][2]["tool_call_id"], "call_view");
+                forwarded["messages"][2]["content"][1]["image_url"]["url"]
+                    .as_str()
+                    .unwrap()
+            } else if name == "native" {
+                forwarded["input"][0]["content"][1]["image_url"]
+                    .as_str()
+                    .unwrap()
+            } else {
+                forwarded["messages"][0]["content"][1]["image_url"]["url"]
+                    .as_str()
+                    .unwrap()
+            };
+            let (media, data) = url
+                .strip_prefix("data:")
+                .unwrap()
+                .split_once(";base64,")
+                .unwrap();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .unwrap();
+            let vision = profile.vision.as_ref().unwrap();
+            assert!(vision.media_types.contains(media));
+            assert!(bytes.len() <= vision.max_bytes);
+            let decoded = image::ImageReader::new(std::io::Cursor::new(bytes))
+                .with_guessed_format()
+                .unwrap()
+                .decode()
+                .unwrap();
+            assert!(decoded.width() <= vision.max_width && decoded.height() <= vision.max_height);
+            assert!(decoded.width() <= 1024 && decoded.height() <= 512);
+            assert_eq!(decoded.width(), decoded.height() * 2);
+        }
+        let mut small_png = std::io::Cursor::new(Vec::new());
+        image
+            .resize(256, 128, image::imageops::FilterType::Lanczos3)
+            .write_to(&mut small_png, image::ImageFormat::Png)
+            .unwrap();
+        let small_encoded =
+            base64::engine::general_purpose::STANDARD.encode(small_png.into_inner());
+        for count in [2, 3, 16] {
+            for name in ["tool-native", "tool-translated", "anthropic"] {
+                let encoded = if count == 16 {
+                    &small_encoded
+                } else {
+                    &encoded
+                };
+                let request = if name == "anthropic" {
+                    let image = serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":encoded}});
+                    serde_json::json!({"model":"public-model","max_tokens":8,"stream":true,"messages":[{"role":"user","content":vec![image;count]}]})
+                } else {
+                    let image = serde_json::json!({"type":"input_image","image_url":format!("data:image/png;base64,{encoded}")});
+                    let mut input = vec![
+                        serde_json::json!({"type":"message","role":"user","content":"compare the screenshots"}),
+                    ];
+                    for index in 0..count {
+                        let id = format!("view_{index}");
+                        input.push(serde_json::json!({"type":"function_call","name":"view_image","call_id":id,"arguments":"{}"}));
+                        input.push(serde_json::json!({"type":"function_call_output","call_id":id,"output":[{"type":"input_text","text":format!("Frame {index}")},image]}));
+                        if index + 1 < count {
+                            input.push(serde_json::json!({"type":"message","role":"assistant","content":"Inspect the next screenshot."}));
+                        }
+                    }
+                    serde_json::json!({"input":input,"stream":true})
+                };
+                let path = if name == "anthropic" {
+                    format!("/anthropic/{name}/v1/messages")
+                } else {
+                    format!("/openai/{name}/v1/responses")
+                };
+                let response = client
+                    .post(format!("https://localhost:{}{path}", address.port()))
+                    .bearer_auth(TOKEN)
+                    .header("anthropic-version", "2023-06-01")
+                    .json(&request)
+                    .send()
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = response.bytes().await.unwrap();
+                assert_eq!(
+                    status,
+                    reqwest::StatusCode::OK,
+                    "{}",
+                    String::from_utf8_lossy(&body)
+                );
+                let forwarded = received.recv().await.unwrap();
+                let messages = forwarded[if name == "tool-native" {
+                    "input"
+                } else {
+                    "messages"
+                }]
+                .as_array()
+                .unwrap();
+                let mut images = 0;
+                let mut total = 0;
+                let retained = if count == 16 && name != "anthropic" {
+                    10
+                } else {
+                    count
+                };
+                for message in messages {
+                    let parts = message[if message["type"] == "function_call_output" {
+                        "output"
+                    } else {
+                        "content"
+                    }]
+                    .as_array();
+                    for part in parts.into_iter().flatten() {
+                        let url = if part["type"] == "input_image" {
+                            part["image_url"].as_str()
+                        } else {
+                            part["image_url"]["url"].as_str()
+                        };
+                        if let Some(url) = url {
+                            let bytes = base64::engine::general_purpose::STANDARD
+                                .decode(url.split_once(";base64,").unwrap().1)
+                                .unwrap();
+                            assert!(
+                                bytes.len()
+                                    <= profile.vision.as_ref().unwrap().max_total_bytes / retained
+                            );
+                            total += bytes.len();
+                            images += 1;
+                        }
+                    }
+                }
+                assert_eq!(images, retained);
+                assert!(total <= profile.vision.as_ref().unwrap().max_total_bytes);
+            }
+        }
+        // The launch adapter streams a source history larger than ingress allows,
+        // then forwards only its recent window over the same pinned HTTPS route.
+        let config = tempfile::tempdir().unwrap();
+        std::fs::create_dir(config.path().join("spark")).unwrap();
+        std::fs::write(config.path().join("spark/fixture.ca.pem"), &certificate).unwrap();
+        let pin = format!("sha256:{:x}", Sha256::digest(certificate.as_bytes()));
+        std::fs::write(config.path().join("spark.toml"), format!("[hosts.fixture]\nurl='https://localhost:{}'\nca_cert_sha256='{pin}'\ncredential='spark/unused'\nrequest_timeout_seconds=30\n", address.port())).unwrap();
+        let adapter = crate::spark::inference_adapter::Adapter::start(
+            config.path(),
+            "fixture",
+            "tool-native",
+            TOKEN,
+        )
+        .unwrap();
+        let image = serde_json::json!({"type":"input_image","image_url":format!("data:image/png;base64,{encoded}")});
+        let mut input = vec![
+            serde_json::json!({"type":"message","role":"user","content":"Inspect the screenshots."}),
+        ];
+        for index in 0..25 {
+            input.push(serde_json::json!({"type":"function_call","name":"view_image","call_id":format!("long_{index}"),"arguments":"{}"}));
+            input.push(serde_json::json!({"type":"function_call_output","call_id":format!("long_{index}"),"output":[{"type":"input_text","text":format!("Frame {index}")},image]}));
+            if index < 24 {
+                input.push(serde_json::json!({"type":"message","role":"assistant","content":"Observed the button."}));
+            }
+        }
+        let payload =
+            serde_json::to_vec(&serde_json::json!({"input":input,"stream":true})).unwrap();
+        assert!(payload.len() > crate::spark::gateway::IngressLimits::default().request_body_bytes);
+        let response = client
+            .post(format!("{}/openai/v1/responses", adapter.base_url))
+            .bearer_auth(adapter.token())
+            .header("content-type", "application/json")
+            .body(payload)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK, "{text}");
+        assert!(text.contains("response.completed"));
+        let mut forwarded = received.recv().await.unwrap();
+        let mut count = 0;
+        crate::spark::image_history::visit_parts(
+            &mut forwarded["input"],
+            crate::spark::image_history::Protocol::Responses,
+            &mut |_| count += 1,
+        );
+        assert!(count <= 12);
+        assert_eq!(forwarded["input"][74]["call_id"], "long_24");
+        assert_eq!(forwarded["input"][74]["output"][0]["text"], "Frame 24");
+        drop(adapter);
+        handle.shutdown();
+        server.await.unwrap();
+        engine_server.abort();
+    }
+
+    #[tokio::test]
+    async fn upstream_client_rejections_keep_safe_status_codes_and_context_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (status, body, expected, code) in [
+            (
+                400,
+                r#"{"error":{"code":"context_length_exceeded","message":"private prompt SECRET"}}"#,
+                400,
+                "context_length_exceeded",
+            ),
+            (
+                400,
+                r#"{"error":{"message":"This model's maximum context length is 262144 tokens. private prompt SECRET"}}"#,
+                400,
+                "context_length_exceeded",
+            ),
+            (
+                400,
+                r#"{"error":{"message":"private prompt SECRET"}}"#,
+                400,
+                "invalid_request_error",
+            ),
+            (413, "private prompt SECRET", 413, "request_too_large"),
+            (429, "private prompt SECRET", 429, "rate_limit_error"),
+            (500, "private prompt SECRET", 503, "server_error"),
+        ] {
+            for kind in [
+                "responses",
+                "native_stream",
+                "native_json",
+                "chat_json",
+                "anthropic",
+            ] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = vec![0; 16384];
+                    assert!(socket.read(&mut request).await.unwrap() > 0);
+                    socket.write_all(format!("HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                });
+                let state = AgentState::new(TOKEN, Vec::new(), Vec::new());
+                let upstream = crate::spark::upstream::ObservedRoute::new(
+                    "i_11111111111111111111111111111111",
+                    1,
+                    address.ip(),
+                    address.port(),
+                    [("POST", "/v1/chat/completions"), ("POST", "/v1/responses")],
+                )
+                .unwrap();
+                let mut profile = crate::spark::gateway::GatewayProfile::text();
+                profile.native_responses = kind.starts_with("native");
+                profile.native_response_timeout_seconds = 5;
+                state.routes.publish_with_profile(
+                    "fixture",
+                    "public-model".into(),
+                    "served-model".into(),
+                    profile,
+                    upstream,
+                );
+                let (path, body) = match kind {
+                    "anthropic" => (
+                        "/anthropic/fixture/v1/messages",
+                        r#"{"model":"public-model","max_tokens":8,"messages":[{"role":"user","content":"work"}]}"#,
+                    ),
+                    "chat_json" => (
+                        "/openai/fixture/v1/chat/completions",
+                        r#"{"messages":[{"role":"user","content":"work"}],"stream":false}"#,
+                    ),
+                    "native_json" => (
+                        "/openai/fixture/v1/responses",
+                        r#"{"input":"work","stream":false}"#,
+                    ),
+                    _ => (
+                        "/openai/fixture/v1/responses",
+                        r#"{"input":"work","stream":true}"#,
+                    ),
+                };
+                let request = Request::post(path)
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .header("anthropic-version", "2023-06-01")
+                    .body(Body::from(body))
+                    .unwrap();
+                let response = router(state).oneshot(request).await.unwrap();
+                assert_eq!(
+                    response.status().as_u16(),
+                    expected,
+                    "{kind}, engine status {status}"
+                );
+                if expected == 429 {
+                    assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+                }
+                let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                assert!(!String::from_utf8_lossy(&bytes).contains("SECRET"));
+                assert!(!String::from_utf8_lossy(&bytes).contains("private prompt"));
+                let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                if kind == "anthropic" {
+                    assert_eq!(response["type"], "error");
+                    assert_eq!(
+                        response["error"]["type"],
+                        if expected == 503 {
+                            "api_error"
+                        } else if expected == 429 {
+                            "rate_limit_error"
+                        } else {
+                            "invalid_request_error"
+                        }
+                    );
+                } else {
+                    assert_eq!(response["error"]["code"], code);
+                }
+                server.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_busy_rejections_are_bounded_and_release_after_cancellation() {
+        let state = AgentState::new(TOKEN, Vec::new(), Vec::new());
+        let first = state.ingress_slots.clone().try_acquire_owned().unwrap();
+        let second = state.ingress_slots.clone().try_acquire_owned().unwrap();
+        for path in [
+            "/openai/fixture/v1/responses",
+            "/anthropic/fixture/v1/messages",
+        ] {
+            let response = router(state.clone())
+                .oneshot(
+                    Request::post(path)
+                        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert!(
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("busy")
+            );
+        }
+        drop((first, second));
+        // A cancelled upload frees its slot without waiting for the 30-second deadline.
+        let request = Request::post("/openai/fixture/v1/responses")
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .body(Body::from_stream(futures_util::stream::pending::<
+                Result<axum::body::Bytes, std::io::Error>,
+            >()))
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                router(state.clone()).oneshot(request)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(state.ingress_slots.available_permits(), 2);
     }
 
     #[tokio::test]
@@ -6317,6 +7361,62 @@ mod tests {
         mutations: Arc<AtomicUsize>,
     }
 
+    struct DeferredReconcileExecutor {
+        matched: bool,
+        swap_in_pages_delta: Option<u64>,
+        guard_heartbeat: bool,
+        disables: Arc<AtomicUsize>,
+        unexpected_mutations: Arc<AtomicUsize>,
+    }
+
+    impl sparkplane_ipc::Handler for DeferredReconcileExecutor {
+        async fn handle(&self, request: sparkplane_ipc::Request) -> sparkplane_ipc::Response {
+            let action = &request.params["action"];
+            if let Some(expected) = action.get("reconcile_scan") {
+                let identity = &expected[0];
+                let matched = if self.matched {
+                    vec![serde_json::json!({
+                        "instance_id":identity["instance_id"],"generation":identity["generation"],
+                        "container_id":"container-g1","network_id":"network","address":"172.30.0.2","port":8000,
+                        "running":true,"restart_policy":"unless-stopped","health_method":"GET","health_path":"/health",
+                        "allowed_routes":[["GET","/health"]],"gateway_profile":crate::spark::gateway::GatewayProfile::text(),
+                        "served_model":"Ornith-1.5-9B","semantic_prompt":"health","semantic_max_tokens":1,
+                        "startup_deadline_seconds":900,"init_pid":1,"pid_start_time_ticks":1,
+                        "cgroup_path":"/system.slice/docker-container-g1.scope"
+                    })]
+                } else {
+                    Vec::new()
+                };
+                return sparkplane_ipc::Response::Ok {
+                    schema_version: sparkplane_ipc::SCHEMA_VERSION,
+                    request_id: request.request_id,
+                    result: serde_json::json!({"action":"reconcile_scan","scan":{
+                        "matched":matched,"missing":if self.matched { serde_json::json!([]) } else { expected.clone() },"quarantined":[]}}),
+                    blob: None,
+                };
+            }
+            if action.get("disable_restart_policy").is_some() {
+                self.disables.fetch_add(1, Ordering::SeqCst);
+            } else if action.get("prepare_instance").is_some()
+                || action.get("start_instance").is_some()
+                || action.get("promote_restart_policy").is_some()
+                || action.get("stop_instance").is_some()
+            {
+                self.unexpected_mutations.fetch_add(1, Ordering::SeqCst);
+            }
+            let mut response = ResourceExecutor.handle(request).await;
+            if let sparkplane_ipc::Response::Ok { result, .. } = &mut response {
+                if result["action"] == "inspect_resources" {
+                    result["snapshot"]["swap_in_pages_delta"] =
+                        serde_json::json!(self.swap_in_pages_delta);
+                } else if result["action"] == "health" {
+                    result["health"]["guard_heartbeat"] = serde_json::json!(self.guard_heartbeat);
+                }
+            }
+            response
+        }
+    }
+
     struct StopRaceExecutor {
         stops: Arc<AtomicUsize>,
         removed: Arc<std::sync::atomic::AtomicBool>,
@@ -6657,6 +7757,84 @@ mod tests {
         handle.graceful_shutdown(None);
         server.await.unwrap();
         database.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_reconciliation_keeps_admission_closed_without_consuming_restart_budget() {
+        for (matched, swap_in_pages_delta, guard_heartbeat) in [
+            (true, None, true),
+            (true, Some(1), true),
+            (true, Some(0), false),
+            (false, Some(1), true),
+        ] {
+            let (state, database, root) = durable_state().await;
+            let socket = root.join("executor.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let disables = Arc::new(AtomicUsize::new(0));
+            let unexpected_mutations = Arc::new(AtomicUsize::new(0));
+            let server = tokio::spawn(
+                sparkplane_ipc::Server::new(DeferredReconcileExecutor {
+                    matched,
+                    swap_in_pages_delta,
+                    guard_heartbeat,
+                    disables: Arc::clone(&disables),
+                    unexpected_mutations: Arc::clone(&unexpected_mutations),
+                })
+                .serve(listener),
+            );
+            let model = ornith_model();
+            database.promote_model(model.clone(), false).await.unwrap();
+            database
+                .accept_operation(
+                    "bootstrap",
+                    "instance.serve",
+                    "01K00000000000000000000000",
+                    &"a".repeat(64),
+                    Some("ornith".into()),
+                )
+                .await
+                .unwrap();
+            let instance = database
+                .begin_serve(creating_instance(&model))
+                .await
+                .unwrap()
+                .instance;
+            if !matched {
+                let route = crate::spark::upstream::ObservedRoute::new(
+                    &instance.id,
+                    instance.generation,
+                    "127.0.0.1".parse().unwrap(),
+                    9,
+                    [("GET", "/health")],
+                )
+                .unwrap();
+                state.routes.publish(
+                    &instance.name,
+                    instance.model.clone(),
+                    "served-model".into(),
+                    route,
+                );
+            }
+            let executor = crate::spark::executor::ExecutorClient::new(socket);
+            for _ in 0..6 {
+                super::reconcile_once(&database, &executor, Some(&state.routes), &state.admission)
+                    .await
+                    .unwrap();
+            }
+            let current = database.instance(&instance.id).await.unwrap();
+            assert_eq!(current.restart_failures, 0);
+            assert!(!current.restart_suppressed);
+            assert_eq!(current.engine_fingerprint, instance.engine_fingerprint);
+            assert_eq!(current.generation, instance.generation);
+            assert!(!matches!(
+                state.routes.lookup(&instance.name),
+                crate::spark::gateway::RouteLookup::Healthy(_)
+            ));
+            assert_eq!(disables.load(Ordering::SeqCst), if matched { 6 } else { 0 });
+            assert_eq!(unexpected_mutations.load(Ordering::SeqCst), 0);
+            database.shutdown().unwrap();
+            server.abort();
+        }
     }
 
     #[tokio::test]
@@ -7199,6 +8377,313 @@ mod tests {
         );
         database.shutdown().unwrap();
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn launch_session_usage_and_revocation_round_trip_over_https() {
+        use crate::spark::wire::{LaunchSessionCreated, LaunchSessionDocument};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (state, database, root) = durable_state().await;
+        let model = ornith_model();
+        database.promote_model(model.clone(), false).await.unwrap();
+        let instance = database
+            .begin_serve(creating_instance(&model))
+            .await
+            .unwrap()
+            .instance;
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certificate = cert.pem();
+        let tls = super::tls13_config(
+            certificate.as_bytes().to_vec(),
+            signing_key.serialize_pem().into_bytes(),
+        )
+        .await
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = axum_server::Handle::new();
+        let server_handle = handle.clone();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            axum_server::from_tcp_rustls(listener, tls)
+                .unwrap()
+                .handle(server_handle)
+                .serve(router(server_state).into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(reqwest::Certificate::from_pem(certificate.as_bytes()).unwrap())
+            .build()
+            .unwrap();
+        let base = format!("https://localhost:{}", address.port());
+        let id = ulid::Ulid::new().to_string();
+        let create =
+            serde_json::json!({"id":id,"instance":"ornith","integration":"codex","eco_mode":"max"});
+        let response = client
+            .post(format!("{base}{API_BASE}/launch-sessions"))
+            .bearer_auth(TOKEN)
+            .json(&create)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let created: LaunchSessionCreated = response.json().await.unwrap();
+        let bearer = created.bearer_token.unwrap();
+        let repeated: LaunchSessionCreated = client
+            .post(format!("{base}{API_BASE}/launch-sessions"))
+            .bearer_auth(TOKEN)
+            .json(&create)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(repeated.bearer_token.is_none());
+        assert_eq!(
+            client
+                .get(format!("{base}{API_BASE}/launch-sessions/{id}"))
+                .bearer_auth(&bearer)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        for (path, body, missing, shared) in [
+            (
+                "/openai/ornith/v1/responses",
+                serde_json::json!({"input":"private fixture prompt","stream":false}),
+                false,
+                false,
+            ),
+            (
+                "/anthropic/ornith/v1/messages",
+                serde_json::json!({"model":"sparkplane","messages":[{"role":"user","content":"fixture"}],"max_tokens":10,"stream":true}),
+                false,
+                false,
+            ),
+            (
+                "/openai/ornith/v1/chat/completions",
+                serde_json::json!({"messages":[{"role":"user","content":"fixture"}],"stream":true}),
+                false,
+                false,
+            ),
+            (
+                "/openai/ornith/v1/responses",
+                serde_json::json!({"input":"fixture","stream":true}),
+                true,
+                false,
+            ),
+            (
+                "/openai/ornith/v1/responses",
+                serde_json::json!({"input":"another client","stream":false}),
+                false,
+                true,
+            ),
+        ] {
+            let fixture = if missing {
+                llama_chat_sse()
+                    .lines()
+                    .filter(|line| !line.contains("usage"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n"
+            } else {
+                llama_chat_sse()
+            };
+            let (engine, task) = llama_chat_server_with(fixture).await;
+            let upstream = crate::spark::upstream::ObservedRoute::new(
+                &instance.id,
+                instance.generation,
+                engine.ip(),
+                engine.port(),
+                [("POST", "/v1/chat/completions")],
+            )
+            .unwrap();
+            state.routes.publish(
+                "ornith",
+                model.canonical.clone(),
+                "Ornith-1.5-9B".into(),
+                upstream,
+            );
+            let response = client
+                .post(format!("{base}{path}"))
+                .header("anthropic-version", "2023-06-01")
+                .bearer_auth(if shared { TOKEN } else { &bearer })
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let output = response.bytes().await.unwrap();
+            assert!(
+                status.is_success(),
+                "{path}: {status}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            assert!(!output.is_empty());
+            task.await.unwrap();
+        }
+        for stream in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let engine = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 16384];
+                let count = socket.read(&mut request).await.unwrap();
+                assert!(
+                    String::from_utf8_lossy(&request[..count]).starts_with("POST /v1/responses ")
+                );
+                let document = r#"{"id":"resp_fixture","object":"response","status":"completed","output":[],"usage":{"input_tokens":11,"output_tokens":5,"total_tokens":16}}"#;
+                let body = if stream {
+                    format!(
+                        "data: {{\"type\":\"response.completed\",\"response\":{document}}}\r\n\r\n"
+                    )
+                } else {
+                    document.into()
+                };
+                let content = if stream {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                };
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {content}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await.unwrap();
+                for chunk in body.as_bytes().chunks(3) {
+                    socket.write_all(chunk).await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+            });
+            let upstream = crate::spark::upstream::ObservedRoute::new(
+                &instance.id,
+                instance.generation,
+                engine.ip(),
+                engine.port(),
+                [("POST", "/v1/responses")],
+            )
+            .unwrap();
+            let mut profile = crate::spark::gateway::GatewayProfile::text();
+            profile.native_responses = true;
+            profile.native_response_timeout_seconds = 5;
+            state.routes.publish_with_profile(
+                "ornith",
+                model.canonical.clone(),
+                "Ornith-1.5-9B".into(),
+                profile,
+                upstream,
+            );
+            let output = client
+                .post(format!("{base}/openai/ornith/v1/responses"))
+                .bearer_auth(&bearer)
+                .json(&serde_json::json!({"input":"fixture","stream":stream}))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            assert!(String::from_utf8_lossy(&output).contains("resp_fixture"));
+            task.await.unwrap();
+        }
+        let finish = format!("{base}{API_BASE}/launch-sessions/{id}/finish");
+        let finished: LaunchSessionDocument = client
+            .post(&finish)
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(finished.usage.requests, 6);
+        assert_eq!(finished.usage.input_tokens, 43);
+        assert_eq!(finished.usage.output_tokens, 19);
+        assert_eq!(finished.usage.unknown_usage_requests, 1);
+        assert_eq!(finished.usage.pending_requests, 0);
+        let repeated: LaunchSessionDocument = client
+            .post(&finish)
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(finished.finished_at, repeated.finished_at);
+        assert_eq!(repeated.usage.input_tokens, 43);
+        assert_eq!(
+            client
+                .get(format!("{base}/openai/ornith/v1/models"))
+                .bearer_auth(&bearer)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        let expired_create = serde_json::json!({"id":ulid::Ulid::new().to_string(),"instance":"ornith","integration":"claude","eco_mode":"none"});
+        let expiring: LaunchSessionCreated = client
+            .post(format!("{base}{API_BASE}/launch-sessions"))
+            .bearer_auth(TOKEN)
+            .json(&expired_create)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let expired_bearer = expiring.bearer_token.unwrap();
+        let expired_id = expired_bearer
+            .strip_prefix("sparkplane_")
+            .unwrap()
+            .split('_')
+            .next()
+            .unwrap();
+        let mut snapshot = database.auth_snapshot().await.unwrap();
+        snapshot
+            .tokens
+            .get_mut(expired_id)
+            .unwrap()
+            .token
+            .expires_at = Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
+        state.store_auth(snapshot);
+        assert_eq!(
+            client
+                .get(format!("{base}/openai/ornith/v1/models"))
+                .bearer_auth(expired_bearer)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        let document = serde_json::to_string(&finished).unwrap();
+        assert!(!document.contains("private fixture prompt"));
+        assert!(!document.contains(&bearer));
+        assert_eq!(
+            database.list_instances().await.unwrap()[0].desired,
+            crate::spark::wire::InstanceDesiredState::Running
+        );
+        handle.graceful_shutdown(None);
+        server.await.unwrap();
+        database.shutdown().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     async fn durable_state() -> (super::AgentState, crate::spark::state::DbActor, PathBuf) {

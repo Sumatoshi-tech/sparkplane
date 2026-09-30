@@ -6,6 +6,14 @@ allowed_client_cidrs = ["10.1.30.0/24"]
 plain_http_loopback_only = true
 executor_socket = "/run/sparkplane/executor.sock"
 
+[gateway]
+# Public uploads are normalized to the selected engine's stricter image policy.
+request_body_bytes = 33554432
+image_bytes = 16777216
+image_pixels = 32000000 # Total source pixels across the request.
+image_dimension = 16384
+max_parallel_requests = 2
+
 [models]
 cache_root = "/var/lib/sparkplane/huggingface"
 endpoint = "https://huggingface.co"

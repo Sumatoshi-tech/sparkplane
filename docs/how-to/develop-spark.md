@@ -418,6 +418,15 @@ The generated `sparkplane-launch-models.json` must include both `text` and
 `image`. Relaunch Codex so it reads that catalog. Do not hand-edit the catalog
 or its ownership receipt to make an old session accept attachments.
 
+Updating the Qwen image-count policy from one to 16 also requires a managed
+stop and re-serve: the count belongs to the signed engine fingerprint. The
+model artifacts are unchanged, so a model download refresh is unnecessary.
+Keep the same instance name, context, launch arguments and resources. Verify
+successive `view_image` results and a 16-image request through the public
+gateway after activation. The shared 512 KiB engine image budget remains;
+normalization divides it among the frames, and the gateway enforces the
+combined source-pixel limit before resizing.
+
 If regeneration reports an ownership conflict, preserve a private backup of the
 affected profile and its receipt, move the indicated profile aside, and rerun
 `launch ... --config --json`. Additional tables such as `[tui]` in an earlier

@@ -6,6 +6,11 @@ allowed_client_cidrs = ["10.1.30.0/24"]
 plain_http_loopback_only = true
 executor_socket = "/run/sparkplane/executor.sock"
 
+[webui]
+enabled = true
+# Optional exact HTTPS origin; otherwise use the certificate's DNS/IP identities.
+# origin = "https://10.1.30.143:9843"
+
 [gateway]
 # Public uploads are normalized to the selected engine's stricter image policy.
 request_body_bytes = 33554432

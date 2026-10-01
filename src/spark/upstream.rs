@@ -271,6 +271,7 @@ pub trait UsageObserver: std::fmt::Debug + Send + Sync {
     fn json(&self, bytes: &[u8], success: bool);
     fn raw(&self, bytes: &[u8]);
     fn incomplete(&self) {}
+    fn response_failed(&self) {}
 }
 
 pub struct CompletionStream {
@@ -282,6 +283,12 @@ pub struct CompletionStream {
 }
 
 impl CompletionStream {
+    pub fn response_failed(&self) {
+        if let Some(meter) = &self.meter {
+            meter.response_failed();
+        }
+    }
+
     pub async fn next(&mut self) -> Option<Result<GenerationEvent, UpstreamError>> {
         match tokio::time::timeout(self.idle_timeout, self.receiver.recv()).await {
             Ok(event) => {

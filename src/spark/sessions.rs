@@ -77,6 +77,7 @@ pub(crate) enum Command {
         token: String,
         id: String,
         instance: String,
+        protocol: String,
         reply: oneshot::Sender<Result<bool, StateError>>,
     },
     Record {
@@ -84,6 +85,8 @@ pub(crate) enum Command {
         usage: Option<(u64, u64)>,
         outcome: String,
         incomplete: bool,
+        duration_ms: u64,
+        ttft_ms: Option<u64>,
         reply: oneshot::Sender<Result<(), StateError>>,
     },
 }
@@ -121,12 +124,19 @@ impl DbActor {
             .await
             .map_err(|_| StateError::Unavailable("session database unavailable".into()))?
     }
-    async fn begin_usage(&self, token: &str, id: &str, instance: &str) -> Result<bool, StateError> {
+    pub(crate) async fn begin_usage(
+        &self,
+        token: &str,
+        id: &str,
+        instance: &str,
+        protocol: &str,
+    ) -> Result<bool, StateError> {
         let (reply, receive) = oneshot::channel();
         self.session_command(Command::Begin {
             token: token.into(),
             id: id.into(),
             instance: instance.into(),
+            protocol: protocol.into(),
             reply,
         })?;
         receive
@@ -139,6 +149,8 @@ impl DbActor {
         usage: Option<(u64, u64)>,
         outcome: &str,
         incomplete: bool,
+        duration_ms: u64,
+        ttft_ms: Option<u64>,
     ) -> Result<(), StateError> {
         let (reply, receive) = oneshot::channel();
         self.session_command(Command::Record {
@@ -146,6 +158,8 @@ impl DbActor {
             usage,
             outcome: outcome.into(),
             incomplete,
+            duration_ms,
+            ttft_ms,
             reply,
         })?;
         receive
@@ -184,6 +198,7 @@ pub(crate) fn dispatch(db: &mut Connection, pepper: &SecretString, command: Comm
             token,
             id,
             instance,
+            protocol,
             reply,
         } => {
             let result = (|| {
@@ -195,15 +210,19 @@ pub(crate) fn dispatch(db: &mut Connection, pepper: &SecretString, command: Comm
                     )
                     .optional()
                     .map_err(sql)?;
-                let Some((expected, finished)) = expected else {
-                    return Ok(false);
-                };
-                if expected != instance || finished.is_some() {
+                if expected
+                    .as_ref()
+                    .is_some_and(|(expected, finished)| expected != &instance || finished.is_some())
+                {
                     return Err(StateError::Invalid(
                         "launch session is not active for this instance".into(),
                     ));
                 }
-                db.execute("INSERT INTO launch_requests(id,session_id,instance,started_at) SELECT ?1,id,?2,?3 FROM launch_sessions WHERE token_id=?4 AND finished_at IS NULL", params![id,instance,super::state::now(),token]).map(|n| n == 1).map_err(sql)
+                let tx = db.transaction().map_err(sql)?;
+                tx.execute("INSERT INTO launch_requests(id,session_id,instance,started_at) SELECT ?1,id,?2,?3 FROM launch_sessions WHERE token_id=?4 AND finished_at IS NULL", params![id,instance,super::state::now(),token]).map_err(sql)?;
+                super::analytics::begin(&tx, &id, &token, &instance, &protocol)?;
+                tx.commit().map_err(sql)?;
+                Ok(true)
             })();
             let _ = reply.send(result);
         }
@@ -212,10 +231,15 @@ pub(crate) fn dispatch(db: &mut Connection, pepper: &SecretString, command: Comm
             usage,
             outcome,
             incomplete,
+            duration_ms,
+            ttft_ms,
             reply,
         } => {
             let result = usage.map(|(a,b)| (i64::try_from(a),i64::try_from(b))).map(|(a,b)| Ok((a.map_err(|_| StateError::Invalid("usage overflow".into()))?,b.map_err(|_| StateError::Invalid("usage overflow".into()))?))).transpose().and_then(|counts| {
-                db.execute("UPDATE launch_requests SET input_tokens=?2,output_tokens=?3,outcome=?4,finished_at=?5,accounting_error=?6 WHERE id=?1 AND finished_at IS NULL",params![id,counts.map(|c|c.0),counts.map(|c|c.1),outcome,super::state::now(),incomplete]).map(|_|()).map_err(sql)
+                let tx=db.transaction().map_err(sql)?;
+                tx.execute("UPDATE launch_requests SET input_tokens=?2,output_tokens=?3,outcome=?4,finished_at=?5,accounting_error=?6 WHERE id=?1 AND finished_at IS NULL",params![id,counts.map(|c|c.0),counts.map(|c|c.1),outcome,super::state::now(),incomplete]).map_err(sql)?;
+                super::analytics::record(&tx,&id,counts,&outcome,incomplete,Some(duration_ms),ttft_ms)?;
+                tx.commit().map_err(sql)
             });
             let _ = reply.send(result);
         }
@@ -326,23 +350,34 @@ struct MeterValues {
     usage: Option<(u64, u64)>,
     outcome: &'static str,
     incomplete: bool,
+    ttft_ms: Option<u64>,
 }
 struct MeterInner {
     db: DbActor,
     id: String,
     values: Mutex<MeterValues>,
+    started: std::time::Instant,
 }
 impl UsageMeter {
+    #[cfg(test)]
     pub async fn begin(
         db: Option<&DbActor>,
         token: &str,
         instance: &str,
     ) -> Result<Self, StateError> {
+        Self::begin_protocol(db, token, instance, "inference").await
+    }
+    pub async fn begin_protocol(
+        db: Option<&DbActor>,
+        token: &str,
+        instance: &str,
+        protocol: &str,
+    ) -> Result<Self, StateError> {
         let Some(db) = db else {
             return Ok(Self::default());
         };
         let id = ulid::Ulid::new().to_string();
-        match db.begin_usage(token, &id, instance).await {
+        match db.begin_usage(token, &id, instance, protocol).await {
             Ok(true) => Ok(Self(Some(Arc::new(MeterInner {
                 db: db.clone(),
                 id,
@@ -350,7 +385,9 @@ impl UsageMeter {
                     usage: None,
                     outcome: "interrupted",
                     incomplete: false,
+                    ttft_ms: None,
                 }),
+                started: std::time::Instant::now(),
             })))),
             Ok(false) => Ok(Self::default()),
             Err(error) => Err(error),
@@ -361,6 +398,17 @@ impl UsageMeter {
             && let Ok(mut values) = inner.values.lock()
         {
             match event {
+                super::upstream::GenerationEvent::TextDelta { .. }
+                | super::upstream::GenerationEvent::ReasoningDelta { .. }
+                | super::upstream::GenerationEvent::ToolCallDelta { .. } => {
+                    values.ttft_ms.get_or_insert(
+                        inner
+                            .started
+                            .elapsed()
+                            .as_millis()
+                            .min(u128::from(u64::MAX)) as u64,
+                    );
+                }
                 super::upstream::GenerationEvent::Usage {
                     prompt_tokens,
                     completion_tokens,
@@ -386,7 +434,17 @@ impl UsageMeter {
                         usage
                             .get("completion_tokens")
                             .or_else(|| usage.get("output_tokens"))
-                            .and_then(|v| v.as_u64()),
+                            .and_then(|v| v.as_u64())
+                            .or_else(|| {
+                                usage
+                                    .get("prompt_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .is_some_and(|prompt| {
+                                        usage.get("total_tokens").and_then(|v| v.as_u64())
+                                            == Some(prompt)
+                                    })
+                                    .then_some(0)
+                            }),
                     );
             }
         }
@@ -405,6 +463,37 @@ impl UsageMeter {
             .collect::<Vec<_>>()
             .join(&b'\n');
         if let Ok(document) = serde_json::from_slice::<serde_json::Value>(&data) {
+            let kind = document.get("type").and_then(|v| v.as_str());
+            let output = matches!(
+                kind,
+                Some(
+                    "response.output_text.delta"
+                        | "response.reasoning_text.delta"
+                        | "response.reasoning_summary_text.delta"
+                        | "response.function_call_arguments.delta"
+                        | "response.custom_tool_call_input.delta"
+                )
+            ) && document
+                .get("delta")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| !v.is_empty());
+            let tool = kind == Some("response.output_item.added")
+                && matches!(
+                    document["item"]["type"].as_str(),
+                    Some("function_call" | "custom_tool_call")
+                );
+            if (output || tool)
+                && let Some(inner) = &self.0
+                && let Ok(mut values) = inner.values.lock()
+            {
+                values.ttft_ms.get_or_insert(
+                    inner
+                        .started
+                        .elapsed()
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64,
+                );
+            }
             let response = document.get("response").unwrap_or(&document);
             let terminal = matches!(
                 document.get("type").and_then(|v| v.as_str()),
@@ -424,13 +513,22 @@ impl Drop for MeterInner {
             usage: None,
             outcome: "interrupted",
             incomplete: true,
+            ttft_ms: None,
         });
         values.incomplete |= values.outcome != "succeeded";
         let db = self.db.clone();
         let id = self.id.clone();
+        let duration_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         tokio::spawn(async move {
             if db
-                .record_usage(&id, values.usage, values.outcome, values.incomplete)
+                .record_usage(
+                    &id,
+                    values.usage,
+                    values.outcome,
+                    values.incomplete,
+                    duration_ms,
+                    values.ttft_ms,
+                )
                 .await
                 .is_err()
             {
@@ -455,6 +553,14 @@ impl super::upstream::UsageObserver for UsageMeter {
             && let Ok(mut values) = inner.values.lock()
         {
             values.incomplete = true;
+        }
+    }
+    fn response_failed(&self) {
+        if let Some(inner) = &self.0
+            && let Ok(mut values) = inner.values.lock()
+        {
+            // Failed delivery still burns the engine's reported tokens.
+            values.outcome = "failed";
         }
     }
 }

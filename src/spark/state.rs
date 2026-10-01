@@ -123,7 +123,7 @@ impl std::fmt::Display for StateError {
 
 impl std::error::Error for StateError {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DatabaseHealth {
     pub journal_mode: String,
     pub synchronous: String,
@@ -298,6 +298,7 @@ enum Command {
     },
     Snapshot(oneshot::Sender<Result<AuthSnapshot, StateError>>),
     Sessions(super::sessions::Command),
+    Panel(super::analytics::Command),
     Shutdown(std_mpsc::SyncSender<()>),
 }
 
@@ -309,6 +310,14 @@ pub struct DbActor {
 }
 
 impl DbActor {
+    pub(crate) fn panel_command(
+        &self,
+        command: super::analytics::Command,
+    ) -> Result<(), StateError> {
+        self.sender
+            .try_send(Command::Panel(command))
+            .map_err(|_| StateError::Overloaded)
+    }
     pub(crate) fn session_command(
         &self,
         command: super::sessions::Command,
@@ -700,7 +709,11 @@ fn open_connection(
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(state_sql)?;
-    if version > 0 && (version < 4 || super::sessions::migration_needed(&connection)?) {
+    if version > 0
+        && (version < 4
+            || super::sessions::migration_needed(&connection)?
+            || super::analytics::migration_needed(&connection)?)
+    {
         verified_backup(&connection, backup_dir, max_backups)?;
     }
     let migrations = Migrations::new(vec![
@@ -718,8 +731,54 @@ fn open_connection(
     // Additive launch tables have a separate version ledger. Older releases
     // still read the qualified engine state under the unchanged main schema.
     super::sessions::migrate(&mut connection)?;
+    super::analytics::migrate(&mut connection)?;
+    super::analytics::interrupt_pending(&mut connection)?;
+    interrupt_panel_recoveries(&mut connection)?;
     verified_backup(&connection, backup_dir, max_backups)?;
     Ok(connection)
+}
+
+fn interrupt_panel_recoveries(connection: &mut Connection) -> Result<(), StateError> {
+    loop {
+        let ids = connection
+            .prepare("SELECT id FROM operations WHERE kind='instance.recover' AND state IN ('accepted','running') LIMIT 256")
+            .map_err(state_sql)?
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(state_sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(state_sql)?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        for id in ids {
+            let progress = OperationProgress {
+                stage: "interrupted".into(),
+                current: None,
+                total: None,
+                unit: None,
+                message: "Recovery sequence interrupted by an agent restart".into(),
+            };
+            if read_operation(connection, &id)?.state == OperationState::Accepted {
+                transition(
+                    connection,
+                    &id,
+                    OperationState::Running,
+                    progress.clone(),
+                    None,
+                    None,
+                )?;
+            }
+            transition(connection, &id, OperationState::Failed, progress, None, Some(ProblemDocument {
+                schema: PROBLEM_SCHEMA.into(),
+                r#type: "about:blank".into(),
+                code: "spark.instance.recovery-interrupted".into(),
+                status: 409,
+                detail: "The agent restarted during managed recovery. Child lifecycle operations reconcile independently.".into(),
+                remediation: vec!["Inspect the instance and child operations before starting a new recovery.".into()],
+                operation_id: Some(id.clone()),
+            }))?;
+        }
+    }
 }
 
 fn verified_backup(
@@ -790,6 +849,7 @@ fn actor_loop(
 ) {
     while let Some(command) = receiver.blocking_recv() {
         match command {
+            Command::Panel(command) => super::analytics::dispatch(&mut connection, command),
             Command::Sessions(command) => {
                 super::sessions::dispatch(&mut connection, &pepper, command)
             }
@@ -1220,8 +1280,18 @@ fn create_token(
     }
     connection.execute(
         "INSERT INTO token_metadata(id,name,verifier,scopes_json,allowed_cidrs_json,expires_at,max_concurrent_inference,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-        params![token_id, request.name, verifier.as_slice(), json(&request.scopes)?, json(&request.allowed_cidrs)?, request.expires_at, request.max_concurrent_inference, created_at],
+        params![token_id, request.name, verifier.as_slice(), json(&request.scopes.iter().filter(|scope| **scope!=super::wire::TokenScope::AnalyticsRead).collect::<Vec<_>>())?, json(&request.allowed_cidrs)?, request.expires_at, request.max_concurrent_inference, created_at],
     ).map_err(state_sql)?;
+    // New permissions live in an additive table so preceding releases can still
+    // decode their token metadata; downgrading never grants analytics access.
+    if request
+        .scopes
+        .contains(&super::wire::TokenScope::AnalyticsRead)
+    {
+        connection
+            .execute("INSERT INTO panel_token_scopes VALUES(?1,1)", [&token_id])
+            .map_err(state_sql)?;
+    }
     let result = serde_json::json!({"token_id":token_id});
     let running = transition(
         connection,
@@ -2059,8 +2129,27 @@ fn read_token(connection: &Connection, id: &str) -> Result<TokenDocument, StateE
         [id],
         |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,row.get::<_, String>(3)?,row.get::<_, Option<String>>(4)?,row.get::<_, u32>(5)?,row.get::<_, String>(6)?,row.get::<_, Option<String>>(7)?,row.get::<_, Option<String>>(8)?)),
     ).optional().map_err(state_sql)?.ok_or(StateError::NotFound).and_then(|(id,name,scopes,cidrs,expires_at,max_concurrent_inference,created_at,last_used_at,revoked_at)| Ok(TokenDocument {
-        schema: TOKEN_SCHEMA.into(), id, name, scopes: from_json(&scopes)?, allowed_cidrs: from_json(&cidrs)?, expires_at, max_concurrent_inference, created_at, last_used_at, revoked_at,
+        schema: TOKEN_SCHEMA.into(), id:id.clone(), name, scopes: token_scopes(connection,&id,&scopes)?, allowed_cidrs: from_json(&cidrs)?, expires_at, max_concurrent_inference, created_at, last_used_at, revoked_at,
     }))
+}
+
+fn token_scopes(
+    connection: &Connection,
+    id: &str,
+    legacy: &str,
+) -> Result<Vec<super::wire::TokenScope>, StateError> {
+    let mut scopes: Vec<super::wire::TokenScope> = from_json(legacy)?;
+    if connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM panel_token_scopes WHERE token_id=?1)",
+            [id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(state_sql)?
+    {
+        scopes.push(super::wire::TokenScope::AnalyticsRead);
+    }
+    Ok(scopes)
 }
 
 fn load_snapshot(connection: &Connection) -> Result<AuthSnapshot, StateError> {
@@ -2104,7 +2193,7 @@ fn load_snapshot(connection: &Connection) -> Result<AuthSnapshot, StateError> {
             schema: TOKEN_SCHEMA.into(),
             id: id.clone(),
             name,
-            scopes: from_json(&scopes)?,
+            scopes: token_scopes(connection, &id, &scopes)?,
             allowed_cidrs: from_json(&cidrs)?,
             expires_at,
             max_concurrent_inference,
@@ -2166,9 +2255,9 @@ fn validate_token_request(request: &TokenCreateRequest) -> Result<(), StateError
             "token name must contain 1..80 bytes".into(),
         ));
     }
-    if request.scopes.is_empty() || request.scopes.len() > 11 {
+    if request.scopes.is_empty() || request.scopes.len() > 12 {
         return Err(StateError::Invalid(
-            "token must contain 1..11 scopes".into(),
+            "token must contain 1..12 scopes".into(),
         ));
     }
     if request.allowed_cidrs.len() > 16

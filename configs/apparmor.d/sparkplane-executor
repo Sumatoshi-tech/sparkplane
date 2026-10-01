@@ -26,6 +26,7 @@ profile sparkplane-executor /opt/sparkplane/current/sparkplane flags=(attach_dis
   /var/lib/sparkplane/huggingface/** r,
   /proc/*/cgroup r,
   /proc/*/stat r,
+  /proc/stat r,
   /proc/meminfo r,
   /proc/vmstat r,
   /proc/pressure/memory r,

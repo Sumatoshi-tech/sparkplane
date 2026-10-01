@@ -17,10 +17,12 @@ use std::{
 use bollard::{
     API_DEFAULT_VERSION, Docker,
     container::LogOutput,
+    exec::{StartExecOptions, StartExecResults},
     models::{
         ContainerCreateBody, ContainerUpdateBody, DeviceMapping, DeviceRequest, EndpointSettings,
-        EventMessage, EventMessageTypeEnum, HealthConfig, HostConfig, ImageInspect, Mount,
-        MountType, NetworkCreateRequest, NetworkingConfig, RestartPolicy, RestartPolicyNameEnum,
+        EventMessage, EventMessageTypeEnum, ExecConfig, HealthConfig, HostConfig, ImageInspect,
+        Mount, MountType, NetworkCreateRequest, NetworkingConfig, RestartPolicy,
+        RestartPolicyNameEnum,
     },
     query_parameters::{
         AttachContainerOptionsBuilder, CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
@@ -872,6 +874,7 @@ enum ExecutorActionKind {
     InspectProtectedHost,
     InspectDockerVersion,
     InspectResources,
+    InspectPanelTelemetry,
     InspectCandidateStorage(CandidateStorageInput),
     InspectEmergencyRecords,
     InspectQualification(QualificationSubmission),
@@ -889,6 +892,9 @@ enum ExecutorActionKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum ExecutorResult {
+    InspectPanelTelemetry {
+        telemetry: super::telemetry::PanelTelemetry,
+    },
     Health {
         health: ExecutorHealth,
     },
@@ -1003,6 +1009,13 @@ trait ContainerRuntime: Send + Sync + 'static {
     fn logs(&self, input: LogInput) -> RuntimeFuture<EngineLogs>;
     fn scan_managed(&self) -> RuntimeFuture<Vec<ManagedContainerObservation>>;
     fn quarantine(&self, container_id: String) -> RuntimeFuture<()>;
+    fn panel_gpu(
+        &self,
+        _input: StopInstanceInput,
+        _container_id: String,
+    ) -> RuntimeFuture<Option<super::telemetry::GpuTelemetry>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 struct BollardContainerRuntime;
@@ -1369,6 +1382,79 @@ fn qualification_image_architecture(host_architecture: &str) -> Result<&'static 
 }
 
 impl ContainerRuntime for BollardContainerRuntime {
+    fn panel_gpu(
+        &self,
+        input: StopInstanceInput,
+        container_id: String,
+    ) -> RuntimeFuture<Option<super::telemetry::GpuTelemetry>> {
+        Box::pin(async move {
+            let docker = Self::docker().await?;
+            let Some(observed) = inspect_input(&docker, &input).await? else {
+                return Ok(None);
+            };
+            if observed.container_id != container_id || !observed.running {
+                return Ok(None);
+            }
+            // A finite read-only command inherits the engine's existing device,
+            // user, cgroup and confinement policy. No caller can choose argv.
+            let exec = docker
+                .create_exec(
+                    &container_id,
+                    ExecConfig {
+                        attach_stdin: Some(false),
+                        attach_stdout: Some(true),
+                        attach_stderr: Some(false),
+                        tty: Some(false),
+                        privileged: Some(false),
+                        cmd: Some(
+                            super::telemetry::gpu_command()
+                                .into_iter()
+                                .map(str::to_owned)
+                                .collect(),
+                        ),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|_| ())?;
+            let StartExecResults::Attached { mut output, .. } = docker
+                .start_exec(
+                    &exec.id,
+                    Some(StartExecOptions {
+                        detach: false,
+                        tty: false,
+                        output_capacity: Some(8192),
+                    }),
+                )
+                .await
+                .map_err(|_| ())?
+            else {
+                return Ok(None);
+            };
+            let mut bytes = Vec::new();
+            while let Some(chunk) = output.next().await {
+                let chunk = chunk.map_err(|_| ())?;
+                if let LogOutput::StdOut { message } = chunk {
+                    if bytes.len().saturating_add(message.len()) > 8192 {
+                        return Ok(None);
+                    }
+                    bytes.extend_from_slice(&message);
+                }
+            }
+            if docker
+                .inspect_exec(&exec.id)
+                .await
+                .map_err(|_| ())?
+                .exit_code
+                != Some(0)
+            {
+                return Ok(None);
+            }
+            Ok(std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(super::telemetry::gpu))
+        })
+    }
     fn qualify(
         &self,
         spec: QualificationContainerSpec,
@@ -2668,6 +2754,9 @@ struct ExecutorHandler {
     kernel_release: String,
     machine_id_path: PathBuf,
     engine_catalog: Arc<EngineCatalog>,
+    // Read-only telemetry targets adopted by exact catalogued reconciliation.
+    // This cache does not participate in admission or emergency decisions.
+    panel_targets: RwLock<Vec<(StopInstanceInput, String)>>,
     resources: Option<Arc<ResourceMonitor>>,
     qualification: Option<Arc<QualificationExecutorConfig>>,
 }
@@ -2721,6 +2810,7 @@ impl ExecutorHandler {
                 .into_owned(),
             machine_id_path: "/etc/machine-id".into(),
             engine_catalog: Arc::new(engine_catalog),
+            panel_targets: RwLock::new(Vec::new()),
             resources: Some(resources),
             qualification: Some(Arc::new(QualificationExecutorConfig {
                 authority,
@@ -2771,6 +2861,62 @@ impl ExecutorHandler {
         cancellation: CancellationToken,
     ) -> Result<ExecutorResult, ErrorCode> {
         match action.action {
+            ExecutorActionKind::InspectPanelTelemetry => {
+                let (guard_heartbeat, event_heartbeat) = self.heartbeats.healthy();
+                let cpu = tokio::fs::read_to_string("/proc/stat")
+                    .await
+                    .ok()
+                    .and_then(|s| super::telemetry::cpu_ticks(&s));
+                let target = self
+                    .resources
+                    .as_ref()
+                    .and_then(|monitor| {
+                        let identities = monitor.identities.read().ok()?;
+                        identities.values().next().map(|identity| {
+                            (
+                                StopInstanceInput {
+                                    instance_id: identity.instance_id.clone(),
+                                    generation: identity.generation,
+                                    grace_seconds: 0,
+                                },
+                                identity.container_id.clone(),
+                            )
+                        })
+                    })
+                    .or_else(|| self.panel_targets.read().ok()?.first().cloned());
+                let gpu = if let Some((input, container_id)) = target {
+                    tokio::time::timeout(
+                        Duration::from_millis(2500),
+                        self.runtime.panel_gpu(input, container_id),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .flatten()
+                } else {
+                    None
+                };
+                Ok(ExecutorResult::InspectPanelTelemetry {
+                    telemetry: super::telemetry::PanelTelemetry {
+                        health: ExecutorHealth {
+                            schema: "sparkplane.executor.health/v1".into(),
+                            version: env!("CARGO_PKG_VERSION").into(),
+                            authorized_agent_uid: self.agent_uid,
+                            guard_heartbeat,
+                            event_heartbeat,
+                            event_epoch: self.heartbeats.event_epoch(),
+                        },
+                        resources: self
+                            .resources
+                            .as_ref()
+                            .and_then(|r| r.snapshot())
+                            .map(|(s, _)| s),
+                        cpu_total_ticks: cpu.map(|c| c.0),
+                        cpu_idle_ticks: cpu.map(|c| c.1),
+                        gpu,
+                    },
+                })
+            }
             ExecutorActionKind::Health => {
                 let (guard_heartbeat, event_heartbeat) = self.heartbeats.healthy();
                 Ok(ExecutorResult::Health {
@@ -2935,6 +3081,12 @@ impl ExecutorHandler {
                 if let Some(resources) = &self.resources {
                     resources.forget_engine(&input.instance_id, input.generation);
                 }
+                if let Ok(mut targets) = self.panel_targets.write() {
+                    targets.retain(|(target, _)| {
+                        target.instance_id != input.instance_id
+                            || target.generation != input.generation
+                    });
+                }
                 Ok(ExecutorResult::StopInstance)
             }
             ExecutorActionKind::InspectInstance(input) => self
@@ -3077,6 +3229,22 @@ impl ExecutorHandler {
                 (!matched_keys.contains(&identity)).then_some(expected)
             })
             .collect();
+        if let Ok(mut targets) = self.panel_targets.write() {
+            *targets = matched
+                .iter()
+                .filter(|engine| engine.running)
+                .map(|engine| {
+                    (
+                        StopInstanceInput {
+                            instance_id: engine.instance_id.clone(),
+                            generation: engine.generation,
+                            grace_seconds: 0,
+                        },
+                        engine.container_id.clone(),
+                    )
+                })
+                .collect();
+        }
         Ok(ReconcileScan {
             matched,
             missing,
@@ -3468,6 +3636,20 @@ impl ExecutorClient {
             .await?
         {
             ExecutorResult::Health { health } => Ok(health),
+            _ => Err(protocol_error()),
+        }
+    }
+
+    pub async fn panel_telemetry(
+        &self,
+    ) -> Result<super::telemetry::PanelTelemetry, ExecutorClientError> {
+        match self
+            .call(ExecutorAction {
+                action: ExecutorActionKind::InspectPanelTelemetry,
+            })
+            .await?
+        {
+            ExecutorResult::InspectPanelTelemetry { telemetry } => Ok(telemetry),
             _ => Err(protocol_error()),
         }
     }
@@ -4076,6 +4258,56 @@ async fn actuate_emergency_at(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn panel_telemetry_round_trips_only_for_the_authorized_ipc_peer() {
+        let uid = rustix::process::geteuid().as_raw();
+        for authorized_uid in [uid, uid + 1] {
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("executor.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let heartbeats = Arc::new(Heartbeats::default());
+            heartbeats.mark_guard();
+            heartbeats.mark_events();
+            let handler = ExecutorHandler {
+                agent_uid: authorized_uid,
+                cancellation: Arc::new(CancelRegistry::new()),
+                docker: Arc::new(BollardDockerInspector),
+                runtime: Arc::new(FakeRuntime::new()),
+                heartbeats,
+                hostname_path: "/etc/hostname".into(),
+                kernel_release: "fixture".into(),
+                machine_id_path: "/etc/machine-id".into(),
+                engine_catalog: engine_catalog(),
+                panel_targets: RwLock::new(Vec::new()),
+                resources: None,
+                qualification: None,
+            };
+            let server = tokio::spawn(
+                Server::with_authorizer(handler, SparkUidAuthorizer::new(authorized_uid))
+                    .with_max_request_frame_length(MAX_REQUEST_FRAME)
+                    .serve(listener),
+            );
+            let result = ExecutorClient::new(socket).panel_telemetry().await;
+            if uid == authorized_uid {
+                let telemetry = result.unwrap();
+                assert!(telemetry.health.guard_heartbeat);
+                assert!(telemetry.cpu_total_ticks.is_some());
+                assert!(telemetry.resources.is_none());
+                assert!(telemetry.gpu.is_none());
+            } else {
+                assert!(result.is_err());
+            }
+            server.abort();
+            let _ = server.await;
+        }
+        assert!(
+            serde_json::from_value::<ExecutorAction>(
+                serde_json::json!({"action":"inspect_panel_telemetry","argv":["sh"]})
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn compute_devices_survive_restart_policy_updates() {
         let paths: Vec<_> = nvidia_compute_devices()
@@ -4628,6 +4860,22 @@ mod tests {
     }
 
     impl ContainerRuntime for FakeRuntime {
+        fn panel_gpu(
+            &self,
+            input: StopInstanceInput,
+            container_id: String,
+        ) -> RuntimeFuture<Option<super::super::telemetry::GpuTelemetry>> {
+            self.record("panel-gpu");
+            assert_eq!(input.instance_id, self.observed.instance_id);
+            assert_eq!(input.generation, self.observed.generation);
+            assert_eq!(container_id, self.observed.container_id);
+            Box::pin(async {
+                Ok(super::super::telemetry::gpu(
+                    "NVIDIA GB10, 0, 45, 10.48, [N/A], [N/A]",
+                ))
+            })
+        }
+
         fn qualify(
             &self,
             _: QualificationContainerSpec,
@@ -5142,6 +5390,7 @@ mod tests {
             kernel_release: "6.17-test".into(),
             machine_id_path: root.path().join("machine-id"),
             engine_catalog: engine_catalog(),
+            panel_targets: RwLock::new(Vec::new()),
             resources: None,
             qualification: None,
         };
@@ -5233,6 +5482,7 @@ mod tests {
             kernel_release: "6.17-test".into(),
             machine_id_path: root.path().join("machine-id"),
             engine_catalog: engine_catalog(),
+            panel_targets: RwLock::new(Vec::new()),
             resources: None,
             qualification: None,
         });
@@ -5271,6 +5521,7 @@ mod tests {
             kernel_release: "6.17-test".into(),
             machine_id_path: "/etc/machine-id".into(),
             engine_catalog: engine_catalog(),
+            panel_targets: RwLock::new(Vec::new()),
             resources: None,
             qualification: None,
         };
@@ -5307,6 +5558,7 @@ mod tests {
             kernel_release: "6.17-test".into(),
             machine_id_path: "/etc/machine-id".into(),
             engine_catalog: engine_catalog(),
+            panel_targets: RwLock::new(Vec::new()),
             resources: None,
             qualification: None,
         };
@@ -5821,6 +6073,7 @@ mod tests {
             kernel_release: "6.17-test".into(),
             machine_id_path: "/etc/machine-id".into(),
             engine_catalog: engine_catalog(),
+            panel_targets: RwLock::new(Vec::new()),
             resources: None,
             qualification: None,
         };
@@ -5889,6 +6142,7 @@ mod tests {
             kernel_release: "6.17-test".into(),
             machine_id_path: "/etc/machine-id".into(),
             engine_catalog: engine_catalog(),
+            panel_targets: RwLock::new(Vec::new()),
             resources: None,
             qualification: None,
         };
@@ -5964,6 +6218,7 @@ mod tests {
             kernel_release: "6.17-test".into(),
             machine_id_path: "/etc/machine-id".into(),
             engine_catalog: engine_catalog(),
+            panel_targets: RwLock::new(Vec::new()),
             resources: None,
             qualification: None,
         };
@@ -5987,6 +6242,19 @@ mod tests {
             ),
             (0, 1, 1)
         );
+        let ExecutorResult::InspectPanelTelemetry { telemetry } = handler
+            .execute(
+                ExecutorAction {
+                    action: ExecutorActionKind::InspectPanelTelemetry,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("wrong result");
+        };
+        assert!(telemetry.gpu.is_none());
         managed.lock().unwrap()[0].name = format!(
             "sparkplane-{}-g{}",
             expected.instance_id, expected.generation
@@ -5994,7 +6262,7 @@ mod tests {
         let result = handler
             .execute(
                 ExecutorAction {
-                    action: ExecutorActionKind::ReconcileScan(vec![expected]),
+                    action: ExecutorActionKind::ReconcileScan(vec![expected.clone()]),
                 },
                 CancellationToken::new(),
             )
@@ -6004,6 +6272,44 @@ mod tests {
             panic!("wrong result");
         };
         assert_eq!((scan.matched.len(), scan.missing.len()), (1, 0));
+        let ExecutorResult::InspectPanelTelemetry { telemetry } = handler
+            .execute(
+                ExecutorAction {
+                    action: ExecutorActionKind::InspectPanelTelemetry,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("wrong result");
+        };
+        assert_eq!(telemetry.gpu.unwrap().name, "NVIDIA GB10");
+
+        // A later failed identity check must evict the old telemetry target.
+        managed.lock().unwrap()[0].engine_fingerprint = Some("untrusted".into());
+        handler
+            .execute(
+                ExecutorAction {
+                    action: ExecutorActionKind::ReconcileScan(vec![expected]),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ExecutorResult::InspectPanelTelemetry { telemetry } = handler
+            .execute(
+                ExecutorAction {
+                    action: ExecutorActionKind::InspectPanelTelemetry,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("wrong result");
+        };
+        assert!(telemetry.gpu.is_none());
     }
 
     #[tokio::test]
@@ -6028,6 +6334,7 @@ mod tests {
             kernel_release: "6.17-test".into(),
             machine_id_path: "/etc/machine-id".into(),
             engine_catalog: engine_catalog(),
+            panel_targets: RwLock::new(Vec::new()),
             resources: Some(monitor.clone()),
             qualification: None,
         };

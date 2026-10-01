@@ -95,3 +95,47 @@ fn an_interrupted_pair_update_can_be_completed_without_losing_ownership() {
     sparkplane::generated_files::remove(root.path()).unwrap();
     assert!(!root.path().join("sparkplane-launch.config.toml").exists());
 }
+
+#[test]
+fn resume_providers_survive_model_changes_and_profile_removal() {
+    let root = tempfile::tempdir().unwrap();
+    let original = "# User preferences\nmodel = 'gpt-6.1-sol'\n[model_providers.other]\nname = 'Other'\nbase_url = 'https://other.example/v1'\nwire_api = 'responses'\n";
+    std::fs::write(root.path().join("config.toml"), original).unwrap();
+    let first = b"model='qwen'\nmodel_provider='sparkplane_qwen'\n[model_providers.sparkplane_qwen]\nname='Sparkplane Qwen'\nbase_url='https://spark.example/openai/qwen/v1'\nenv_key='SPARKPLANE_INFERENCE_TOKEN'\nwire_api='responses'\n";
+    let second = b"model='other'\nmodel_provider='sparkplane_other'\n[model_providers.sparkplane_other]\nname='Sparkplane Other'\nbase_url='https://spark.example/openai/other/v1'\nenv_key='SPARKPLANE_INFERENCE_TOKEN'\nwire_api='responses'\n";
+    for profile in [first.as_slice(), second.as_slice()] {
+        sparkplane::generated_files::publish(root.path(), profile, b"catalog").unwrap();
+        sparkplane::generated_files::publish_provider(root.path(), profile).unwrap();
+    }
+    sparkplane::generated_files::remove(root.path()).unwrap();
+    let text = std::fs::read_to_string(root.path().join("config.toml")).unwrap();
+    let config: toml::Value = toml::from_str(&text).unwrap();
+    assert_eq!(config["model"].as_str(), Some("gpt-6.1-sol"));
+    assert!(config.get("model_provider").is_none());
+    assert!(text.starts_with("# User preferences\nmodel = 'gpt-6.1-sol'\n"));
+    for name in ["sparkplane_qwen", "sparkplane_other", "other"] {
+        assert!(config["model_providers"].get(name).is_some(), "{name}");
+    }
+    assert!(!root.path().join("sparkplane-launch.config.toml").exists());
+    // Missing definitions are repaired without replacing user preferences.
+    std::fs::write(root.path().join("config.toml"), original).unwrap();
+    sparkplane::generated_files::publish_provider(root.path(), first).unwrap();
+    let text = std::fs::read_to_string(root.path().join("config.toml")).unwrap();
+    assert!(text.contains("sparkplane_qwen"));
+}
+
+#[test]
+fn resume_provider_registration_preserves_edits_and_rejects_symlinks() {
+    let root = tempfile::tempdir().unwrap();
+    let profile = b"[model_providers.sparkplane_qwen]\nname='Sparkplane Qwen'\nbase_url='https://spark.example/v1'\nwire_api='responses'\n";
+    sparkplane::generated_files::publish_provider(root.path(), profile).unwrap();
+    let path = root.path().join("config.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let edited = text.replace("https://spark.example/v1", "https://custom.example/v1");
+    std::fs::write(&path, &edited).unwrap();
+    assert!(sparkplane::generated_files::publish_provider(root.path(), profile).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+    std::fs::rename(&path, root.path().join("user-original")).unwrap();
+    std::os::unix::fs::symlink("user-original", &path).unwrap();
+    assert!(sparkplane::generated_files::publish_provider(root.path(), profile).is_err());
+}

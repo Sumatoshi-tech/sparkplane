@@ -75,6 +75,9 @@ type TokenLimiter = RateLimiter<String, DashMapStateStore<String>, DefaultClock>
 type InferenceSlots = BTreeMap<String, (u32, Arc<tokio::sync::Semaphore>)>;
 const DATABASE_QUEUE_CAPACITY: usize = 64;
 
+#[path = "web.rs"]
+mod web;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
@@ -91,6 +94,8 @@ pub struct AgentConfig {
     pub models: ModelsConfig,
     #[serde(default)]
     pub gateway: gateway::IngressLimits,
+    #[serde(default)]
+    pub webui: web::PanelConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -137,6 +142,7 @@ pub struct AgentState {
     admission: TransitionCoordinator,
     routes: RouteRegistry,
     qualification_authority: Option<Arc<str>>,
+    web: Arc<web::WebState>,
     #[cfg(test)]
     executor_ready_override: bool,
 }
@@ -209,6 +215,7 @@ impl AgentState {
             admission: TransitionCoordinator::new(),
             routes: RouteRegistry::default(),
             qualification_authority: None,
+            web: Arc::new(web::WebState::default()),
             #[cfg(test)]
             executor_ready_override: false,
         }
@@ -519,9 +526,14 @@ pub fn router(state: AgentState) -> Router {
             inference_ingress,
         ));
     let authenticated = authenticated
+        .merge(web::api_routes())
         .merge(inference)
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
-    authenticated.fallback(not_found).with_state(state)
+    authenticated
+        .merge(web::public_routes(state.clone()))
+        .fallback(not_found)
+        .layer(middleware::from_fn(web::normalize_authority))
+        .with_state(state)
 }
 
 // The worker owns a clone so cancellation cannot free its CPU/memory slot early.
@@ -659,10 +671,17 @@ async fn meter_inference_route(
     auth: &AuthenticatedToken,
     instance: &str,
     route: Arc<gateway::HealthyRoute>,
+    protocol: &str,
 ) -> Result<Arc<gateway::HealthyRoute>, StateError> {
     let mut metered_route = (*route).clone();
     metered_route.upstream = metered_route.upstream.with_meter(Arc::new(
-        super::sessions::UsageMeter::begin(state.database.as_ref(), &auth.id, instance).await?,
+        super::sessions::UsageMeter::begin_protocol(
+            state.database.as_ref(),
+            &auth.id,
+            instance,
+            protocol,
+        )
+        .await?,
     ));
     Ok(Arc::new(metered_route))
 }
@@ -800,10 +819,11 @@ async fn gateway_anthropic_messages(
         Ok(request) => request,
         Err(error) => return anthropic_error(StatusCode::BAD_REQUEST, error),
     };
-    let route = match meter_inference_route(&state, &auth, &instance, route).await {
-        Ok(route) => route,
-        Err(error) => return state_problem(error),
-    };
+    let route =
+        match meter_inference_route(&state, &auth, &instance, route, "anthropic.messages").await {
+            Ok(route) => route,
+            Err(error) => return state_problem(error),
+        };
     let token_permit = match auth.acquire_inference().await {
         Ok(permit) => permit,
         Err(()) => return anthropic_upstream_unavailable(),
@@ -1049,7 +1069,13 @@ async fn gateway_completions(
     };
     let mut metered_route = (*route).clone();
     metered_route.upstream = metered_route.upstream.with_meter(Arc::new(
-        match super::sessions::UsageMeter::begin(state.database.as_ref(), &auth.id, &instance).await
+        match super::sessions::UsageMeter::begin_protocol(
+            state.database.as_ref(),
+            &auth.id,
+            &instance,
+            "openai.completions",
+        )
+        .await
         {
             Ok(meter) => meter,
             Err(error) => return state_problem(error),
@@ -1291,7 +1317,9 @@ async fn gateway_responses(
             Ok(request) => request,
             Err(error) => return openai_error(StatusCode::BAD_REQUEST, error),
         };
-        let route = match meter_inference_route(&state, &auth, &instance, route).await {
+        let route = match meter_inference_route(&state, &auth, &instance, route, "openai.responses")
+            .await
+        {
             Ok(route) => route,
             Err(error) => return state_problem(error),
         };
@@ -1309,10 +1337,11 @@ async fn gateway_responses(
         Ok(request) => request,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error),
     };
-    let route = match meter_inference_route(&state, &auth, &instance, route).await {
-        Ok(route) => route,
-        Err(error) => return state_problem(error),
-    };
+    let route =
+        match meter_inference_route(&state, &auth, &instance, route, "openai.responses").await {
+            Ok(route) => route,
+            Err(error) => return state_problem(error),
+        };
     let token_permit = match auth.acquire_inference().await {
         Ok(permit) => permit,
         Err(()) => return gateway_upstream_unavailable(),
@@ -1415,6 +1444,11 @@ async fn gateway_embeddings(
     if !route.profile.allows(PublicAction::Embeddings) {
         return openai_not_found().await;
     }
+    let route =
+        match meter_inference_route(&state, &auth, &instance, route, "openai.embeddings").await {
+            Ok(route) => route,
+            Err(error) => return state_problem(error),
+        };
     let rewritten =
         match gateway::rewrite_embeddings_request(&body, &route.served_model, &route.profile) {
             Ok(request) => request,
@@ -1481,7 +1515,13 @@ async fn gateway_chat_completions(
     };
     let mut metered_route = (*route).clone();
     metered_route.upstream = metered_route.upstream.with_meter(Arc::new(
-        match super::sessions::UsageMeter::begin(state.database.as_ref(), &auth.id, &instance).await
+        match super::sessions::UsageMeter::begin_protocol(
+            state.database.as_ref(),
+            &auth.id,
+            &instance,
+            "openai.chat",
+        )
+        .await
         {
             Ok(meter) => meter,
             Err(error) => return state_problem(error),
@@ -1643,23 +1683,37 @@ async fn responses_json(
     while let Some(event) = upstream.next().await {
         match event {
             Ok(GenerationEvent::Done) => {
-                if encoder.accept(GenerationEvent::Done).is_err() {
+                if let Err(error) = encoder.accept(GenerationEvent::Done) {
+                    upstream.response_failed();
+                    tracing::warn!(
+                        event_code = "spark.inference.response-invalid",
+                        reason = error.message
+                    );
                     return gateway_upstream_unavailable();
                 }
                 done = true;
                 break;
             }
             Ok(event) => {
-                if encoder.accept(event).is_err() {
+                if let Err(error) = encoder.accept(event) {
+                    upstream.response_failed();
+                    tracing::warn!(
+                        event_code = "spark.inference.response-invalid",
+                        reason = error.message
+                    );
                     return gateway_upstream_unavailable();
                 }
             }
-            _ => return gateway_upstream_unavailable(),
+            _ => {
+                upstream.response_failed();
+                return gateway_upstream_unavailable();
+            }
         }
     }
     if done {
         Json(encoder.final_document()).into_response()
     } else {
+        upstream.response_failed();
         gateway_upstream_unavailable()
     }
 }
@@ -1689,12 +1743,18 @@ fn responses_sse(
                 match upstream.next().await {
                     Some(Ok(event)) => {
                         terminal = matches!(event, GenerationEvent::Done);
-                        if encoder.accept(event).is_err() {
-                            encoder.fail();
+                        if let Err(error) = encoder.accept(event) {
+                            upstream.response_failed();
+                            tracing::warn!(
+                                event_code = "spark.inference.response-invalid",
+                                reason = error.message
+                            );
+                            encoder.fail_with_message(error.message);
                             terminal = true;
                         }
                     }
                     _ => {
+                        upstream.response_failed();
                         encoder.fail();
                         terminal = true;
                     }
@@ -2607,7 +2667,7 @@ async fn reconcile_once(
         .into_iter()
         .map(|engine| ((engine.instance_id.clone(), engine.generation), engine))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let operations = database.list_operations().await.map_err(|_| ())?;
+    let operations = database.list_operation_summaries().await.map_err(|_| ())?;
     for instance in instances {
         let Ok(_transition) =
             coordinator.try_acquire(format!("reconcile:{}:{}", instance.id, instance.generation))
@@ -4054,7 +4114,10 @@ async fn metrics(State(state): State<AgentState>, RawQuery(query): RawQuery) -> 
     }
     let (operations, instances, models) = match &state.database {
         Some(database) => {
-            let operations = database.list_operations().await.map(|items| items.len());
+            let operations = database
+                .list_operation_summaries()
+                .await
+                .map(|items| items.len());
             let instances = database.list_instances().await.map(|items| items.len());
             let models = database.list_models().await.map(|items| items.len());
             match (operations, instances, models) {
@@ -4104,6 +4167,21 @@ impl AuthenticatedToken {
 
 #[utoipa::path(get, path = "/api/sparkplane/v1/operations", responses((status = 200, body = OperationListDocument)))]
 async fn list_operations(State(state): State<AgentState>, RawQuery(query): RawQuery) -> Response {
+    if query.as_deref() == Some("view=summary") {
+        let Some(database) = &state.database else {
+            return database_unavailable();
+        };
+        return match database
+            .panel_query(
+                crate::spark::analytics::QueryKind::Operations,
+                crate::spark::analytics::AnalyticsQuery::default(),
+            )
+            .await
+        {
+            Ok(operations) => Json(operations).into_response(),
+            Err(error) => state_problem(error),
+        };
+    }
     if let Some(response) = reject_query(query) {
         return response;
     }
@@ -4925,7 +5003,9 @@ async fn authenticate(
     next: Next,
 ) -> Response {
     let request_path = request.uri().path().to_owned();
-    if headers.contains_key(header::ORIGIN) {
+    let cookie_auth = web::authenticate_cookie(&state, &request);
+    let using_cookie = cookie_auth.is_some();
+    if headers.contains_key(header::ORIGIN) && cookie_auth.is_none() {
         return authentication_layer_error(
             &request_path,
             StatusCode::FORBIDDEN,
@@ -4961,61 +5041,72 @@ async fn authenticate(
         (Some(token), None) | (None, Some(token)) => Some(token),
         _ => None,
     };
-    let Some(presented) = presented else {
-        return authentication_layer_error(
-            &request_path,
-            StatusCode::UNAUTHORIZED,
-            "spark.auth.failed",
-            "authentication failed",
-        );
-    };
-    let auth = if token_matches(state.token.expose_secret(), presented) {
-        AuthenticatedToken::admin(state.inference_slot("bootstrap-admin", 64))
+    let auth = if let Some(auth) = cookie_auth {
+        auth
     } else {
-        let Some((id, secret)) = parse_bearer(presented) else {
-            return auth_failed(&request_path);
+        let Some(presented) = presented else {
+            return authentication_layer_error(
+                &request_path,
+                StatusCode::UNAUTHORIZED,
+                "spark.auth.failed",
+                "authentication failed",
+            );
         };
-        let snapshot = state.auth.load();
-        let Some(verifier) = snapshot.tokens.get(id) else {
-            return auth_failed(&request_path);
-        };
-        if verifier.token.revoked_at.is_some()
-            || verifier.token.expires_at.as_ref().is_some_and(|expiry| {
-                chrono::DateTime::parse_from_rfc3339(expiry)
-                    .map_or(true, |expiry| expiry <= chrono::Utc::now())
-            })
-        {
-            return auth_failed(&request_path);
-        }
-        if !verifier.verify(
-            &state
-                .database
-                .as_ref()
-                .map(DbActor::pepper)
-                .unwrap_or_else(|| Arc::new(SecretString::from("invalid"))),
-            secret,
-        ) {
-            return auth_failed(&request_path);
-        }
-        if let Some(peer) = request.extensions().get::<ConnectInfo<SocketAddr>>()
-            && !verifier.token.allowed_cidrs.is_empty()
-            && !verifier
-                .token
-                .allowed_cidrs
-                .iter()
-                .filter_map(|value| value.parse::<Cidr>().ok())
-                .any(|cidr| cidr.contains(peer.ip()))
-        {
-            return auth_failed(&request_path);
-        }
-        AuthenticatedToken {
-            id: id.into(),
-            scopes: verifier.token.scopes.clone(),
-            inference: state.inference_slot(id, verifier.token.max_concurrent_inference),
+        if token_matches(state.token.expose_secret(), presented) {
+            AuthenticatedToken::admin(state.inference_slot("bootstrap-admin", 64))
+        } else {
+            let Some((id, secret)) = parse_bearer(presented) else {
+                return auth_failed(&request_path);
+            };
+            let snapshot = state.auth.load();
+            let Some(verifier) = snapshot.tokens.get(id) else {
+                return auth_failed(&request_path);
+            };
+            if verifier.token.revoked_at.is_some()
+                || verifier.token.expires_at.as_ref().is_some_and(|expiry| {
+                    chrono::DateTime::parse_from_rfc3339(expiry)
+                        .map_or(true, |expiry| expiry <= chrono::Utc::now())
+                })
+            {
+                return auth_failed(&request_path);
+            }
+            if !verifier.verify(
+                &state
+                    .database
+                    .as_ref()
+                    .map(DbActor::pepper)
+                    .unwrap_or_else(|| Arc::new(SecretString::from("invalid"))),
+                secret,
+            ) {
+                return auth_failed(&request_path);
+            }
+            if let Some(peer) = request.extensions().get::<ConnectInfo<SocketAddr>>()
+                && !verifier.token.allowed_cidrs.is_empty()
+                && !verifier
+                    .token
+                    .allowed_cidrs
+                    .iter()
+                    .filter_map(|value| value.parse::<Cidr>().ok())
+                    .any(|cidr| cidr.contains(peer.ip()))
+            {
+                return auth_failed(&request_path);
+            }
+            AuthenticatedToken {
+                id: id.into(),
+                scopes: verifier.token.scopes.clone(),
+                inference: state.inference_slot(id, verifier.token.max_concurrent_inference),
+            }
         }
     };
     let required = required_scope(request.method(), request.uri().path());
     if required.as_ref().is_some_and(|scope| !auth.permits(scope)) {
+        if using_cookie {
+            return problem(
+                StatusCode::FORBIDDEN,
+                "spark.auth.scope-required",
+                "token does not permit this action",
+            );
+        }
         return auth_failed(&request_path);
     }
     let limiter_key = format!(
@@ -5054,6 +5145,14 @@ fn parse_bearer(value: &str) -> Option<(&str, &str)> {
 }
 
 fn required_scope(method: &Method, path: &str) -> Option<TokenScope> {
+    if path.starts_with(&format!("{API_BASE}/analytics"))
+        || path.starts_with(&format!("{API_BASE}/health"))
+    {
+        return Some(TokenScope::AnalyticsRead);
+    }
+    if path == format!("{API_BASE}/audit") {
+        return Some(TokenScope::Admin);
+    }
     if path.starts_with("/openai/") || path.starts_with("/anthropic/") {
         return Some(TokenScope::Inference);
     }
@@ -5465,7 +5564,12 @@ pub async fn serve(
         state = state.with_executor(executor);
     }
     state.certificate = certificate_status;
+    Arc::get_mut(&mut state.web)
+        .expect("unshared initial web state")
+        .config = config.webui;
+    web::validate_config(&state)?;
     let state = state.with_allowed_clients(allowed_clients);
+    tokio::spawn(web::sample_health(state.clone()));
     if let Some(executor) = state.executor.clone() {
         let routes = state.routes.clone();
         let coordinator = state.admission.clone();
@@ -8489,8 +8593,17 @@ mod tests {
                 false,
                 true,
             ),
+            (
+                "/openai/ornith/v1/responses",
+                serde_json::json!({"input":"reasoning-only fixture","stream":true}),
+                false,
+                false,
+            ),
         ] {
-            let fixture = if missing {
+            let failed_translation = body["input"] == "reasoning-only fixture";
+            let fixture = if failed_translation {
+                reasoning_only_chat_sse()
+            } else if missing {
                 llama_chat_sse()
                     .lines()
                     .filter(|line| !line.contains("usage"))
@@ -8531,6 +8644,12 @@ mod tests {
                 String::from_utf8_lossy(&output)
             );
             assert!(!output.is_empty());
+            if failed_translation {
+                let output = String::from_utf8_lossy(&output);
+                assert!(output.contains("response.failed"));
+                assert!(output.contains("upstream generation produced no actionable output"));
+                assert!(!output.contains("response.completed"));
+            }
             task.await.unwrap();
         }
         for stream in [false, true] {
@@ -8607,11 +8726,27 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert_eq!(finished.usage.requests, 6);
-        assert_eq!(finished.usage.input_tokens, 43);
-        assert_eq!(finished.usage.output_tokens, 19);
+        assert_eq!(finished.usage.requests, 7);
+        assert_eq!(finished.usage.input_tokens, 50);
+        assert_eq!(finished.usage.output_tokens, 22);
+        assert_eq!(finished.usage.failed_requests, 1);
         assert_eq!(finished.usage.unknown_usage_requests, 1);
         assert_eq!(finished.usage.pending_requests, 0);
+        let analytics: serde_json::Value = client
+            .get(format!("{base}{API_BASE}/analytics?session={id}"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(analytics["summary"]["requests"], 7);
+        assert_eq!(analytics["summary"]["failed_requests"], 1);
+        assert_eq!(analytics["summary"]["input_tokens"], 50);
+        assert_eq!(analytics["summary"]["output_tokens"], 22);
         let repeated: LaunchSessionDocument = client
             .post(&finish)
             .bearer_auth(TOKEN)
@@ -8624,7 +8759,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(finished.finished_at, repeated.finished_at);
-        assert_eq!(repeated.usage.input_tokens, 43);
+        assert_eq!(repeated.usage.input_tokens, 50);
         assert_eq!(
             client
                 .get(format!("{base}/openai/ornith/v1/models"))

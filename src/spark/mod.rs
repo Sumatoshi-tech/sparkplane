@@ -15,10 +15,13 @@ pub mod qualification;
 pub mod reconcile;
 #[cfg(feature = "appliance")]
 pub mod sessions;
+pub mod webauth;
 pub mod wire;
 
 #[cfg(feature = "appliance")]
 pub mod agent;
+#[cfg(feature = "appliance")]
+pub mod analytics;
 #[cfg(all(feature = "appliance", test))]
 pub mod bench;
 #[cfg(feature = "appliance")]
@@ -34,6 +37,8 @@ pub mod recipe;
 pub mod resources;
 #[cfg(feature = "appliance")]
 pub mod state;
+#[cfg(feature = "appliance")]
+pub mod telemetry;
 #[cfg(feature = "appliance")]
 pub mod upstream;
 

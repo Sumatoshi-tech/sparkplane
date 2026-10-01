@@ -801,6 +801,8 @@ pub struct OperationEvent {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[cfg_attr(feature = "appliance", derive(utoipa::ToSchema))]
 pub enum TokenScope {
+    #[serde(rename = "analytics:read")]
+    AnalyticsRead,
     #[serde(rename = "models:read")]
     ModelsRead,
     #[serde(rename = "models:write")]
@@ -828,6 +830,7 @@ pub enum TokenScope {
 impl TokenScope {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::AnalyticsRead => "analytics:read",
             Self::ModelsRead => "models:read",
             Self::ModelsWrite => "models:write",
             Self::InstancesRead => "instances:read",
@@ -848,6 +851,7 @@ impl std::str::FromStr for TokenScope {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
+            "analytics:read" => Ok(Self::AnalyticsRead),
             "models:read" => Ok(Self::ModelsRead),
             "models:write" => Ok(Self::ModelsWrite),
             "instances:read" => Ok(Self::InstancesRead),

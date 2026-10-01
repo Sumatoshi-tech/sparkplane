@@ -42,6 +42,13 @@ the workstation update helper also reads the installed public release key over S
 
 ## Local development loop
 
+Install Node.js 22.12+ and npm for appliance development. The web panel's exact
+dependencies are recorded in `web/package-lock.json`. `make lint`, `make test`
+and `make build` compile it automatically; a direct Cargo appliance build needs
+`make web-build` first. Client-only Cargo builds and `make test-client` need no
+Node tooling. The panel assets are embedded inside the existing signed executable,
+so the signed release inventory remains unchanged.
+
 Run the same checks that gate the release before opening a pull request:
 
 ```bash
@@ -49,6 +56,8 @@ make lint
 make test
 make test-client
 make audit
+cd web && npx playwright install chromium && cd ..
+make web-test-browser
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --all-features --no-deps
 ```
 
@@ -152,6 +161,7 @@ python3 -m pip install --user ziglang==0.16.0
 Build locally with the same feature boundary as Spark:
 
 ```bash
+make web-build
 cargo auditable zigbuild --locked --release \
   --target aarch64-unknown-linux-gnu \
   --no-default-features --features appliance --bin sparkplane

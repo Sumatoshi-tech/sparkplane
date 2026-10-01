@@ -15,6 +15,10 @@ pub const SCHEMA: &str = "sparkplane.session-economics/v1";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Price {
     pub model: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
     pub source: String,
     pub verified_at: String,
     pub effective_from: String,
@@ -23,6 +27,17 @@ pub struct Price {
     pub long_context_threshold: Option<u64>,
     pub long_input_microusd_per_million: Option<u64>,
     pub long_output_microusd_per_million: Option<u64>,
+}
+impl Price {
+    pub fn matches_model(&self, model: &str) -> bool {
+        let identity = model.strip_prefix("huggingface:").unwrap_or(model);
+        let identity = identity.split(['@', '#']).next().unwrap_or(identity);
+        self.model.eq_ignore_ascii_case(identity)
+            || self
+                .aliases
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(identity))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +93,7 @@ impl Report {
             .catalog
             .models
             .iter()
+            .filter(|price| price.matches_model(&self.model))
             .map(|price| {
                 let inference = self.inference.as_ref().and_then(|session| {
                     let usage = &session.usage;
@@ -247,11 +263,14 @@ pub fn load(config: &Path, host: &str, id: Option<&str>) -> Result<Report> {
             .pop()
             .ok_or_else(|| anyhow::anyhow!("no retained economics reports"))?
     };
-    let report: Report = read_record(&path)?;
+    let mut report: Report = read_record(&path)?;
     ensure!(
         report.schema == SCHEMA && report.host == host,
         "economics report identity mismatch"
     );
+    // Retain the original tariff evidence, but stop presenting unrelated models
+    // in reports produced before same-model matching was introduced.
+    report.calculate();
     Ok(report)
 }
 
@@ -354,6 +373,9 @@ pub fn render(report: &Report, fancy: bool, width: usize) -> String {
         }
     }
     text.push_str("\nCloud equivalent / estimated RTK savings (USD):\n");
+    if report.comparisons.is_empty() {
+        text.push_str("  Unavailable: no verified public tariff for this model.\n");
+    }
     for row in &report.comparisons {
         text.push_str(&format!(
             "  {:<20} {:>11} / {:>11}\n",
@@ -362,16 +384,19 @@ pub fn render(report: &Report, fancy: bool, width: usize) -> String {
             money(row.estimated_rtk_usd_nanos)
         ));
     }
-    text.push_str(&format!(
-        "Public standard uncached rates · verified {}\n",
-        report
-            .catalog
-            .models
-            .first()
-            .map(|p| p.verified_at.as_str())
-            .unwrap_or("unknown")
-    ));
-    text.push_str("Estimates use local token counts; RTK is valued once at input rates.\nCloud comparisons exclude electricity/hardware and are not added together.\n");
+    for price in report
+        .catalog
+        .models
+        .iter()
+        .filter(|p| p.matches_model(&report.model))
+    {
+        text.push_str(&format!(
+            "{} standard uncached rates · verified {}\n",
+            price.provider.as_deref().unwrap_or("Public"),
+            price.verified_at
+        ));
+    }
+    text.push_str("Same-model estimates use local token counts; cloud quantization may differ.\nRTK is valued once at input rates, separately from inference.\nEstimates exclude electricity/hardware.\n");
     text
 }
 
@@ -400,10 +425,32 @@ mod tests {
         assert_eq!(money(Some(999_000_000)), "$1.00");
     }
     #[test]
-    fn catalog_has_official_sources_and_known_context_tier() {
+    fn catalog_has_same_model_prices_and_primary_sources() {
         let prices = catalog().unwrap();
-        assert_eq!(prices.models.len(), 3);
-        assert_eq!(prices.models[0].long_context_threshold, Some(272_000));
+        assert_eq!(prices.models.len(), 2);
+        for price in prices.models {
+            assert!(
+                price
+                    .source
+                    .starts_with("https://lyceum.technology/products/inference/models/qwen/")
+            );
+            assert_eq!(price.provider.as_deref(), Some("Lyceum"));
+            assert!(price.matches_model(&price.model));
+            assert!(!price.matches_model("gpt-6.1-sol"));
+            assert!(!price.matches_model("qwen3.6:35b-a3b"));
+        }
+    }
+
+    #[test]
+    fn cloud_equivalent_never_substitutes_another_model() {
+        let mut report = report();
+        report.calculate();
+        assert!(report.comparisons.is_empty());
+        report.model = "huggingface:RadixArk/Qwen3.8-Flash-Next-NVFP4@revision#artifact".into();
+        report.calculate();
+        assert_eq!(report.comparisons.len(), 1);
+        assert_eq!(report.comparisons[0].model, "qwen3.8-flash-next");
+        assert_eq!(report.comparisons[0].inference_usd_nanos, Some(54_402_200));
     }
 
     fn report() -> Report {
@@ -451,13 +498,21 @@ mod tests {
     #[test]
     fn costs_use_each_requests_context_tier_and_keep_rtk_separate() {
         let mut report = report();
+        let price = &mut report.catalog.models[0];
+        price.model = "local-model".into();
+        price.aliases.clear();
+        price.input_microusd_per_million = 2_000_000;
+        price.output_microusd_per_million = 10_000_000;
+        price.long_context_threshold = Some(272_000);
+        price.long_input_microusd_per_million = Some(4_000_000);
+        price.long_output_microusd_per_million = Some(15_000_000);
         report.calculate();
         assert_eq!(
             report.comparisons[0].inference_usd_nanos,
             Some(1_088_064_000)
         );
         assert_eq!(report.comparisons[0].estimated_rtk_usd_nanos, Some(150_000));
-        assert_eq!(report.comparisons[1].inference_usd_nanos, Some(816_063_000));
+        assert_eq!(report.comparisons.len(), 1);
         let usage = &mut report.inference.as_mut().unwrap().usage;
         usage.input_tokens = 272000;
         usage.long_context_input_tokens = 0;
@@ -484,14 +539,27 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut report = report();
         report.calculate();
+        report.comparisons.push(Comparison {
+            model: "unrelated-cloud-model".into(),
+            inference_usd_nanos: Some(1_000_000),
+            estimated_rtk_usd_nanos: Some(10),
+        });
         save(root.path(), &report).unwrap();
+        let path = directory(root.path(), "fixture").join(format!("{}.json", report.session_id));
+        let evidence = fs::read(&path).unwrap();
+        assert!(
+            load(root.path(), "fixture", None)
+                .unwrap()
+                .comparisons
+                .is_empty()
+        );
+        assert_eq!(fs::read(&path).unwrap(), evidence);
         assert_eq!(
             load(root.path(), "fixture", None).unwrap().session_id,
             report.session_id
         );
         assert!(load(root.path(), "other", Some(&report.session_id)).is_err());
         assert!(load(root.path(), "fixture", Some("../escape")).is_err());
-        let path = directory(root.path(), "fixture").join(format!("{}.json", report.session_id));
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(load(root.path(), "fixture", None).is_err());

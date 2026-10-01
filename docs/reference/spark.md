@@ -28,6 +28,8 @@ bounded, cursored, redacted, and protected by `logs:read`.
 ## Synopsis
 
 ```text
+sparkplane webui [--host <alias>] [--json]
+sparkplane webauthsvc start [--host <alias>] [--json]
 sparkplane <host> install --dry-run --json
 sparkplane <host> install --yes --release-manifest <SHA256SUMS> --release-signature <sig> --release-public-key <pub>
 sparkplane <host> upgrade --dry-run --json
@@ -48,6 +50,85 @@ sparkplane <host> client-config <name> --client <codex|claude-code>
 ```
 
 ## Description
+
+### Web panel
+
+The panel is served at `https://<spark>:9843/panel/`, using the existing TLS and
+allowed-client CIDR policy. Its pages cover overview, analytics, verified models,
+managed instances, operations, host health and administration. Access and controls
+inherit the selected CLI credential's scopes; `analytics:read` permits usage and
+health data. Administrator credentials can manage tokens, audit history,
+certificates and release-signed qualification jobs. Updates, rollback and
+certificate rotation remain CLI-assisted.
+
+Run `sparkplane webui` to start a temporary loopback authentication service and
+open the browser. Click **Authenticate**. Spark creates an HttpOnly browser
+session through a single-use, browser-bound handoff; the stored API token is
+never sent to browser JavaScript. The CLI exits and closes all local connections
+after Spark confirms login. Sessions expire after eight hours or 30 idle minutes;
+logout, token expiry and token revocation invalidate access.
+
+For a panel opened directly, run `sparkplane webauthsvc start` on the same
+computer as the browser. The page checks `127.0.0.1:9844` and displays Authenticate
+when the service appears. Some browsers require local-network permission. If
+detection is blocked, use **I started the local service**, then **Authenticate**.
+Both entrypoints use the single configured host automatically; use `--host`
+when multiple profiles exist. The helper expires after ten minutes; Ctrl-C stops
+it earlier. An occupied port produces an error instead of replacing a process.
+No sudo or password is required. The browser must trust the installed Spark TLS
+certificate; the helper continues to verify the CLI's existing pinned CA.
+
+The panel is enabled by default. Set `[webui] enabled = false` in the agent
+configuration to disable it. An optional `origin` restricts browser access to
+one exact HTTPS origin; otherwise certificate DNS/IP identities are accepted.
+Browser sessions cannot authorize inference endpoints. State-changing panel
+requests require the session's CSRF proof and matching origin.
+
+Panel operation lists use `GET /operations?view=summary` for bounded metadata
+without qualification result payloads. `GET /operations/<id>` retrieves the full
+result on demand; the existing unfiltered operation-list API retains its format.
+
+Analytics count reported inference tokens from ordinary API clients as well as
+launched sessions, including embeddings. Unknown and interrupted accounting stays
+explicit. Cloud-equivalent cost matches each actual model to the bundled
+public-price catalog's dated standard uncached tariff. Unpriced models make the
+total unavailable; filter to a priced model to inspect its estimate. Prices for
+GPT, Claude or Gemini are never substituted for a different local model.
+RTK compression estimates use authenticated,
+client-reported byte aggregates and are shown separately. They are not net
+ownership savings. No prompts, generated text, images or command output are
+stored in analytics.
+
+Request and session details are retained for 90 days, daily usage and RTK rollups
+for one year. Health samples are retained at five-second resolution for 24 hours,
+minute resolution for 30 days and hourly resolution for one year. History before
+this upgrade covers only retained launch sessions. GB10 dedicated VRAM figures
+may be unavailable; the panel displays host unified memory separately.
+GPU utilization, temperature and power use a fixed, time-limited query inside
+an existing exact managed engine. They are unavailable when no such engine or
+driver utility is present. The executor keeps its private devices and network.
+
+Panel tables use a separate verified migration ledger after a verified backup.
+The qualified engine state schema stays compatible with the preceding release.
+The new analytics permission is stored separately from legacy token scopes, so
+older releases can decode credentials without granting new permissions.
+
+Additional control API endpoints include `web-auth/approve`, `web-auth/flows/<id>`,
+`web-session`, `analytics`, `analytics/requests`, `analytics/sessions`, `audit`,
+`health`, `health/history`, `instances/<id>/recover` and
+`launch-sessions/<id>/compression`. Analytics use `days` (1–365), `limit` (1–200),
+`offset`, and optional `model`, `instance`, `token`, `integration`, `session`
+filters; `previous=true` selects the preceding equal period. Days use UTC calendar
+boundaries. Paginated results expose `items` and nullable `next_offset`.
+
+Recovery previews and then durably sequences stop and serve, retaining the
+qualified engine settings. It rejects catalog/settings differences before
+stopping. Every lifecycle action still passes the normal typed executor,
+resource admission, confinement and exact-container cleanup checks.
+If the agent restarts mid-recovery, the sequence is marked interrupted and its
+child lifecycle operations reconcile independently. Inspect those operations
+before retrying. In-flight usage from the previous agent is marked interrupted
+with unknown counts; it never remains pending indefinitely.
 
 `ls` is the everyday inventory of verified models available to run. Its default
 columns are `NAME`, `ID`, `SIZE`, and `MODIFIED`. `ps` is the active lifecycle
@@ -253,6 +334,18 @@ profile/catalog files. `-y` permits the fixed Claude or OpenCode installer when
 the executable is absent. Only arguments after `--` are forwarded, without a
 shell.
 
+Launch also registers its provider in the user-level Codex `config.toml`,
+preserving defaults, preferences and other providers. Provider definitions remain
+across model changes and `--restore` so saved threads can still resolve their
+provider IDs. User edits to a managed provider are preserved and reported as a
+conflict. Definitions contain an environment variable name, never a token.
+Resume through the launcher to initialize credentials, the pinned CA and image
+history handling:
+
+```sh
+sparkplane <host> launch codex -- resume [session-id]
+```
+
 State is serialized with a local lock. Metadata stores only the token ID; the
 bearer is held separately in a mode-0600 credential file. The child receives an
 inference-only token and pinned CA, never the administrator credential. Claude
@@ -312,6 +405,13 @@ observations. Codex launches compact the conversation at 75% of the qualified
 context window, preserving room for new tool results and compaction. Image
 retention remains active with `--eco-mode=none`; that switch controls RTK command
 compression. These bounds do not change engine context, sampling or resources.
+Codex checkpoint requests marked `request_kind=compaction` in
+`client_metadata.x-codex-turn-metadata`, without tools, use non-thinking generation
+on translated Responses routes. This returns a visible handoff summary instead
+of a reasoning-only response that Codex cannot compact. Ordinary coding requests
+retain their selected effort; native Responses routes retain their own behavior.
+Translation failures count as failed requests while retaining reported tokens,
+and streamed errors report the safe failure reason.
 Codex `view_image` results and other typed function/custom tool outputs preserve
 inline images as multimodal tool content, including resizing and the shared
 request image budget. Their base64 is never converted into prompt text. Regular
@@ -385,18 +485,21 @@ input/output tokens, duration, compressed command counts, estimated output
 reduction and two separate USD columns:
 
 - **Cloud equivalent:** known local inference tokens valued at published
-  standard uncached input/output rates for GPT-6.1 Sol, Claude Sonnet 4.6 and
-  Gemini 3.5 Flash. The GPT comparison applies its longer-context tier per
-  request above 272,000 input tokens.
+  standard uncached input/output rates for the same model in the cloud.
+  The catalog currently covers Lyceum's Qwen3.8 Flash Next and Qwen3.8 27B.
+  Exact, explicitly listed checkpoint aliases match their cloud model;
+  other models show unavailable until a verified tariff is added.
 - **Estimated RTK savings:** removed tool-output bytes divided by four,
   valued once at standard input rates. This estimate does not assume repeated
   context reuse and is unavailable when compression metrics are incomplete.
 
-These columns are not added together. Different tokenizers, prompt caching,
+These columns are not added together. Cloud quantization, tokenizers, prompt caching,
 hardware and electricity can change actual costs; these are comparisons, not
 bills or measured cash savings. The bundled price catalog records official
 source links, verification dates, rates and a version. Launch never fetches
 prices from the network; each report retains the catalog it used.
+Older retained reports keep their original tariff evidence, but unrelated-model
+comparisons are no longer displayed.
 
 `sparkplane <host> economics` displays the most recent report;
 `economics --session <id> --json` emits the structured report on stdout.

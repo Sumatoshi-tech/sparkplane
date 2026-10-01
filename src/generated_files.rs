@@ -167,6 +167,140 @@ pub fn publish(home: &Path, profile: &[u8], catalog: &[u8]) -> Result<()> {
     atomic(home, RECEIPT, &serde_json::to_vec(&committed)?)
 }
 
+/// Keep saved thread provider IDs available when Codex resumes without a profile.
+/// Only owned provider tables change; user defaults and other settings stay intact.
+pub fn publish_provider(home: &Path, profile: &[u8]) -> Result<()> {
+    const CONFIG: &str = "config.toml";
+    const LEDGER: &str = "sparkplane-providers.ownership.json";
+    const PROVIDER_SCHEMA: &str = "sparkplane.codex-providers/v1";
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Providers {
+        schema: String,
+        providers: BTreeMap<String, Vec<String>>,
+    }
+    fn valid_name(name: &str) -> bool {
+        name.starts_with("sparkplane_")
+            && name.len() <= 256
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    }
+    fn digest(value: &toml::Value) -> Result<String> {
+        Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
+    }
+    ensure!(
+        profile.len() as u64 <= MAX_BYTES,
+        "provider profile exceeds size limit"
+    );
+    let text = std::str::from_utf8(profile)?;
+    let incoming: toml::Value = toml::from_str(text)?;
+    let tables = incoming
+        .get("model_providers")
+        .and_then(toml::Value::as_table)
+        .context("profile has no provider definitions")?;
+    ensure!(
+        !tables.is_empty() && tables.len() <= 128,
+        "invalid provider count"
+    );
+    ensure!(
+        tables.iter().all(|(name, table)| valid_name(name)
+            && table
+                .as_table()
+                .is_some_and(|table| table.keys().all(|key| matches!(
+                    key.as_str(),
+                    "name"
+                        | "base_url"
+                        | "env_key"
+                        | "env_key_instructions"
+                        | "wire_api"
+                        | "supports_standalone_web_search"
+                        | "supports_websockets"
+                )))),
+        "invalid managed provider definition"
+    );
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(home)?;
+    let _lock = lock(home)?;
+    let mut pending: Providers = match read(home, LEDGER)? {
+        Some(bytes) => serde_json::from_slice(&bytes)?,
+        None => Providers {
+            schema: PROVIDER_SCHEMA.into(),
+            providers: BTreeMap::new(),
+        },
+    };
+    ensure!(
+        pending.schema == PROVIDER_SCHEMA
+            && pending.providers.len() <= 128
+            && pending
+                .providers
+                .iter()
+                .all(|(name, hashes)| valid_name(name)
+                    && !hashes.is_empty()
+                    && hashes.len() <= 2
+                    && hashes.iter().all(
+                        |hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                    )),
+        "invalid provider ownership receipt"
+    );
+    let original = read(home, CONFIG)?;
+    let config_text = std::str::from_utf8(original.as_deref().unwrap_or(b""))?;
+    let current: toml::Value = toml::from_str(config_text)?;
+    let mut document: toml_edit::DocumentMut = config_text.parse()?;
+    let additions: toml_edit::DocumentMut = text.parse()?;
+    if !document.contains_key("model_providers") {
+        document["model_providers"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    ensure!(
+        document["model_providers"].is_table(),
+        "model_providers must be a table"
+    );
+    let mut committed = Providers {
+        schema: PROVIDER_SCHEMA.into(),
+        providers: pending.providers.clone(),
+    };
+    for (name, value) in tables {
+        let hash = digest(value)?;
+        let mut hashes = vec![hash.clone()];
+        if let Some(old) = current.get("model_providers").and_then(|v| v.get(name)) {
+            let old_hash = digest(old)?;
+            ensure!(
+                old == value
+                    || pending
+                        .providers
+                        .get(name)
+                        .is_some_and(|owned| owned.contains(&old_hash)),
+                "refusing to overwrite user-edited Codex provider {name}"
+            );
+            if old_hash != hash {
+                hashes.push(old_hash);
+            }
+        }
+        pending.providers.insert(name.clone(), hashes);
+        committed.providers.insert(name.clone(), vec![hash]);
+        document["model_providers"][name] = additions["model_providers"][name].clone();
+    }
+    ensure!(
+        pending.providers.len() <= 128,
+        "provider registry exceeds size limit"
+    );
+    let output = document.to_string();
+    ensure!(
+        output.len() as u64 <= MAX_BYTES,
+        "Codex config exceeds size limit"
+    );
+    let _: toml::Value = toml::from_str(&output)?;
+    atomic(home, LEDGER, &serde_json::to_vec(&pending)?)?;
+    ensure!(
+        read(home, CONFIG)? == original,
+        "Codex config changed concurrently; retry launch"
+    );
+    if original.as_deref() != Some(output.as_bytes()) {
+        atomic(home, CONFIG, output.as_bytes())?;
+    }
+    atomic(home, LEDGER, &serde_json::to_vec(&committed)?)
+}
+
 pub fn remove(home: &Path) -> Result<()> {
     let _lock = lock(home)?;
     let receipt = receipt(home)?;

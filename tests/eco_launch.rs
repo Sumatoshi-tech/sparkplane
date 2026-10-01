@@ -160,7 +160,7 @@ fn economics_json_is_a_retained_offline_report() {
     assert_eq!(value["session_id"], report.session_id);
     assert_eq!(value["exit_code"], 7);
     assert!(value["inference"].is_null());
-    assert!(value["comparisons"][0]["inference_usd_nanos"].is_null());
+    assert_eq!(value["comparisons"], serde_json::json!([]));
 }
 
 #[test]

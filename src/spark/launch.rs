@@ -373,6 +373,18 @@ pub fn run(host: &str, config_dir: &Path, args: LaunchArgs) -> Result<(), Client
         comparisons: Vec::new(),
     };
     report.calculate();
+    if report
+        .inference
+        .as_ref()
+        .is_some_and(|session| session.finished_at.is_some())
+        && client
+            .upload_compression(&report.session_id, &report.compression)
+            .is_err()
+    {
+        eprintln!(
+            "Panel compression reporting unavailable; aggregate retained in local economics report."
+        );
+    }
     if super::economics::save(config_dir, &report).is_err() {
         eprintln!("Could not retain the private economics report.");
     }
@@ -723,7 +735,9 @@ fn configure_integration(
     let catalog_text = serde_json::to_vec_pretty(&catalog_value)
         .map_err(|_| failure(EXIT_INTERNAL, "could not encode Codex model catalog"))?;
     crate::generated_files::publish(&home, profile_text.as_bytes(), &catalog_text)
-        .map_err(|error| usage(format!("generated client files: {error:#}")))
+        .map_err(|error| usage(format!("generated client files: {error:#}")))?;
+    crate::generated_files::publish_provider(&home, profile_text.as_bytes())
+        .map_err(|error| usage(format!("Codex provider registration: {error:#}")))
 }
 
 fn codex_catalog(model: &ModelDocument, instance: &InstanceDocument) -> Value {

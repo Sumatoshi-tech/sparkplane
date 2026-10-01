@@ -263,6 +263,71 @@ impl Drop for SparkClient {
 }
 
 impl SparkClient {
+    pub fn configured_hosts(config_dir: &Path) -> Result<Vec<String>, ClientError> {
+        let profiles: Profiles = toml::from_str(&read_text(&config_dir.join("spark.toml"))?)
+            .map_err(|_| usage("invalid Spark host profiles"))?;
+        Ok(profiles.hosts.into_keys().collect())
+    }
+
+    pub fn base_url(&self) -> &Url {
+        &self.base
+    }
+
+    pub fn approve_web_login(
+        &self,
+        flow: &str,
+        intent: &str,
+    ) -> Result<serde_json::Value, ClientError> {
+        let url = self
+            .base
+            .join("api/sparkplane/v1/web-auth/approve")
+            .map_err(|_| usage("invalid web authentication route"))?;
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(5))
+            .json(&serde_json::json!({"flow":flow,"intent":intent}))
+            .send()
+            .map_err(|_| unreachable("web authentication unavailable"))?;
+        if !response.status().is_success() {
+            return Err(map_problem(response.status(), response.json().ok()));
+        }
+        decode_response(response)
+    }
+
+    pub fn web_login_complete(&self, flow: &str) -> Result<bool, ClientError> {
+        let result: serde_json::Value =
+            self.get_json(&format!("api/sparkplane/v1/web-auth/flows/{flow}"))?;
+        Ok(result["complete"].as_bool() == Some(true))
+    }
+    pub fn upload_compression(
+        &self,
+        id: &str,
+        report: &super::economics::Compression,
+    ) -> Result<(), ClientError> {
+        if id.parse::<ulid::Ulid>().is_err() {
+            return Err(usage("invalid session id"));
+        }
+        let response = self
+            .http
+            .post(
+                self.base
+                    .join(&format!(
+                        "api/sparkplane/v1/launch-sessions/{id}/compression"
+                    ))
+                    .map_err(|_| usage("invalid report route"))?,
+            )
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(5))
+            .json(report)
+            .send()
+            .map_err(|_| unreachable("compression report upload unavailable"))?;
+        if !response.status().is_success() {
+            return Err(map_problem(response.status(), response.json().ok()));
+        }
+        Ok(())
+    }
     pub fn create_launch_session(
         &self,
         request: &super::wire::LaunchSessionRequest,

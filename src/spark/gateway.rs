@@ -890,12 +890,18 @@ impl ResponsesEncoder {
     }
 
     pub fn fail(&mut self) {
+        self.fail_with_message("upstream stream failed");
+    }
+
+    pub fn fail_with_message(&mut self, message: &'static str) {
         let sequence = self.next_sequence();
-        self.pending.push_back(OpenAiStreamEvent { name: "response.failed",
+        self.pending.push_back(OpenAiStreamEvent {
+            name: "response.failed",
             data: serde_json::json!({"type":"response.failed","response":{
                 "id":self.id,"object":"response","status":"failed","model":self.model,
-                "output":self.output_items(),"error":{"code":"server_error","message":"upstream stream failed"}},
-                "sequence_number":sequence}) });
+                "output":self.output_items(),"error":{"code":"server_error","message":message}},
+                "sequence_number":sequence}),
+        });
     }
 
     pub fn final_document(&self) -> Value {
@@ -2267,17 +2273,26 @@ pub fn rewrite_responses_request_with_profile(
     }
     let max_tokens = response_max_tokens(object.get("max_output_tokens"))?;
     let tool_choice = response_tool_choice(object.get("tool_choice"))?;
-    let reasoning_effort = object
-        .get("reasoning")
-        .and_then(|reasoning| reasoning.get("effort"))
-        .and_then(Value::as_str)
-        .map(|effort| {
-            profile
-                .sampling
-                .reasoning_effort_map
-                .get(effort)
-                .map_or_else(|| effort.to_owned(), Clone::clone)
-        });
+    let reasoning_effort = if !profile.native_responses && codex_context_compaction(object, &tools)
+    {
+        // A summary request must return visible text for Codex's local compactor.
+        // Thinking-only summaries otherwise retry the same long history. Use
+        // the existing per-request non-thinking path; qualified instance settings
+        // and the reasoning effort of ordinary agent steps stay intact.
+        Some("none".to_owned())
+    } else {
+        object
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("effort"))
+            .and_then(Value::as_str)
+            .map(|effort| {
+                profile
+                    .sampling
+                    .reasoning_effort_map
+                    .get(effort)
+                    .map_or_else(|| effort.to_owned(), Clone::clone)
+            })
+    };
     let disable_thinking = reasoning_effort.as_deref() == Some("none");
     let stream = object
         .get("stream")
@@ -2330,6 +2345,22 @@ pub fn rewrite_responses_request_with_profile(
         custom_tools,
         omit_reasoning: false,
     })
+}
+
+fn codex_context_compaction(object: &serde_json::Map<String, Value>, tools: &[Value]) -> bool {
+    if !tools.is_empty() {
+        return false;
+    }
+    let Some(metadata) = object
+        .get("client_metadata")
+        .and_then(|metadata| metadata.get("x-codex-turn-metadata"))
+        .and_then(Value::as_str)
+        .filter(|metadata| metadata.len() <= 16 * 1024)
+    else {
+        return false;
+    };
+    serde_json::from_str::<Value>(metadata)
+        .is_ok_and(|metadata| metadata["request_kind"] == "compaction")
 }
 
 pub fn rewrite_native_responses_request_with_profile(
@@ -3189,6 +3220,60 @@ mod tests {
         let body: Value = serde_json::from_slice(&request.body).unwrap();
 
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+    }
+
+    #[test]
+    fn codex_compaction_requests_produce_visible_summaries_without_changing_coding_effort() {
+        let mut request = serde_json::json!({
+            "input":"checkpoint", "tools":[], "reasoning":{"effort":"xhigh"},
+            "client_metadata":{"x-codex-turn-metadata":"{\"request_kind\":\"compaction\"}"}
+        });
+        let rewrite = |request: &Value| {
+            let rewritten = rewrite_responses_request_with_profile(
+                &serde_json::to_vec(request).unwrap(),
+                "served-model",
+                &configured_sampling_profile(),
+            )
+            .unwrap();
+            serde_json::from_slice::<Value>(&rewritten.body).unwrap()
+        };
+        let summary = rewrite(&request);
+        assert_eq!(summary["reasoning_effort"], "none");
+        assert_eq!(summary["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(summary["temperature"], 0.6);
+        assert!(summary.get("thinking_token_budget").is_none());
+        assert!(summary.get("max_tokens").is_none());
+
+        for marker in ["{\"request_kind\":\"turn\"}", "invalid json", "{}"] {
+            request["client_metadata"]["x-codex-turn-metadata"] = marker.into();
+            let coding = rewrite(&request);
+            assert_eq!(coding["reasoning_effort"], "xhigh");
+            assert!(
+                coding["chat_template_kwargs"]
+                    .get("enable_thinking")
+                    .is_none()
+            );
+        }
+        request["client_metadata"]["x-codex-turn-metadata"] =
+            "{\"request_kind\":\"compaction\"}".into();
+        let mut native_profile = configured_sampling_profile();
+        native_profile.native_responses = true;
+        let native = rewrite_native_responses_request_with_profile(
+            &serde_json::to_vec(&request).unwrap(),
+            "served-model",
+            &native_profile,
+        )
+        .unwrap();
+        let native: Value = serde_json::from_slice(&native.body).unwrap();
+        assert_eq!(native["reasoning"]["effort"], "xhigh");
+        assert!(
+            native["chat_template_kwargs"]
+                .get("enable_thinking")
+                .is_none()
+        );
+        request["tools"] =
+            serde_json::json!([{"type":"function","name":"run","parameters":{"type":"object"}}]);
+        assert_eq!(rewrite(&request)["reasoning_effort"], "xhigh");
     }
 
     #[test]

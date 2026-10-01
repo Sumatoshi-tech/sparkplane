@@ -11,6 +11,7 @@ cargo build --locked --release
 ./target/release/sparkplane dgx-spark status --json
 ./target/release/sparkplane dgx-spark serve qwen3.8:flash-next --dry-run --json
 ./target/release/sparkplane dgx-spark launch codex
+./target/release/sparkplane webui
 ```
 
 Use the pinned Rust 1.95.0 toolchain (selected automatically by rustup), a
@@ -26,8 +27,9 @@ within a supported sandbox. See [launch permissions](docs/reference/spark.md#int
 
 Launches also default to `--eco-mode=max`, using RTK filters embedded in the
 Sparkplane executable. Use `--eco-mode=none` to disable compression. When the
-coding session exits, Sparkplane prints token usage and public cloud price
-comparisons; `sparkplane <host> economics --json` reads the latest retained report.
+coding session exits, Sparkplane prints token usage and the same model's public
+cloud-equivalent cost when a verified tariff exists; `sparkplane <host> economics
+--json` reads the latest retained report.
 See [session economics](docs/reference/spark.md#eco-mode-and-session-economics).
 
 Vision launches also retain recent images automatically and archive older
@@ -47,11 +49,22 @@ executor, database, gateway and bootstrap implementation. The owned
 `sparkplane-core` and `sparkplane-ipc` crates contain only platform vocabulary,
 trace propagation, notification and bounded IPC.
 
+The web panel uses shadcn/ui with a black and NVIDIA-green theme. Run
+`sparkplane webui` to open it and click **Authenticate**, using your existing
+CLI credential. The local authentication service stops after login. If you
+open `/panel/` directly, run `sparkplane webauthsvc start` on the browser's
+computer. See [web panel](docs/reference/spark.md#web-panel).
+
+Appliance builds additionally need Node.js 22.12+ and npm to compile the panel:
+run `make web-build` before invoking Cargo with `--features appliance`.
+Compiled assets are embedded in the signed binary; Spark needs no Node runtime.
+
 ```sh
 make lint
 make test
 make test-client
 make audit
+make web-test-browser # first: cd web && npx playwright install chromium
 cargo build --locked --release --features appliance
 ```
 

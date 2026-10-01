@@ -6,7 +6,8 @@ use tracing_subscriber::prelude::*;
 #[command(
     name = "sparkplane",
     version,
-    about = "Independent DGX Spark inference appliance"
+    about = "Independent DGX Spark inference appliance",
+    after_help = "Web panel:\n  sparkplane webui [--host ALIAS]\n  sparkplane webauthsvc start [--host ALIAS]"
 )]
 struct Cli {
     #[command(flatten)]
@@ -14,6 +15,18 @@ struct Cli {
 }
 
 fn main() {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|a| a == "webui" || a == "webauthsvc")
+    {
+        if let Err(error) =
+            sparkplane::spark::webauth::dispatch(sparkplane::spark::webauth::WebCli::parse())
+        {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if std::env::args_os().nth(1).is_some_and(|a| a == "__eco") {
         let code = match sparkplane::spark::eco::run(std::env::args_os().skip(2).collect()) {
             Ok(code) => code,

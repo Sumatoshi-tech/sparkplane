@@ -2333,11 +2333,6 @@ fn observed_from_inspect(
         return Err(());
     }
     let endpoint = networks.values().next().ok_or(())?;
-    let address = endpoint
-        .ip_address
-        .clone()
-        .filter(|value| !value.is_empty())
-        .ok_or(())?;
     let network_id = endpoint
         .network_id
         .clone()
@@ -2347,7 +2342,18 @@ fn observed_from_inspect(
         .state
         .as_ref()
         .and_then(|state| state.running)
-        .unwrap_or(false);
+        .ok_or(())?;
+    // Docker retains a stopped container's network membership, but drops its
+    // endpoint and process. Keep that exact generation observable for recovery.
+    let address = if running {
+        endpoint
+            .ip_address
+            .clone()
+            .filter(|value| !value.is_empty())
+            .ok_or(())?
+    } else {
+        String::new()
+    };
     let restart_policy = inspect
         .host_config
         .as_ref()
@@ -2355,14 +2361,19 @@ fn observed_from_inspect(
         .and_then(|policy| policy.name)
         .map(|name| name.to_string())
         .unwrap_or_else(|| "no".into());
-    let init_pid = inspect
-        .state
-        .as_ref()
-        .and_then(|state| state.pid)
-        .and_then(|pid| u32::try_from(pid).ok())
-        .filter(|pid| *pid > 0)
-        .ok_or(())?;
-    let (pid_start_time_ticks, cgroup_path) = process_identity(init_pid)?;
+    let (init_pid, pid_start_time_ticks, cgroup_path) = if running {
+        let init_pid = inspect
+            .state
+            .as_ref()
+            .and_then(|state| state.pid)
+            .and_then(|pid| u32::try_from(pid).ok())
+            .filter(|pid| *pid > 0)
+            .ok_or(())?;
+        let (start_time, cgroup) = process_identity(init_pid)?;
+        (init_pid, start_time, cgroup)
+    } else {
+        (0, 0, String::new())
+    };
     if inspect
         .network_settings
         .as_ref()
@@ -5029,6 +5040,65 @@ mod tests {
         };
 
         assert_eq!(inspect_managed_running(&inspect, &input), Ok(false));
+    }
+
+    #[test]
+    fn reboot_exited_container_without_endpoint_or_process_is_observable() {
+        let mut inspect = bollard::models::ContainerInspectResponse {
+            id: Some("a".repeat(64)),
+            config: Some(bollard::models::ContainerConfig {
+                labels: Some(std::collections::HashMap::from([
+                    (
+                        "io.sparkplane.instance".into(),
+                        format!("i_{}", "1".repeat(32)),
+                    ),
+                    ("io.sparkplane.generation".into(), "12".into()),
+                ])),
+                ..Default::default()
+            }),
+            state: Some(bollard::models::ContainerState {
+                running: Some(false),
+                pid: Some(0),
+                ..Default::default()
+            }),
+            network_settings: Some(bollard::models::NetworkSettings {
+                networks: Some(std::collections::HashMap::from([(
+                    "sparkplane-internal".into(),
+                    EndpointSettings {
+                        network_id: Some("network-id".into()),
+                        ip_address: Some(String::new()),
+                        ..Default::default()
+                    },
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let observed = observed_from_inspect(inspect.clone(), 8000).unwrap();
+        assert!(!observed.running);
+        assert_eq!(observed.generation, 12);
+        assert!(observed.address.is_empty());
+        assert_eq!((observed.init_pid, observed.pid_start_time_ticks), (0, 0));
+        assert!(observed.cgroup_path.is_empty());
+
+        inspect.state.as_mut().unwrap().running = None;
+        assert!(observed_from_inspect(inspect.clone(), 8000).is_err());
+
+        // A live engine still needs its endpoint and exact process identity.
+        inspect.state.as_mut().unwrap().running = Some(true);
+        assert!(observed_from_inspect(inspect.clone(), 8000).is_err());
+        inspect
+            .network_settings
+            .as_mut()
+            .unwrap()
+            .networks
+            .as_mut()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap()
+            .ip_address = Some("172.30.0.2".into());
+        assert!(observed_from_inspect(inspect, 8000).is_err());
     }
 
     fn managed_event(action: &str) -> EventMessage {

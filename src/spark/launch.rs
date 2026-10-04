@@ -6,6 +6,8 @@ use std::{
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -139,13 +141,13 @@ pub fn run(host: &str, config_dir: &Path, args: LaunchArgs) -> Result<(), Client
     let instances = client.instances()?;
     let (model, selected_name) =
         resolve_launch_model(&models.models, &instances.instances, &model_reference)?;
+    let saved_name = if selected_name.is_some() {
+        None
+    } else {
+        saved.as_ref().map(|value| value.instance.as_str())
+    };
     let owned_name = selected_name.unwrap_or_else(|| launch_instance_name(&model));
-    let mut instance = resolve_instance(
-        &instances.instances,
-        &model,
-        saved.as_ref().map(|value| value.instance.as_str()),
-        &owned_name,
-    )?;
+    let mut instance = resolve_instance(&instances.instances, &model, saved_name, &owned_name)?;
     let reused_instance = instance.is_some();
 
     if args.dry_run {
@@ -165,6 +167,11 @@ pub fn run(host: &str, config_dir: &Path, args: LaunchArgs) -> Result<(), Client
                 ));
             }
         }
+        let action = match instance.as_ref() {
+            Some(value) if !value.healthy => "wait",
+            Some(_) => "reuse",
+            None => "serve",
+        };
         return render_plan(
             &LaunchPlan {
                 schema: LAUNCH_PLAN_SCHEMA,
@@ -179,7 +186,7 @@ pub fn run(host: &str, config_dir: &Path, args: LaunchArgs) -> Result<(), Client
                     .unwrap_or(owned_name),
                 endpoint: instance.and_then(|value| value.endpoint),
                 reused_instance,
-                action: if reused_instance { "reuse" } else { "serve" },
+                action,
                 token_id: None,
                 extra_argument_count: args.extra_args.len(),
                 allow_network: args.allow_network,
@@ -200,7 +207,7 @@ pub fn run(host: &str, config_dir: &Path, args: LaunchArgs) -> Result<(), Client
                 dry_run: false,
             },
         )?;
-        client.follow_operation(&operation.id, 0)?;
+        client.follow_operation_with_timeout(&operation.id, 0, launch_readiness_timeout())?;
         instance = Some(
             client
                 .instances()?
@@ -226,6 +233,12 @@ pub fn run(host: &str, config_dir: &Path, args: LaunchArgs) -> Result<(), Client
             "Spark launch instance resolution ended without an instance",
         )
     })?;
+    let instance = if instance.healthy && instance.endpoint.is_some() {
+        instance
+    } else {
+        eprintln!("Waiting for Spark instance {} to recover…", instance.name);
+        wait_for_ready_instance(&client, &instance, launch_readiness_timeout())?
+    };
     let (token_id, token) = ensure_inference_token(&client, host, config_dir, &mut state)?;
     configure_integration(args.integration, config_dir, host, &instance, &model)?;
 
@@ -569,21 +582,41 @@ fn resolve_instance(
     saved_name: Option<&str>,
     owned_name: &str,
 ) -> Result<Option<InstanceDocument>, ClientError> {
-    let healthy = instances
+    let available = instances
         .iter()
-        .filter(|value| value.model_id == model.id && value.healthy && value.endpoint.is_some())
+        .filter(|value| {
+            value.model_id == model.id
+                && value.desired == super::wire::InstanceDesiredState::Running
+                && !value.restart_suppressed
+                && value.quarantine.is_none()
+        })
         .cloned()
         .collect::<Vec<_>>();
     if let Some(saved) = saved_name
-        && let Some(instance) = healthy.iter().find(|value| value.name == saved)
+        && let Some(instance) = available.iter().find(|value| value.name == saved)
     {
         return Ok(Some(instance.clone()));
     }
-    if let Some(instance) = healthy.iter().find(|value| value.name == owned_name) {
+    if let Some(instance) = available.iter().find(|value| value.name == owned_name) {
         return Ok(Some(instance.clone()));
     }
+    let healthy = available
+        .iter()
+        .filter(|value| value.healthy && value.endpoint.is_some())
+        .cloned()
+        .collect::<Vec<_>>();
     match healthy.as_slice() {
-        [] => Ok(None),
+        [] => match available.as_slice() {
+            [] => Ok(None),
+            [instance] => Ok(Some(instance.clone())),
+            many => Err(usage(format!(
+                "multiple recovering Spark instances serve the requested model: {}; select an instance with --model <instance-name>",
+                many.iter()
+                    .map(|value| value.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        },
         [instance] => Ok(Some(instance.clone())),
         many => Err(usage(format!(
             "multiple healthy Spark instances serve the requested model: {}",
@@ -592,6 +625,63 @@ fn resolve_instance(
                 .collect::<Vec<_>>()
                 .join(", ")
         ))),
+    }
+}
+
+fn launch_readiness_timeout() -> Duration {
+    Duration::from_secs(super::MAX_ENGINE_STARTUP_DEADLINE_SECONDS + 60)
+}
+
+pub(crate) fn wait_for_ready_instance(
+    client: &SparkClient,
+    selected: &InstanceDocument,
+    timeout: Duration,
+) -> Result<InstanceDocument, ClientError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let current = client
+            .instances()?
+            .instances
+            .into_iter()
+            .find(|value| value.id == selected.id)
+            .ok_or_else(|| {
+                failure(
+                    EXIT_REJECTED,
+                    "selected Spark instance disappeared during recovery",
+                )
+            })?;
+        if current.generation != selected.generation || current.model_id != selected.model_id {
+            return Err(failure(
+                EXIT_REJECTED,
+                "selected Spark instance changed generation during recovery; retry launch",
+            ));
+        }
+        if current.desired != super::wire::InstanceDesiredState::Running
+            || current.restart_suppressed
+            || current.quarantine.is_some()
+        {
+            return Err(failure(
+                EXIT_REJECTED,
+                format!(
+                    "Spark instance {} cannot recover; inspect its state with `sparkplane <host> ps --json`",
+                    selected.name
+                ),
+            ));
+        }
+        if current.healthy && current.endpoint.is_some() {
+            return Ok(current);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(failure(
+                EXIT_REJECTED,
+                format!(
+                    "Spark instance {} is still recovering; inspect its state with `sparkplane <host> ps --json`",
+                    selected.name
+                ),
+            ));
+        }
+        thread::sleep(remaining.min(Duration::from_secs(1)));
     }
 }
 
@@ -1749,6 +1839,44 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(actual.name, "saved");
+    }
+
+    #[test]
+    fn reboot_recovering_instance_is_selected_instead_of_a_second_model_copy() {
+        let model = model("m_one", "qwen3.8:flash-next");
+        let mut recovering = instance("qwen38-vllm", &model.id);
+        recovering.healthy = false;
+        recovering.endpoint = None;
+        recovering.observed = InstanceObservedState::Degraded;
+        let instances = [recovering.clone()];
+        let actual = resolve_instance(&instances, &model, None, &launch_instance_name(&model))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (actual.name, actual.generation),
+            (recovering.name, recovering.generation)
+        );
+    }
+
+    #[test]
+    fn stopped_or_suppressed_instances_are_not_waited_on_by_launch() {
+        let model = model("m_one", "qwen3.8:flash-next");
+        let mut unavailable = instance("qwen38-vllm", &model.id);
+        unavailable.healthy = false;
+        unavailable.endpoint = None;
+        unavailable.desired = InstanceDesiredState::Stopped;
+        assert!(
+            resolve_instance(std::slice::from_ref(&unavailable), &model, None, "owned")
+                .unwrap()
+                .is_none()
+        );
+        unavailable.desired = InstanceDesiredState::Running;
+        unavailable.restart_suppressed = true;
+        assert!(
+            resolve_instance(&[unavailable], &model, None, "owned")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

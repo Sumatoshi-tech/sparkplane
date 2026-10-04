@@ -664,9 +664,18 @@ impl SparkClient {
         id: &str,
         last_event_id: u64,
     ) -> Result<OperationDocument, ClientError> {
+        self.follow_operation_with_timeout(id, last_event_id, self.request_timeout)
+    }
+
+    pub(crate) fn follow_operation_with_timeout(
+        &self,
+        id: &str,
+        last_event_id: u64,
+        timeout: Duration,
+    ) -> Result<OperationDocument, ClientError> {
         validate_id(id)?;
         let deadline = Instant::now()
-            .checked_add(self.request_timeout)
+            .checked_add(timeout)
             .ok_or_else(|| usage("Spark request timeout is too large"))?;
         let route = format!("api/sparkplane/v1/operations/{id}/events");
         let url = self

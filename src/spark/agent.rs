@@ -2722,8 +2722,9 @@ async fn reconcile_once(
         if action == ReconcileAction::KeepSuppressed {
             continue;
         }
-        if let Some(observed) = observed {
-            reconcile_running_engine(database, executor, routes, &instance, observed).await?;
+        if let Some(observed) = observed.as_ref().filter(|engine| engine.running) {
+            reconcile_running_engine(database, executor, routes, &instance, observed.clone())
+                .await?;
             complete_recovered_operation(
                 database,
                 &operations,
@@ -2741,6 +2742,19 @@ async fn reconcile_once(
         // Only an admitted restart attempt consumes the engine failure budget.
         if !persistent_restart_allowed(database, executor).await? {
             continue;
+        }
+        if observed.is_some() {
+            // The scan already verified the complete catalog and container
+            // identity. Remove only this exited generation, under the lease,
+            // before recreating it with its original engine and artifacts.
+            executor
+                .stop_instance(StopInstanceInput {
+                    instance_id: instance.id.clone(),
+                    generation: instance.generation,
+                    grace_seconds: 0,
+                })
+                .await
+                .map_err(|_| ())?;
         }
         let failed = database
             .record_restart_failure(&instance.id, instance.generation, unix_millis() / 1_000)
@@ -7461,6 +7475,42 @@ mod tests {
         }
     }
 
+    struct ExitedReconcileExecutor {
+        recovery: CountingReconcileExecutor,
+        stops: Arc<AtomicUsize>,
+        swap_in_pages_delta: Option<u64>,
+    }
+
+    impl sparkplane_ipc::Handler for ExitedReconcileExecutor {
+        async fn handle(&self, request: sparkplane_ipc::Request) -> sparkplane_ipc::Response {
+            let action = &request.params["action"];
+            if action.get("reconcile_scan").is_some() {
+                return MatchedReconcileExecutor {
+                    mutations: Arc::clone(&self.stops),
+                }
+                .handle(request)
+                .await;
+            }
+            if action.get("stop_instance").is_some() {
+                self.stops.fetch_add(1, Ordering::SeqCst);
+                return sparkplane_ipc::Response::Ok {
+                    schema_version: sparkplane_ipc::SCHEMA_VERSION,
+                    request_id: request.request_id,
+                    result: serde_json::json!({"action":"stop_instance"}),
+                    blob: None,
+                };
+            }
+            let mut response = self.recovery.handle(request).await;
+            if let sparkplane_ipc::Response::Ok { result, .. } = &mut response
+                && result["action"] == "inspect_resources"
+            {
+                result["snapshot"]["swap_in_pages_delta"] =
+                    serde_json::json!(self.swap_in_pages_delta);
+            }
+            response
+        }
+    }
+
     struct MatchedReconcileExecutor {
         mutations: Arc<AtomicUsize>,
     }
@@ -7602,13 +7652,13 @@ mod tests {
                 serde_json::json!({"action":"reconcile_scan","scan":{
                     "matched":[{
                         "instance_id":identity["instance_id"],"generation":identity["generation"],
-                        "container_id":"container-g7","network_id":"network","address":"172.30.0.2","port":8000,
+                        "container_id":"container-g7","network_id":"network","address":"","port":8000,
                         "running":false,"restart_policy":"no","health_method":"GET","health_path":"/health",
                         "allowed_routes":[["GET","/health"],["GET","/v1/models"],["POST","/v1/completions"]],
                         "gateway_profile":crate::spark::gateway::GatewayProfile::text(),
                         "served_model":"Ornith-1.5-9B","semantic_prompt":"Generate one completion token.",
-                        "semantic_max_tokens":1,"startup_deadline_seconds":900,"init_pid":1,
-                        "pid_start_time_ticks":1,"cgroup_path":"/system.slice/docker-container-g7.scope"
+                        "semantic_max_tokens":1,"startup_deadline_seconds":900,"init_pid":0,
+                        "pid_start_time_ticks":0,"cgroup_path":""
                     }],"missing":[],"quarantined":[]}})
             } else {
                 if action.get("disable_restart_policy").is_some()
@@ -7864,6 +7914,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn launch_waits_for_exact_reboot_generation_over_pinned_https() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+        let (state, database, root) = durable_state().await;
+        let model = ornith_model();
+        database.promote_model(model.clone(), false).await.unwrap();
+        let selected = database
+            .begin_serve(creating_instance(&model))
+            .await
+            .unwrap()
+            .instance;
+        state
+            .routes
+            .mark_warming(&selected.name, selected.generation);
+        let routes = state.routes.clone();
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certificate = cert.pem();
+        let tls = super::tls13_config(
+            certificate.as_bytes().to_vec(),
+            signing_key.serialize_pem().into_bytes(),
+        )
+        .await
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = axum_server::Handle::new();
+        let server_handle = handle.clone();
+        let server = tokio::spawn(async move {
+            axum_server::from_tcp_rustls(listener, tls)
+                .unwrap()
+                .handle(server_handle)
+                .serve(router(state).into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .unwrap();
+        });
+        let config = root.join("launch-client");
+        std::fs::create_dir_all(config.join("spark")).unwrap();
+        std::fs::create_dir_all(config.join("credentials/spark")).unwrap();
+        std::fs::write(config.join("spark/fixture.ca.pem"), &certificate).unwrap();
+        let pin = format!("sha256:{:x}", Sha256::digest(certificate.as_bytes()));
+        std::fs::write(config.join("spark.toml"), format!(
+            "[hosts.fixture]\nurl='https://localhost:{}'\nca_cert_sha256='{pin}'\ncredential='spark/fixture'\nrequest_timeout_seconds=2\n",
+            address.port())).unwrap();
+        std::fs::write(config.join("credentials/spark/fixture"), TOKEN).unwrap();
+        std::fs::set_permissions(
+            config.join("credentials/spark/fixture"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let client_config = config.clone();
+        let instance = selected.clone();
+        let waiter = tokio::task::spawn_blocking(move || {
+            let client =
+                crate::spark::client::SparkClient::load(&client_config, "fixture").unwrap();
+            crate::spark::launch::wait_for_ready_instance(
+                &client,
+                &instance,
+                Duration::from_secs(5),
+            )
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiter.is_finished());
+        database
+            .set_instance_observed(
+                &selected.id,
+                selected.generation,
+                crate::spark::wire::InstanceObservedState::Healthy,
+                Some("/openai/ornith/v1".into()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let route = crate::spark::upstream::ObservedRoute::new(
+            &selected.id,
+            selected.generation,
+            "127.0.0.1".parse().unwrap(),
+            9,
+            [("GET", "/health")],
+        )
+        .unwrap();
+        routes.publish(
+            &selected.name,
+            selected.model.clone(),
+            "served-model".into(),
+            route,
+        );
+        let ready = waiter.await.unwrap().unwrap();
+        assert_eq!(
+            (ready.id, ready.generation),
+            (selected.id.clone(), selected.generation)
+        );
+        assert!(ready.healthy && ready.endpoint.is_some());
+        assert_eq!(database.list_instances().await.unwrap().len(), 1);
+
+        // A different generation must never satisfy an in-flight launch wait.
+        database.begin_stop(&selected.id).await.unwrap();
+        let replacement = database
+            .begin_serve(creating_instance(&model))
+            .await
+            .unwrap()
+            .instance;
+        let changed_config = config.clone();
+        let changed = tokio::task::spawn_blocking(move || {
+            let client =
+                crate::spark::client::SparkClient::load(&changed_config, "fixture").unwrap();
+            crate::spark::launch::wait_for_ready_instance(
+                &client,
+                &selected,
+                Duration::from_secs(5),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(changed.message.contains("changed generation"));
+        let timeout_config = config.clone();
+        let waiting = replacement.clone();
+        let expired = tokio::task::spawn_blocking(move || {
+            let client =
+                crate::spark::client::SparkClient::load(&timeout_config, "fixture").unwrap();
+            crate::spark::launch::wait_for_ready_instance(&client, &waiting, Duration::ZERO)
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(expired.message.contains("still recovering"));
+        database.begin_stop(&replacement.id).await.unwrap();
+        let stopped = tokio::task::spawn_blocking(move || {
+            let client = crate::spark::client::SparkClient::load(&config, "fixture").unwrap();
+            crate::spark::launch::wait_for_ready_instance(
+                &client,
+                &replacement,
+                Duration::from_secs(5),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(stopped.message.contains("cannot recover"));
+        handle.graceful_shutdown(None);
+        server.await.unwrap();
+        database.shutdown().unwrap();
+    }
+
+    #[tokio::test]
     async fn deferred_reconciliation_keeps_admission_closed_without_consuming_restart_budget() {
         for (matched, swap_in_pages_delta, guard_heartbeat) in [
             (true, None, true),
@@ -8018,6 +8216,88 @@ mod tests {
         );
         database.shutdown().unwrap();
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn reboot_exited_generation_is_recreated_through_exact_typed_ipc() {
+        for swap_in_pages_delta in [None, Some(1), Some(0)] {
+            let (state, database, root) = durable_state().await;
+            let socket = root.join("executor.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let prepares = Arc::new(AtomicUsize::new(0));
+            let stops = Arc::new(AtomicUsize::new(0));
+            let prepared = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let server = tokio::spawn(
+                sparkplane_ipc::Server::new(ExitedReconcileExecutor {
+                    recovery: CountingReconcileExecutor {
+                        scans: Arc::new(AtomicUsize::new(0)),
+                        prepares: Arc::clone(&prepares),
+                        prepared: Arc::clone(&prepared),
+                    },
+                    stops: Arc::clone(&stops),
+                    swap_in_pages_delta,
+                })
+                .serve(listener),
+            );
+            let model = ornith_model();
+            database.promote_model(model.clone(), false).await.unwrap();
+            database
+                .accept_operation(
+                    "bootstrap",
+                    "instance.serve",
+                    "01K00000000000000000000000",
+                    &"a".repeat(64),
+                    Some("ornith".into()),
+                )
+                .await
+                .unwrap();
+            let instance = database
+                .begin_serve(creating_instance(&model))
+                .await
+                .unwrap()
+                .instance;
+            let executor = crate::spark::executor::ExecutorClient::new(socket);
+            super::reconcile_once(&database, &executor, Some(&state.routes), &state.admission)
+                .await
+                .unwrap();
+            if swap_in_pages_delta != Some(0) {
+                assert_eq!(stops.load(Ordering::SeqCst), 0);
+                assert_eq!(prepares.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    database
+                        .instance(&instance.id)
+                        .await
+                        .unwrap()
+                        .restart_failures,
+                    0
+                );
+                database.shutdown().unwrap();
+                server.abort();
+                continue;
+            }
+            assert_eq!(stops.load(Ordering::SeqCst), 1);
+            assert_eq!(prepares.load(Ordering::SeqCst), 1);
+            let prepared = prepared.lock().unwrap().clone();
+            assert_eq!(prepared[0]["instance_id"], instance.id);
+            assert_eq!(prepared[0]["generation"], instance.generation);
+            assert_eq!(
+                prepared[0]["engine_fingerprint"],
+                instance.engine_fingerprint
+            );
+            assert_eq!(
+                prepared[0]["artifact_fingerprint"],
+                instance.artifact_fingerprint
+            );
+            let current = database.instance(&instance.id).await.unwrap();
+            assert_eq!(current.context_window, instance.context_window);
+            assert!(!current.healthy);
+            assert!(!matches!(
+                state.routes.lookup(&instance.name),
+                crate::spark::gateway::RouteLookup::Healthy(_)
+            ));
+            database.shutdown().unwrap();
+            server.abort();
+        }
     }
 
     #[tokio::test]

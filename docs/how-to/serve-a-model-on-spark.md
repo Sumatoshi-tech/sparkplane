@@ -98,6 +98,13 @@ healthy, and confirm the OpenAI-compatible gateway path answers.
    so its existing tool permissions are left alone. See
    [network controls and limitations](../reference/spark.md#internet-access-for-development).
 
+   After a host reboot, launch waits for an existing running-intent instance
+   to recover instead of starting another copy of the model. `--dry-run --json`
+   reports `action: "wait"` while recovery is in progress. The wait is bounded
+   by the maximum engine startup deadline plus 60 seconds. Check `ps --json`
+   if recovery fails or is suppressed; explicitly select an instance with
+   `--model <instance-name>` when several instances of the model are recovering.
+
 7. Stop when you are done. An already-absent instance is an idempotent success:
 
    ```bash

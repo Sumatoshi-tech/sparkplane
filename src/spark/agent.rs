@@ -1665,101 +1665,178 @@ async fn gateway_responses_stream(
         Ok(upstream) => upstream,
         Err(error) => return gateway_generation_error(error),
     };
-    let encoder = gateway::ResponsesEncoder::new(route.public_model.clone(), request.custom_tools);
-    if request.stream {
-        responses_sse(upstream, encoder, permit, token_permit)
+    let stream = request.stream;
+    let generation = ResponsesGeneration::new(route, request, upstream);
+    if stream {
+        responses_sse(generation, permit, token_permit)
     } else {
-        responses_json(upstream, encoder, permit, token_permit).await
+        responses_json(generation, permit, token_permit).await
+    }
+}
+
+struct ResponsesGeneration {
+    route: Arc<gateway::HealthyRoute>,
+    upstream: Option<super::upstream::CompletionStream>,
+    observer: Option<Arc<dyn super::upstream::UsageObserver>>,
+    original_body: Vec<u8>,
+    encoder: gateway::ResponsesEncoder,
+    prior_usage: (u64, u64),
+    attempt_usage: Option<(u64, u64)>,
+    recovered: bool,
+    terminal: bool,
+    succeeded: bool,
+}
+
+impl ResponsesGeneration {
+    fn new(
+        route: Arc<gateway::HealthyRoute>,
+        request: gateway::GenerationRequest,
+        mut upstream: super::upstream::CompletionStream,
+    ) -> Self {
+        let observer = upstream.take_usage_observer();
+        let encoder =
+            gateway::ResponsesEncoder::new(route.public_model.clone(), request.custom_tools);
+        Self {
+            route,
+            upstream: Some(upstream),
+            observer,
+            original_body: request.body,
+            encoder,
+            prior_usage: (0, 0),
+            attempt_usage: None,
+            recovered: false,
+            terminal: false,
+            succeeded: false,
+        }
+    }
+
+    fn fail(&mut self, message: &'static str) {
+        if let Some(observer) = &self.observer {
+            observer.response_failed();
+        }
+        tracing::warn!(
+            event_code = "spark.inference.response-invalid",
+            reason = message
+        );
+        self.encoder.fail_with_message(message);
+        self.terminal = true;
+        self.upstream.take();
+    }
+
+    async fn next(&mut self) -> Option<gateway::OpenAiStreamEvent> {
+        loop {
+            if let Some(event) = self.encoder.pop() {
+                return Some(event);
+            }
+            if self.terminal {
+                return None;
+            }
+            let event = match self.upstream.as_mut()?.next().await {
+                Some(Ok(event)) => event,
+                _ => {
+                    if let Some(observer) = &self.observer {
+                        observer.incomplete();
+                    }
+                    self.fail("upstream stream failed");
+                    continue;
+                }
+            };
+            if matches!(event, GenerationEvent::Done)
+                && !self.recovered
+                && let Some(body) = self
+                    .encoder
+                    .reasoning_only_recovery_request(&self.original_body)
+            {
+                self.recovered = true;
+                self.prior_usage = self.attempt_usage.unwrap_or_default();
+                self.attempt_usage = None;
+                // Release the old connection before opening the continuation.
+                // Dropping this response also cancels whichever stream is live.
+                self.upstream.take();
+                tracing::warn!(event_code = "spark.inference.reasoning-only-recovery");
+                match self
+                    .route
+                    .upstream
+                    .chat_stream_with_idle_timeout(&body, self.route.profile.stream_idle_timeout())
+                    .await
+                {
+                    Ok(mut upstream) => {
+                        upstream.take_usage_observer();
+                        self.upstream = Some(upstream);
+                    }
+                    Err(_) => self.fail("upstream generation produced no actionable output"),
+                }
+                continue;
+            }
+            if self.recovered
+                && matches!(event, GenerationEvent::Done)
+                && self.attempt_usage.is_none()
+            {
+                self.fail("upstream recovery usage is missing");
+                continue;
+            }
+            let event = match event {
+                GenerationEvent::Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                } => {
+                    self.attempt_usage = Some((prompt_tokens, completion_tokens));
+                    GenerationEvent::Usage {
+                        prompt_tokens: self.prior_usage.0.saturating_add(prompt_tokens),
+                        completion_tokens: self.prior_usage.1.saturating_add(completion_tokens),
+                    }
+                }
+                event => event,
+            };
+            let done = matches!(event, GenerationEvent::Done);
+            // Only the validated public terminal marks this logical request
+            // successful. Usage counts include the input and output of both passes.
+            if !done && let Some(observer) = &self.observer {
+                observer.observe(&event);
+            }
+            if let Err(error) = self.encoder.accept(event) {
+                self.fail(error.message);
+            } else if done {
+                if let Some(observer) = &self.observer {
+                    observer.observe(&GenerationEvent::Done);
+                }
+                self.terminal = true;
+                self.succeeded = true;
+                self.upstream.take();
+            }
+        }
     }
 }
 
 async fn responses_json(
-    mut upstream: super::upstream::CompletionStream,
-    mut encoder: gateway::ResponsesEncoder,
+    mut generation: ResponsesGeneration,
     _permit: tokio::sync::OwnedSemaphorePermit,
     _token_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
-    let mut done = false;
-    while let Some(event) = upstream.next().await {
-        match event {
-            Ok(GenerationEvent::Done) => {
-                if let Err(error) = encoder.accept(GenerationEvent::Done) {
-                    upstream.response_failed();
-                    tracing::warn!(
-                        event_code = "spark.inference.response-invalid",
-                        reason = error.message
-                    );
-                    return gateway_upstream_unavailable();
-                }
-                done = true;
-                break;
-            }
-            Ok(event) => {
-                if let Err(error) = encoder.accept(event) {
-                    upstream.response_failed();
-                    tracing::warn!(
-                        event_code = "spark.inference.response-invalid",
-                        reason = error.message
-                    );
-                    return gateway_upstream_unavailable();
-                }
-            }
-            _ => {
-                upstream.response_failed();
-                return gateway_upstream_unavailable();
-            }
-        }
-    }
-    if done {
-        Json(encoder.final_document()).into_response()
+    while generation.next().await.is_some() {}
+    if generation.succeeded {
+        Json(generation.encoder.final_document()).into_response()
     } else {
-        upstream.response_failed();
         gateway_upstream_unavailable()
     }
 }
 
 fn responses_sse(
-    upstream: super::upstream::CompletionStream,
-    encoder: gateway::ResponsesEncoder,
+    generation: ResponsesGeneration,
     permit: tokio::sync::OwnedSemaphorePermit,
     token_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let stream = futures_util::stream::unfold(
-        (upstream, encoder, permit, token_permit, false),
-        |(mut upstream, mut encoder, permit, token_permit, mut terminal)| async move {
-            loop {
-                if let Some(event) = encoder.pop() {
-                    let frame = Event::default()
-                        .event(event.name)
-                        .data(event.data.to_string());
-                    return Some((
-                        Ok::<_, std::convert::Infallible>(frame),
-                        (upstream, encoder, permit, token_permit, terminal),
-                    ));
-                }
-                if terminal {
-                    return None;
-                }
-                match upstream.next().await {
-                    Some(Ok(event)) => {
-                        terminal = matches!(event, GenerationEvent::Done);
-                        if let Err(error) = encoder.accept(event) {
-                            upstream.response_failed();
-                            tracing::warn!(
-                                event_code = "spark.inference.response-invalid",
-                                reason = error.message
-                            );
-                            encoder.fail_with_message(error.message);
-                            terminal = true;
-                        }
-                    }
-                    _ => {
-                        upstream.response_failed();
-                        encoder.fail();
-                        terminal = true;
-                    }
-                }
-            }
+        (generation, permit, token_permit),
+        |(mut generation, permit, token_permit)| async move {
+            let event = generation.next().await?;
+            let frame = Event::default()
+                .event(event.name)
+                .data(event.data.to_string());
+            Some((
+                Ok::<_, std::convert::Infallible>(frame),
+                (generation, permit, token_permit),
+            ))
         },
     );
     Sse::new(stream).into_response()
@@ -5862,6 +5939,259 @@ mod tests {
 
     async fn llama_chat_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         llama_chat_server_with(llama_chat_sse()).await
+    }
+
+    async fn chat_sequence_server(
+        responses: Vec<String>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<Vec<serde_json::Value>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for body in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let (start, length) = loop {
+                    let mut buffer = [0; 4096];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(count, 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]);
+                        assert!(headers.starts_with("POST /v1/chat/completions "));
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        break (end + 4, length);
+                    }
+                };
+                while bytes.len() < start + length {
+                    let mut buffer = [0; 4096];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(count, 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                requests.push(serde_json::from_slice(&bytes[start..start + length]).unwrap());
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await.unwrap();
+                for chunk in body.as_bytes().chunks(17) {
+                    socket.write_all(chunk).await.unwrap();
+                }
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "recovery attempted an additional generation"
+            );
+            requests
+        });
+        (address, task)
+    }
+
+    #[tokio::test]
+    async fn responses_recovery_preserves_history_tools_and_accounts_both_attempts() {
+        use crate::spark::upstream::ObservedRoute;
+        use axum::http::StatusCode;
+        for stream in [false, true] {
+            for succeeds in [false, true] {
+                let second = if succeeds {
+                    llama_chat_sse()
+                } else {
+                    reasoning_only_chat_sse()
+                };
+                let (address, server) =
+                    chat_sequence_server(vec![reasoning_only_chat_sse(), second]).await;
+                let state = AgentState::new(TOKEN, Vec::new(), Vec::new());
+                let upstream = ObservedRoute::new(
+                    "i_11111111111111111111111111111111",
+                    1,
+                    address.ip(),
+                    address.port(),
+                    [("POST", "/v1/chat/completions")],
+                )
+                .unwrap();
+                state
+                    .routes
+                    .publish("fixture", "public".into(), "served".into(), upstream);
+                let input = serde_json::json!({
+                    "input":[{"type":"message","role":"user","content":"original task"},{"type":"message","role":"assistant","content":"earlier answer"},{"type":"message","role":"user","content":"continue"}],
+                    "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
+                    "reasoning":{"effort":"high"}, "temperature":0.7, "max_output_tokens":100, "stream":stream
+                });
+                let request = Request::post("/openai/fixture/v1/responses")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(Body::from(input.to_string()))
+                    .unwrap();
+                let response = router(state).oneshot(request).await.unwrap();
+                assert_eq!(
+                    response.status(),
+                    if stream || succeeds {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                );
+                let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap();
+                let body = String::from_utf8(bytes.to_vec()).unwrap();
+                if stream {
+                    let events = body
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("data: "))
+                        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|e| e["type"] == "response.created")
+                            .count(),
+                        1
+                    );
+                    assert!(
+                        events
+                            .windows(2)
+                            .all(|pair| pair[0]["sequence_number"].as_u64()
+                                < pair[1]["sequence_number"].as_u64())
+                    );
+                    let expected = if succeeds {
+                        "response.completed"
+                    } else {
+                        "response.failed"
+                    };
+                    assert_eq!(events.last().unwrap()["type"], expected);
+                    assert_eq!(events.iter().filter(|e| e["type"] == expected).count(), 1);
+                    if succeeds {
+                        assert_eq!(
+                            events.last().unwrap()["response"]["usage"]["input_tokens"],
+                            14
+                        );
+                        assert_eq!(
+                            events.last().unwrap()["response"]["usage"]["output_tokens"],
+                            6
+                        );
+                    }
+                } else if succeeds {
+                    let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    assert_eq!(response["status"], "completed");
+                    assert_eq!(response["usage"]["input_tokens"], 14);
+                    assert_eq!(response["usage"]["output_tokens"], 6);
+                }
+                let requests = server.await.unwrap();
+                assert_eq!(requests.len(), 2);
+                let first = &requests[0];
+                let second = &requests[1];
+                assert_eq!(
+                    &second["messages"].as_array().unwrap()[..3],
+                    first["messages"].as_array().unwrap()
+                );
+                assert_eq!(
+                    second["messages"][3],
+                    serde_json::json!({"role":"assistant","content":"","reasoning_content":"inspect"})
+                );
+                for key in [
+                    "model",
+                    "tools",
+                    "tool_choice",
+                    "reasoning_effort",
+                    "temperature",
+                ] {
+                    assert_eq!(second[key], first[key]);
+                }
+                assert_eq!(second["max_tokens"], 97);
+                assert_eq!(second["continue_final_message"], true);
+                assert_eq!(second["add_generation_prompt"], false);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_recovery_cancellation_closes_connection_and_releases_admission() {
+        use crate::spark::{gateway, upstream::ObservedRoute};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for headers_received in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (recovering, started) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                for index in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut buffer = [0; 16384];
+                    assert!(socket.read(&mut buffer).await.unwrap() > 0);
+                    if index == 0 {
+                        let body = reasoning_only_chat_sse();
+                        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                    } else {
+                        if headers_received {
+                            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.unwrap();
+                        }
+                        recovering.send(()).unwrap();
+                        assert_eq!(
+                            tokio::time::timeout(Duration::from_secs(2), socket.read(&mut buffer))
+                                .await
+                                .unwrap()
+                                .unwrap(),
+                            0
+                        );
+                        break;
+                    }
+                }
+            });
+            let routes = gateway::RouteRegistry::default();
+            routes.publish(
+                "fixture",
+                "public".into(),
+                "served".into(),
+                ObservedRoute::new(
+                    "i_11111111111111111111111111111111",
+                    1,
+                    address.ip(),
+                    address.port(),
+                    [("POST", "/v1/chat/completions")],
+                )
+                .unwrap(),
+            );
+            let gateway::RouteLookup::Healthy(route) = routes.lookup("fixture") else {
+                panic!("missing route");
+            };
+            let admission = Arc::new(tokio::sync::Semaphore::new(1));
+            let token_permit = Arc::clone(&admission).acquire_owned().await.unwrap();
+            let request = gateway::rewrite_responses_request(
+                br#"{"input":"continue","stream":true}"#,
+                "served",
+            )
+            .unwrap();
+            let response =
+                super::gateway_responses_stream(Arc::clone(&route), request, token_permit).await;
+            let client = tokio::spawn(async move {
+                let _ = axum::body::to_bytes(response.into_body(), 65536).await;
+            });
+            tokio::time::timeout(Duration::from_secs(2), started)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(admission.available_permits(), 0);
+            client.abort();
+            let _ = client.await;
+            server.await.unwrap();
+            assert_eq!(admission.available_permits(), 1);
+            let mut permits = Vec::new();
+            for _ in 0..4 {
+                permits.push(
+                    tokio::time::timeout(Duration::from_secs(1), route.acquire())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                );
+            }
+        }
     }
 
     #[test]

@@ -1211,11 +1211,7 @@ impl ResponsesEncoder {
         }) {
             return Err(invalid_request("upstream tool arguments are invalid"));
         }
-        if self.finish_reason.as_deref() == Some("stop")
-            && !self.reasoning.trim().is_empty()
-            && self.text.trim().is_empty()
-            && self.tools.is_empty()
-        {
+        if self.reasoning_only_stop() {
             return Err(OpenAiError {
                 code: "server_error",
                 message: "upstream generation produced no actionable output",
@@ -1238,6 +1234,38 @@ impl ResponsesEncoder {
             },
         );
         Ok(())
+    }
+
+    fn reasoning_only_stop(&self) -> bool {
+        self.finish_reason.as_deref() == Some("stop")
+            && !self.reasoning.trim().is_empty()
+            && self.text.trim().is_empty()
+            && self.tools.is_empty()
+    }
+
+    /// Resume an assistant that emitted EOS inside its reasoning block. The
+    /// engine's own template closes that block before continuing the answer;
+    /// history, tools and the requested sampling policy remain intact.
+    pub fn reasoning_only_recovery_request(&self, original: &[u8]) -> Option<Vec<u8>> {
+        if !self.reasoning_only_stop() || self.usage.0 == 0 || self.usage.1 == 0 {
+            return None;
+        }
+        let mut body: Value = serde_json::from_slice(original).ok()?;
+        if body["continue_final_message"] == true {
+            return None;
+        }
+        let budget = body["max_tokens"].as_u64().unwrap_or(MAX_OUTPUT_TOKENS);
+        let remaining = budget
+            .checked_sub(self.usage.1)
+            .filter(|value| *value > 0)?;
+        body["messages"].as_array_mut()?.push(serde_json::json!({
+            "role":"assistant","content":"","reasoning_content":self.reasoning
+        }));
+        body["continue_final_message"] = true.into();
+        body["add_generation_prompt"] = false.into();
+        body["max_tokens"] = remaining.into();
+        let bytes = serde_json::to_vec(&body).ok()?;
+        (bytes.len() <= MAX_COMPLETION_BODY_BYTES).then_some(bytes)
     }
 }
 
@@ -3220,6 +3248,119 @@ mod tests {
         let body: Value = serde_json::from_slice(&request.body).unwrap();
 
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+    }
+
+    #[test]
+    fn reasoning_only_recovery_continues_the_assistant_with_remaining_budget() {
+        let original = serde_json::json!({
+            "model":"served", "messages":[{"role":"user","content":"continue"}],
+            "tools":[{"type":"function","function":{"name":"inspect","parameters":{"type":"object"}}}],
+            "reasoning_effort":"xhigh", "temperature":1.0, "max_tokens":100,
+            "stream":true,"stream_options":{"include_usage":true}
+        });
+        let bytes = serde_json::to_vec(&original).unwrap();
+        let mut encoder = ResponsesEncoder::new("public".into(), BTreeSet::new());
+        for event in [
+            GenerationEvent::ReasoningDelta {
+                text: "Inspect the existing state.".into(),
+            },
+            GenerationEvent::Usage {
+                prompt_tokens: 50,
+                completion_tokens: 20,
+            },
+            GenerationEvent::Finished {
+                finish_reason: Some("stop".into()),
+            },
+        ] {
+            encoder.accept(event).unwrap();
+        }
+        let recovery: Value =
+            serde_json::from_slice(&encoder.reasoning_only_recovery_request(&bytes).unwrap())
+                .unwrap();
+        assert_eq!(recovery["messages"][0], original["messages"][0]);
+        assert_eq!(
+            recovery["messages"][1],
+            serde_json::json!({
+                "role":"assistant","content":"","reasoning_content":"Inspect the existing state."
+            })
+        );
+        for key in ["tools", "reasoning_effort", "temperature", "stream_options"] {
+            assert_eq!(recovery[key], original[key]);
+        }
+        assert_eq!(recovery["continue_final_message"], true);
+        assert_eq!(recovery["add_generation_prompt"], false);
+        assert_eq!(recovery["max_tokens"], 80);
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), original);
+        encoder
+            .accept(GenerationEvent::Finished {
+                finish_reason: Some("length".into()),
+            })
+            .unwrap();
+        assert!(encoder.reasoning_only_recovery_request(&bytes).is_none());
+    }
+
+    #[test]
+    fn reasoning_only_recovery_never_retries_actions_or_exhausted_or_unknown_usage() {
+        let body = br#"{"messages":[{"role":"user","content":"work"}],"max_tokens":20}"#;
+        let encoder = || {
+            let mut encoder = ResponsesEncoder::new("public".into(), BTreeSet::new());
+            for event in [
+                GenerationEvent::ReasoningDelta {
+                    text: "inspect".into(),
+                },
+                GenerationEvent::Finished {
+                    finish_reason: Some("stop".into()),
+                },
+                GenerationEvent::Usage {
+                    prompt_tokens: 50,
+                    completion_tokens: 20,
+                },
+            ] {
+                encoder.accept(event).unwrap();
+            }
+            encoder
+        };
+        assert!(encoder().reasoning_only_recovery_request(body).is_none());
+        let body = br#"{"messages":[{"role":"user","content":"work"}]}"#;
+        let recovery: Value =
+            serde_json::from_slice(&encoder().reasoning_only_recovery_request(body).unwrap())
+                .unwrap();
+        assert_eq!(recovery["max_tokens"], MAX_OUTPUT_TOKENS - 20);
+        for event in [
+            GenerationEvent::TextDelta {
+                text: "visible answer".into(),
+            },
+            GenerationEvent::ToolCallDelta {
+                index: 0,
+                call_id: Some("call_1".into()),
+                name: Some("inspect".into()),
+                arguments: "{".into(),
+            },
+            GenerationEvent::Finished {
+                finish_reason: Some("length".into()),
+            },
+            GenerationEvent::Usage {
+                prompt_tokens: 50,
+                completion_tokens: 0,
+            },
+        ] {
+            let mut encoder = encoder();
+            encoder.accept(event).unwrap();
+            assert!(encoder.reasoning_only_recovery_request(body).is_none());
+        }
+        assert!(
+            encoder()
+                .reasoning_only_recovery_request(
+                    br#"{"messages":[],"continue_final_message":true}"#
+                )
+                .is_none()
+        );
+        let oversized = serde_json::to_vec(&serde_json::json!({"messages":[{"role":"user","content":"x".repeat(MAX_COMPLETION_BODY_BYTES)}]})).unwrap();
+        assert!(
+            encoder()
+                .reasoning_only_recovery_request(&oversized)
+                .is_none()
+        );
     }
 
     #[test]

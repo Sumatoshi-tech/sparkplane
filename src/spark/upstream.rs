@@ -283,6 +283,13 @@ pub struct CompletionStream {
 }
 
 impl CompletionStream {
+    /// A composing stream owns accounting when it joins multiple generations.
+    /// In particular, an intermediate upstream Done must not mark the logical
+    /// response successful before the public encoder validates it.
+    pub fn take_usage_observer(&mut self) -> Option<Arc<dyn UsageObserver>> {
+        self.meter.take()
+    }
+
     pub fn response_failed(&self) {
         if let Some(meter) = &self.meter {
             meter.response_failed();

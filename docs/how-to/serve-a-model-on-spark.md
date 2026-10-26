@@ -119,6 +119,16 @@ model-identity probe pass, OpenAI-compatible routes are at
 routes are under `/anthropic/<instance>/v1`. Warming or recovering
 generations return protocol-native `503` with `Retry-After`.
 
+For translated Responses requests, an engine can occasionally stop after
+reasoning without producing an answer or tool call. The gateway makes at most
+one assistant-prefill continuation, retaining the request history, tools and
+sampling settings. The engine's chat template closes the retained reasoning
+block so generation can continue into the answer. Both attempts share the
+remaining output budget, and reported usage includes both generations. This
+does not reset or compact the coding session. Unsupported continuations and
+repeated reasoning-only stops fail explicitly; malformed tool arguments and
+length-limited generations are not retried by this recovery path.
+
 For Ornith, reasoning streams independently from final answer text as OpenAI
 `reasoning_content`, Responses reasoning-summary events, or Anthropic thinking
 blocks. `sparkplane ... launch codex` advertises that capability in its private

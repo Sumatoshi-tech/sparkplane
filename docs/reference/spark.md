@@ -184,9 +184,19 @@ The gateway preserves Ornith's parsed reasoning as a distinct channel. OpenAI
 Chat streams `reasoning_content`; Responses streams reasoning summary item
 events and includes the same item in non-stream documents; Anthropic streams a
 thinking block and accepts Sparkplane's integrity-checked block back in later turns.
-The generated coding-client catalog currently disables requests for reasoning
-summaries. Gateway protocol support and the coding client's requested display
-mode are separate contracts; changing the catalog requires continuation tests.
+Each healthy instance publishes `capabilities` through the control API and its
+public `/v1/models` metadata. The values come from the exact generation's verified
+gateway profile: tool calling, parallel tool calls, verbosity, and optional
+reasoning settings (`supported_efforts`, `default_effort`, `summaries`). Unknown
+or legacy reasoning support stays unadvertised. A warming, unhealthy, or
+mismatched generation never advertises another generation's capabilities.
+
+The Codex launcher derives its model catalog and invocation defaults from this
+API contract. Reasoning-capable recipes expose the effort picker and reasoning
+stream, and the launcher overrides stale generated-profile preferences such as
+`model_reasoning_effort = "none"`. Explicit Codex `-c` settings after Sparkplane's
+`--` still win. Red Hat's default is `xhigh`; no reasoning workaround flags are
+needed. Other clients can consume the same API capabilities.
 Anthropic `display: "omitted"` emits the block and signature without thinking
 deltas, while `type: "disabled"` disables thinking in the Ornith template.
 

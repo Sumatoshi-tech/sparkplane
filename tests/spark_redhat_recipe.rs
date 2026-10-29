@@ -129,3 +129,34 @@ fn redhat_config_patch_accepts_only_the_pinned_upstream_source() {
     );
     assert_eq!(fs::read(&config).unwrap(), changed);
 }
+
+#[test]
+fn reasoning_is_an_explicit_validated_recipe_contract() {
+    let source = fs::read_to_string("configs/sparkplane/engines/vllm-qwen38-redhat.toml").unwrap();
+    let parse = |text: &str| sparkplane::spark::engine::EnginePolicy::parse(text);
+    let policy = parse(&source).unwrap();
+    let models = ModelCatalog::load("configs/sparkplane/models.toml".as_ref()).unwrap();
+    let model = models.resolve("qwen3.8:flash-next").unwrap();
+    let profile = policy
+        .gateway_profile_for(None, model.artifacts(), None)
+        .unwrap();
+    let capabilities = profile.inference_capabilities();
+    let reasoning = capabilities.reasoning.unwrap();
+    assert_eq!(reasoning.default_effort, "xhigh");
+    assert!(reasoning.summaries && reasoning.supported_efforts.contains(&"xhigh".into()));
+    assert!(
+        capabilities.tool_calling && !capabilities.verbosity && !capabilities.parallel_tool_calls
+    );
+    for invalid in [
+        source.replace("default_effort = \"xhigh\"", "default_effort = \"ultra\""),
+        source.replace("\"high\", \"xhigh\"]", "\"high\", \"high\"]"),
+        source.replace(
+            "startup_protocol_probe = true",
+            "startup_protocol_probe = false",
+        ),
+        source.replace("verbosity = false", "verbosity = true"),
+    ] {
+        assert_ne!(invalid, source);
+        assert!(parse(&invalid).is_err());
+    }
+}

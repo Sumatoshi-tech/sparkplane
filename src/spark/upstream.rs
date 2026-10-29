@@ -697,7 +697,7 @@ impl ObservedRoute {
             "stream_options":{"include_usage":true},"chat_template_kwargs":{"enable_thinking":false,"reasoning_strength":"low"}
         }))
         .map_err(|_| UpstreamError::new("protocol probe cannot be encoded"))?;
-        validate_protocol_stream(self.chat_stream(&body).await?, false).await?;
+        validate_protocol_stream(self.chat_stream(&body).await?, false, false).await?;
         if require_tools {
             let body = serde_json::to_vec(&serde_json::json!({
                 "model":served_model,
@@ -710,9 +710,26 @@ impl ObservedRoute {
                 "temperature":0,"stream":true,"stream_options":{"include_usage":true},"chat_template_kwargs":{"enable_thinking":false,"reasoning_strength":"low"}
             }))
             .map_err(|_| UpstreamError::new("tool protocol probe cannot be encoded"))?;
-            validate_protocol_stream(self.chat_stream(&body).await?, true).await?;
+            validate_protocol_stream(self.chat_stream(&body).await?, true, false).await?;
         }
         Ok(())
+    }
+
+    pub async fn reasoning_probe(
+        &self,
+        served_model: &str,
+        effort: &str,
+        summaries: bool,
+        timeout: Duration,
+    ) -> Result<(), UpstreamError> {
+        tokio::time::timeout(timeout, async {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "model":served_model, "messages":[{"role":"user","content":"Briefly reason about 17 times 19, then give the answer."}],
+                "max_tokens":1024, "temperature":0, "stream":true, "stream_options":{"include_usage":true},
+                "reasoning_effort":effort, "chat_template_kwargs":{"enable_thinking":true}
+            })).map_err(|_| UpstreamError::new("reasoning probe cannot be encoded"))?;
+            validate_protocol_stream(self.chat_stream(&body).await?, false, summaries).await
+        }).await.map_err(|_| UpstreamError::new("engine reasoning probe timed out"))?
     }
 
     pub async fn completion_stream(&self, body: &[u8]) -> Result<CompletionStream, UpstreamError> {
@@ -943,14 +960,22 @@ async fn rejected_stream_response(
 async fn validate_protocol_stream(
     mut stream: CompletionStream,
     require_tool: bool,
+    require_reasoning: bool,
 ) -> Result<(), UpstreamError> {
     let mut output = false;
+    let mut reasoning = false;
     let mut tools = std::collections::BTreeMap::<u32, (String, String, String)>::new();
     let mut finish_reason = None;
     let mut usage = false;
     while let Some(event) = stream.next().await {
         match event? {
-            GenerationEvent::ReasoningDelta { text } | GenerationEvent::TextDelta { text } => {
+            GenerationEvent::ReasoningDelta { text } => {
+                if finish_reason.is_some() || text.is_empty() {
+                    return Err(UpstreamError::new("engine protocol event order is invalid"));
+                }
+                reasoning = true;
+            }
+            GenerationEvent::TextDelta { text } => {
                 if finish_reason.is_some() || text.is_empty() {
                     return Err(UpstreamError::new("engine protocol event order is invalid"));
                 }
@@ -1007,7 +1032,10 @@ async fn validate_protocol_stream(
                 } else {
                     matches!(finish_reason.as_deref(), Some("stop" | "length"))
                 };
-                if finish_valid && usage && (require_tool && tools_valid || !require_tool && output)
+                if finish_valid
+                    && usage
+                    && (!require_reasoning || reasoning && finish_reason.as_deref() == Some("stop"))
+                    && (require_tool && tools_valid || !require_tool && output)
                 {
                     return Ok(());
                 }
@@ -1590,6 +1618,49 @@ mod tests {
 
         assert_eq!(body, b"data: {\"type\":\"response.completed\"}\n\n");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reasoning_probe_requires_thinking_and_a_completed_answer_over_http() {
+        use axum::{Json, Router, routing::post};
+        for (thinking, answer, finish, accepted) in [
+            (true, true, "stop", true),
+            (false, true, "stop", false),
+            (true, false, "stop", false),
+            (true, true, "length", false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, Router::new().route("/v1/chat/completions", post(move |Json(request): Json<serde_json::Value>| async move {
+                    assert_eq!(request["reasoning_effort"], "xhigh");
+                    assert_eq!(request["chat_template_kwargs"]["enable_thinking"], true);
+                    let mut chunks = Vec::new();
+                    if thinking { chunks.push(serde_json::json!({"choices":[{"delta":{"reasoning_content":"Multiply briefly."},"finish_reason":null}]})); }
+                    if answer { chunks.push(serde_json::json!({"choices":[{"delta":{"content":"323"},"finish_reason":null}]})); }
+                    chunks.push(serde_json::json!({"choices":[{"delta":{},"finish_reason":finish}]}));
+                    chunks.push(serde_json::json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}));
+                    let body = chunks.into_iter().map(|chunk| format!("data: {chunk}\n\n")).collect::<String>()+"data: [DONE]\n\n";
+                    ([("content-type","text/event-stream")],body)
+                }))).await.unwrap();
+            });
+            let route = ObservedRoute::new(
+                "i_11111111111111111111111111111111",
+                1,
+                address.ip(),
+                address.port(),
+                [("POST", "/v1/chat/completions")],
+            )
+            .unwrap();
+            assert_eq!(
+                route
+                    .reasoning_probe("fixture-model", "xhigh", true, Duration::from_secs(2))
+                    .await
+                    .is_ok(),
+                accepted
+            );
+            server.abort();
+        }
     }
 
     #[tokio::test]

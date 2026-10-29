@@ -410,6 +410,8 @@ impl Cidr {
         ServeRequest,
         StopRequest,
         InstanceDocument,
+        super::wire::InferenceCapabilitiesDocument,
+        super::wire::ReasoningCapabilitiesDocument,
         InstanceListDocument,
         EngineLogDocument,
         AnthropicTokenCountDocument,
@@ -2189,6 +2191,7 @@ async fn serve_instance(
         context_window,
         input_modalities: vec!["text".into()],
         default_reasoning_effort,
+        capabilities: Default::default(),
         generation: 0,
         desired: InstanceDesiredState::Running,
         observed: InstanceObservedState::Creating,
@@ -2498,7 +2501,7 @@ async fn run_serve(
         return;
     }
     let endpoint = format!("/openai/{}/v1", instance.name);
-    let healthy_instance = match database
+    let mut healthy_instance = match database
         .set_instance_observed(
             &instance.id,
             instance.generation,
@@ -2532,6 +2535,7 @@ async fn run_serve(
             route,
         );
     }
+    project_route_health(&routes, std::slice::from_mut(&mut healthy_instance));
     let _ = database
         .transition(
             &operation_id,
@@ -2905,7 +2909,7 @@ async fn complete_recovered_operation(
     }) else {
         return;
     };
-    let Ok(current) = database.instance(&instance.id).await else {
+    let Ok(mut current) = database.instance(&instance.id).await else {
         return;
     };
     let route_ready = routes.is_some_and(|routes| {
@@ -2932,6 +2936,9 @@ async fn complete_recovered_operation(
     };
     if !recovered {
         return;
+    }
+    if let Some(routes) = routes {
+        project_route_health(routes, std::slice::from_mut(&mut current));
     }
     let result = serde_json::to_value(current).ok();
     if operation.state == super::wire::OperationState::Accepted {
@@ -3173,7 +3180,25 @@ async fn semantic_probe_result(
     route
         .protocol_probe(&observed.served_model, require_tools, remaining)
         .await
-        .map_err(|error| error.diagnostic())
+        .map_err(|error| error.diagnostic())?;
+    if let Some(reasoning) = &observed.gateway_profile.reasoning {
+        let effort = observed
+            .gateway_profile
+            .sampling
+            .reasoning_effort_map
+            .get(&reasoning.default_effort)
+            .unwrap_or(&reasoning.default_effort);
+        route
+            .reasoning_probe(
+                &observed.served_model,
+                effort,
+                reasoning.summaries,
+                timeout.saturating_sub(started.elapsed()),
+            )
+            .await
+            .map_err(|error| error.diagnostic())?;
+    }
+    Ok(())
 }
 
 fn semantic_failure_detail(reason: &'static str) -> String {
@@ -3275,12 +3300,14 @@ async fn list_instances(State(state): State<AgentState>, RawQuery(query): RawQue
 fn project_route_health(routes: &RouteRegistry, instances: &mut [InstanceDocument]) {
     for instance in instances {
         instance.input_modalities = vec!["text".into()];
+        instance.capabilities = Default::default();
         if !instance.healthy {
             continue;
         }
         if let RouteLookup::Healthy(route) = routes.lookup(&instance.name)
             && route.generation == instance.generation
         {
+            instance.capabilities = route.profile.inference_capabilities();
             if route.profile.capabilities.contains("vision") && route.profile.vision.is_some() {
                 instance.input_modalities.push("image".into());
             }
@@ -8056,6 +8083,7 @@ mod tests {
             context_window: 65_536,
             input_modalities: vec!["text".into()],
             default_reasoning_effort: None,
+            capabilities: Default::default(),
             generation: 0,
             desired: crate::spark::wire::InstanceDesiredState::Running,
             observed: crate::spark::wire::InstanceObservedState::Creating,
@@ -8190,7 +8218,7 @@ mod tests {
             .build()
             .unwrap();
         let vision = crate::spark::engine::EnginePolicy::parse(include_str!(
-            "../../configs/sparkplane/engines/llama-cpp.toml"
+            "../../configs/sparkplane/engines/vllm-qwen38-redhat.toml"
         ))
         .unwrap()
         .gateway_profile(None);
@@ -8214,6 +8242,8 @@ mod tests {
                 [("POST", "/v1/chat/completions")],
             )
             .unwrap();
+            let advertised_reasoning =
+                generation == instance.generation && profile.reasoning.is_some();
             routes.publish_with_profile(
                 &instance.name,
                 instance.model.clone(),
@@ -8237,6 +8267,36 @@ mod tests {
                 .unwrap();
             assert_eq!(list.instances[0].input_modalities, expected);
             assert_eq!(list.instances[0].healthy, generation == instance.generation);
+            assert_eq!(
+                list.instances[0].capabilities.reasoning.is_some(),
+                advertised_reasoning
+            );
+            let catalog = crate::spark::launch::codex_catalog(&model, &list.instances[0]);
+            assert_eq!(
+                catalog["models"][0]["supports_reasoning_summaries"],
+                advertised_reasoning
+            );
+            if advertised_reasoning {
+                assert_eq!(catalog["models"][0]["default_reasoning_level"], "xhigh");
+                let metadata: serde_json::Value = client
+                    .get(format!(
+                        "https://localhost:{}/openai/ornith/v1/models",
+                        address.port()
+                    ))
+                    .bearer_auth(TOKEN)
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    metadata["data"][0]["capabilities"],
+                    serde_json::to_value(&list.instances[0].capabilities).unwrap()
+                );
+            }
         }
         handle.graceful_shutdown(None);
         server.await.unwrap();
@@ -8793,6 +8853,7 @@ mod tests {
             context_window: 65_536,
             input_modalities: vec!["text".into()],
             default_reasoning_effort: None,
+            capabilities: Default::default(),
             generation: 0,
             desired: crate::spark::wire::InstanceDesiredState::Running,
             observed: crate::spark::wire::InstanceObservedState::Creating,

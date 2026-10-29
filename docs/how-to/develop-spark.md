@@ -355,6 +355,30 @@ Certificate rotation is separate from a software release:
 `sparkplane dgx-spark cert rotate --dry-run --json`, followed by `--yes` after
 review. Use `--ca` only when replacing the certificate authority.
 
+### Declare client features in the recipe
+
+An engine profile can declare `parallel_tool_calls` and `verbosity` (both default
+to false), plus an optional reasoning contract:
+
+```toml
+[profiles.reasoning]
+supported_efforts = ["none", "low", "medium", "high", "xhigh"]
+default_effort = "xhigh"
+summaries = true
+```
+
+The default must be a supported effort, levels must be unique, reasoning requires
+text generation and startup protocol probes, and parallel tools require tool
+calling. Verbosity is allowed only on native Responses profiles that preserve
+that control. A reasoning-enabled engine must pass a bounded probe with both
+reasoning and a completed visible answer before its route is published.
+
+The published generation carries these declarations through executor IPC and
+reconciliation to the API. Client adapters consume those API values; do not
+hardcode model names or blanket capability defaults in a launcher. Changes to a
+recipe's declarations change its signed fingerprint and require a new managed
+generation. Existing qualified generations and historical evidence are retained.
+
 ### Activate a capability change on an existing instance
 
 A control-plane-only upgrade can preserve a running engine. Changing an engine

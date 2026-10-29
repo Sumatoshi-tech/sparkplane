@@ -131,8 +131,8 @@ length-limited generations are not retried by this recovery path.
 
 For Ornith, reasoning streams independently from final answer text as OpenAI
 `reasoning_content`, Responses reasoning-summary events, or Anthropic thinking
-blocks. `sparkplane ... launch codex` advertises that capability in its private
-model catalog, so Codex renders the Responses reasoning stream. Requests that
+blocks. A recipe with an explicit, qualified reasoning declaration advertises that
+capability through the API and generated Codex catalog. Requests that
 omit sampling settings receive Ornith's precise-coding defaults; explicit
 client settings remain unchanged.
 
@@ -186,6 +186,17 @@ If a transfer fails, retry the same immutable download. Admission credits only
 space already allocated by regular, singly linked partial files in the managed
 cache; sparse holes and unsafe paths receive no credit. The 100 GiB disk reserve
 and independent verification of every completed file still apply.
+
+The Red Hat recipe declares reasoning levels through `xhigh`, with `xhigh` as
+its Codex default. The control API and public model metadata advertise the
+qualified generation's capabilities. Launch normally, or resume the same thread:
+
+```bash
+sparkplane dgx-spark launch codex --model qwen3.8:flash-next -- resume <session-id>
+```
+
+Explicit per-launch effort choices remain available with Codex's
+`-c 'model_reasoning_effort="low"'` after `--`.
 
 [Red Hat's checkpoint and evaluation](https://huggingface.co/RedHatAI/Qwen3.8-Flash-Next-NVFP4).
 

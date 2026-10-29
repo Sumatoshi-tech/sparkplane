@@ -830,7 +830,7 @@ fn configure_integration(
         .map_err(|error| usage(format!("Codex provider registration: {error:#}")))
 }
 
-fn codex_catalog(model: &ModelDocument, instance: &InstanceDocument) -> Value {
+pub(crate) fn codex_catalog(model: &ModelDocument, instance: &InstanceDocument) -> Value {
     serde_json::json!({
         "owned_by": OWNED_MARKER,
         "models": [{
@@ -849,12 +849,13 @@ fn codex_catalog(model: &ModelDocument, instance: &InstanceDocument) -> Value {
             "truncation_policy": { "mode": "bytes", "limit": 10000 },
             "input_modalities": instance.input_modalities,
             "base_instructions": "",
-            "default_reasoning_summary": "none",
-            "support_verbosity": true,
+            "default_reasoning_summary": if instance.capabilities.reasoning.as_ref().is_some_and(|reasoning| reasoning.summaries) { "auto" } else { "none" },
+            "default_reasoning_level": instance.capabilities.reasoning.as_ref().map(|reasoning| &reasoning.default_effort),
+            "support_verbosity": instance.capabilities.verbosity,
             "default_verbosity": "low",
-            "supports_parallel_tool_calls": false,
-            "supports_reasoning_summaries": false,
-            "supported_reasoning_levels": [],
+            "supports_parallel_tool_calls": instance.capabilities.parallel_tool_calls,
+            "supports_reasoning_summaries": instance.capabilities.reasoning.as_ref().is_some_and(|reasoning| reasoning.summaries),
+            "supported_reasoning_levels": instance.capabilities.reasoning.as_ref().map(|reasoning| reasoning.supported_efforts.iter().map(|effort| serde_json::json!({"effort": effort, "description": format!("{effort} reasoning effort")})).collect::<Vec<_>>()).unwrap_or_default(),
             "experimental_supported_tools": [],
             "supports_search_tool": false,
             "web_search_tool_type": "text",
@@ -1140,7 +1141,36 @@ fn configure_codex_command(
             instance.context_window * 3 / 4
         ),
     ];
-    if let Some(effort) = &instance.default_reasoning_effort {
+    // Explicit invocation overrides beat stale preferences in an older generated
+    // profile, including Codex's persisted model_reasoning_effort="none".
+    overrides.push(format!(
+        "model_reasoning_summary={:?}",
+        if instance
+            .capabilities
+            .reasoning
+            .as_ref()
+            .is_some_and(|reasoning| reasoning.summaries)
+        {
+            "auto"
+        } else {
+            "none"
+        }
+    ));
+    overrides.push(format!(
+        "model_supports_reasoning_summaries={}",
+        instance
+            .capabilities
+            .reasoning
+            .as_ref()
+            .is_some_and(|reasoning| reasoning.summaries)
+    ));
+    if let Some(effort) = instance
+        .capabilities
+        .reasoning
+        .as_ref()
+        .map(|reasoning| &reasoning.default_effort)
+        .or(instance.default_reasoning_effort.as_ref())
+    {
         overrides.push(format!("model_reasoning_effort={effort:?}"));
     }
     for value in overrides {
@@ -1637,6 +1667,7 @@ mod tests {
             context_window: 65_536,
             input_modalities: vec!["text".into()],
             default_reasoning_effort: None,
+            capabilities: Default::default(),
             generation: 1,
             desired: InstanceDesiredState::Running,
             observed: InstanceObservedState::Healthy,
@@ -2049,8 +2080,71 @@ mod tests {
         let instance = instance("vision", "m_one");
         let mut document = serde_json::to_value(instance).unwrap();
         document.as_object_mut().unwrap().remove("input_modalities");
+        document.as_object_mut().unwrap().remove("capabilities");
         let instance: InstanceDocument = serde_json::from_value(document).unwrap();
         assert_eq!(instance.input_modalities, ["text"]);
+        assert_eq!(instance.capabilities, Default::default());
+    }
+
+    #[test]
+    fn codex_uses_advertised_generation_features_instead_of_blanket_defaults() {
+        let model = model("m_one", "redhat");
+        let mut document = serde_json::to_value(instance("redhat", &model.id)).unwrap();
+        document["capabilities"] = serde_json::json!({
+            "tool_calling": true, "parallel_tool_calls": false, "verbosity": false,
+            "reasoning": {"supported_efforts":["none","low","medium","high","xhigh"],
+                          "default_effort":"xhigh", "summaries":true}
+        });
+        let instance: InstanceDocument = serde_json::from_value(document).unwrap();
+        let catalog = codex_catalog(&model, &instance);
+        let root = tempfile::tempdir().unwrap();
+        client_config(root.path());
+        let mut command = Command::new("codex");
+        configure_codex_command(
+            &mut command,
+            root.path(),
+            "dgx",
+            &instance,
+            &model,
+            &LaunchSecret("inference-secret".into()),
+            &["-c".into(), "model_reasoning_effort=\"low\"".into()],
+        )
+        .unwrap();
+        let args = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-c", "model_supports_reasoning_summaries=true"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-c", "model_reasoning_summary=\"auto\""])
+        );
+        let default = args
+            .iter()
+            .position(|value| value == "model_reasoning_effort=\"xhigh\"")
+            .unwrap();
+        let explicit = args
+            .iter()
+            .position(|value| value == "model_reasoning_effort=\"low\"")
+            .unwrap();
+        assert!(
+            default < explicit,
+            "explicit user settings must override recipe defaults"
+        );
+        assert_eq!(catalog["models"][0]["supports_reasoning_summaries"], true);
+        assert_eq!(catalog["models"][0]["default_reasoning_level"], "xhigh");
+        assert_eq!(catalog["models"][0]["default_reasoning_summary"], "auto");
+        assert_eq!(catalog["models"][0]["support_verbosity"], false);
+        assert!(
+            catalog["models"][0]["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|level| level["effort"] == "xhigh")
+        );
     }
 
     #[test]

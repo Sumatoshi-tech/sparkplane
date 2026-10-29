@@ -562,6 +562,46 @@ pub enum InstanceObservedState {
     Failed,
 }
 
+/// Features of one qualified, published inference route. Missing metadata is
+/// deliberately conservative for clients talking to an older agent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "appliance", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct InferenceCapabilitiesDocument {
+    pub tool_calling: bool,
+    pub parallel_tool_calls: bool,
+    pub verbosity: bool,
+    pub reasoning: Option<ReasoningCapabilitiesDocument>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "appliance", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningCapabilitiesDocument {
+    pub supported_efforts: Vec<String>,
+    pub default_effort: String,
+    pub summaries: bool,
+}
+
+impl ReasoningCapabilitiesDocument {
+    pub fn valid(&self) -> bool {
+        !self.supported_efforts.is_empty()
+            && self.supported_efforts.iter().all(|value| {
+                matches!(
+                    value.as_str(),
+                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+                )
+            })
+            && self
+                .supported_efforts
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                == self.supported_efforts.len()
+            && self.supported_efforts.contains(&self.default_effort)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "appliance", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -584,7 +624,10 @@ pub struct InstanceDocument {
     #[serde(default = "default_instance_input_modalities")]
     pub input_modalities: Vec<String>,
     #[serde(default)]
+    /// Legacy sampling intent; client features and defaults are in capabilities.
     pub default_reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub capabilities: InferenceCapabilitiesDocument,
     pub generation: u64,
     pub desired: InstanceDesiredState,
     pub observed: InstanceObservedState,

@@ -172,6 +172,12 @@ pub struct EngineProfile {
     pub capabilities: Vec<String>,
     pub startup_protocol_probe: bool,
     #[serde(default)]
+    pub reasoning: Option<super::wire::ReasoningCapabilitiesDocument>,
+    #[serde(default)]
+    pub parallel_tool_calls: bool,
+    #[serde(default)]
+    pub verbosity: bool,
+    #[serde(default)]
     pub resources: Option<EngineResources>,
     #[serde(default)]
     pub vision: Option<VisionPolicy>,
@@ -391,6 +397,9 @@ impl EnginePolicy {
             vision: profile.vision.clone(),
             embeddings: None,
             startup_protocol_probe: profile.startup_protocol_probe,
+            reasoning: profile.reasoning.clone(),
+            parallel_tool_calls: profile.parallel_tool_calls,
+            verbosity: profile.verbosity,
             native_responses: profile.native_responses,
             native_response_timeout_seconds: profile.native_response_timeout_seconds,
             stream_idle_timeout_seconds: profile.stream_idle_timeout_seconds,
@@ -434,6 +443,9 @@ impl EnginePolicy {
             vision: supports_vision.then(|| profile.vision.clone()).flatten(),
             embeddings,
             startup_protocol_probe: profile.startup_protocol_probe,
+            reasoning: profile.reasoning.clone(),
+            parallel_tool_calls: profile.parallel_tool_calls,
+            verbosity: profile.verbosity,
             native_responses: profile.native_responses,
             native_response_timeout_seconds: profile.native_response_timeout_seconds,
             stream_idle_timeout_seconds: profile.stream_idle_timeout_seconds,
@@ -761,6 +773,27 @@ fn validate_profiles(config: &EngineConfig) -> Result<(), String> {
             }
         {
             return Err("engine profile is invalid or ambiguous".into());
+        }
+        if profile.reasoning.as_ref().is_some_and(|reasoning| {
+            !reasoning.valid()
+                || !profile
+                    .capabilities
+                    .iter()
+                    .any(|value| value == "text_generation")
+                || !profile.startup_protocol_probe
+                || profile
+                    .sampling
+                    .default_reasoning_effort
+                    .as_ref()
+                    .is_some_and(|value| value != &reasoning.default_effort)
+        }) || profile.parallel_tool_calls
+            && !profile
+                .capabilities
+                .iter()
+                .any(|value| value == "tool_calling")
+            || profile.verbosity && !profile.native_responses
+        {
+            return Err("engine client capabilities disagree with the qualified profile".into());
         }
         if let Some(vision) = &profile.vision {
             let processor = format!("sha256:{}", vision.processor_sha256);

@@ -612,7 +612,7 @@ bytes = 3413864960
 sha256 = "9758875fc55e49561165f4a44342b654c123c3e25c6811b34abb83553fb1a164"
 
 [[models]]
-aliases = ["qwen3.8:flash-next", "qwen3.8:flash-next-nvfp4"]
+aliases = ["qwen3.8:flash-next-radixark", "qwen3.8:flash-next-radixark-nvfp4"]
 repository = "RadixArk/Qwen3.8-Flash-Next-NVFP4"
 revision = "7b719225242aacd3dbd3f9407468c2ee9a9d2594"
 
@@ -1862,3 +1862,198 @@ role = "weight_shard"
 path = "model-plefp8-00009.safetensors"
 bytes = 4400023163
 sha256 = "61de98b89bb79f386795787d7a76827a26f1e292c26edbb0a1b613da455f5a9c"
+
+# Standalone FP4-Local derivative; the compressed scales require the B12X runtime.
+[[models]]
+aliases = ["qwen3.8:flash-next-abliterated", "qwen3.8:flash-next-abliterated-nvfp4"]
+repository = "DevelopingDad/Qwen3.8-Flash-Next-FP4-Local-Abliterated"
+revision = "fe8c47ff55d0692e28dbcad2c53df2f51294be46"
+
+[models.artifact]
+format = "safetensors"
+quantization = "NVFP4"
+capabilities = ["reasoning", "text_generation", "tool_calling", "vision"]
+engine_profile = "qwen3.8-flash-next-fp4-local"
+
+[models.artifact.primary]
+path = "model.safetensors.index.json"
+bytes = 46529994
+sha256 = "96e5ea03565556c588b8d7b29feabeec7858c275d6c33b36b231bf92b1941e03"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "tensors/model-00001-of-00021.safetensors"
+bytes = 5000643504
+sha256 = "a3c8c67934589154119f3eb4fff6bde91114496b04a98858f3a59494257da7b4"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "tensors/model-00002-of-00021.safetensors"
+bytes = 5002792096
+sha256 = "39fcd6ac464fcf9db002f13ddb7fd2e8c6f6fc78f1f1615eaac966d43d4b8b99"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "tensors/model-00003-of-00021.safetensors"
+bytes = 5002927400
+sha256 = "6a3bf036982c524faeaea05d8ce8b442280c18263b3c6fd14801b8019e5b4289"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "tensors/model-00004-of-00021.safetensors"
+bytes = 5003194672
+sha256 = "b2083c08d0438cd030bee4bce8c55a3740c565f42bab14fa6a5d52049230f6de"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "tensors/model-00005-of-00021.safetensors"
+bytes = 5003151448
+sha256 = "c0419be6776d0dd85605d2ea99671cfe96349923eefdc35f2986cca4ac837fff"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "tensors/model-00006-of-00021.safetensors"
+bytes = 5002892148
+sha256 = "25e35e23e622cd655104f126d739420645d60dcca442a90c02dcb8d139df2c8a"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "tensors/model-00007-of-00021.safetensors"
+bytes = 5002907708
+sha256 = "af3ef717daaf20d306d76ec4b191909f8dd02a2b90a1eb59fcb86a046333c116"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "tensors/model-00008-of-00021.safetensors"
+bytes = 5003103756
+sha256 = "fc7ae6bbaf2dea684a07f68c749daf4580df0d75e7da1d6e33e401e804fe4e3a"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "tensors/model-00009-of-00021.safetensors"
+bytes = 5002976316
+sha256 = "e69f58486070c9e133421d251fee4f0d71ba59ea5ac23473e117069abca9fc71"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "tensors/model-00010-of-00021.safetensors"
+bytes = 5002834136
+sha256 = "d48514fb5d28d5ce1f8cc2dad83a12ffe5d1b17c60357d0cb79fe14e469edafb"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "tensors/model-00011-of-00021.safetensors"
+bytes = 5002685828
+sha256 = "2a5562f77811ae444051086084ddb26afb6aee9ccf539af9c23cd306f6d4b2be"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "tensors/model-00012-of-00021.safetensors"
+bytes = 5002912920
+sha256 = "aa1749594dff70b62e17aac65755a7ab6f51061e0d59215ca4301581d1782c6a"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "tensors/model-00013-of-00021.safetensors"
+bytes = 5003237060
+sha256 = "0068f9b62a261d84e8c692cff9d4eadde052526076d141fdb970724c06187745"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "tensors/model-00014-of-00021.safetensors"
+bytes = 4845006312
+sha256 = "7d471564f621088cd4f9f95f9f17913bb13118a82d153d0f047d1da5c41efe5b"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "tensors/model-00015-of-00021.safetensors"
+bytes = 4860574920
+sha256 = "ed33b835f0f2cd5fc14012bd64f8efcb84f268964983fc5406e57bbadab37f72"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "tensors/model-00016-of-00021.safetensors"
+bytes = 4950031028
+sha256 = "635e97fbad78fa988647d407e2b58e55d551ef94d798c9b6fb5550de25e86429"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "tensors/model-00017-of-00021.safetensors"
+bytes = 4950030896
+sha256 = "bf60d564d89a805b67f8be5f2847a1b1567a70dbc23d19754395c127568474ad"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "tensors/model-00018-of-00021.safetensors"
+bytes = 4950030896
+sha256 = "c5bde22f9364e82eb25973456795592fdcb4b158bc2095898979a2566bf4c562"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "tensors/model-00019-of-00021.safetensors"
+bytes = 4950030904
+sha256 = "da3dc3b4f428f5b9dd53362691043d0242f48d03adca9b7b553bd9f3a1e96350"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "tensors/model-00020-of-00021.safetensors"
+bytes = 4950030904
+sha256 = "4978bb6b8480cfc02d3c8bc84ba86202889f5f10d090bb17c21fee663cea7683"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "tensors/model-00021-of-00021.safetensors"
+bytes = 2700016864
+sha256 = "48203838f2c76921bddbf1cc51d20a23858c128821a21add55fa1778e5e25283"
+
+[[models]]
+aliases = ["qwen3.8:flash-next", "qwen3.8:flash-next-nvfp4", "qwen3.8:flash-next-redhat", "qwen3.8:flash-next-redhat-nvfp4"]
+repository = "RedHatAI/Qwen3.8-Flash-Next-NVFP4"
+revision = "c8f2fb1b9869f686b214782036123b10ff96d14a"
+
+[models.artifact]
+format = "safetensors"
+quantization = "NVFP4"
+capabilities = ["reasoning", "text_generation", "tool_calling", "vision"]
+engine_profile = "qwen3.8-flash-next-redhat-nvfp4"
+
+[models.artifact.primary]
+path = "model.safetensors.index.json"
+bytes = 34196882
+sha256 = "30b79f475ef97e449349e2eca8bbc26287353a31f27ddab308748be17c1d1ba7"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "model-00001-of-00005.safetensors"
+bytes = 102400512288
+sha256 = "64836044b0d06b54a3a1f3fd3cf4ce06ba005fb6319abb100479b7a151f7f44c"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "model-00002-of-00005.safetensors"
+bytes = 20009465096
+sha256 = "6a5845e3cf6be70e345c4cb25a4d06d20b398ff7a29576fc78da82272578f531"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "model-00003-of-00005.safetensors"
+bytes = 20010984128
+sha256 = "4fdc4e2d027527cf1bac49ee14d6df469a13baa8b856f3bdef8fc9b157596c90"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "model-00004-of-00005.safetensors"
+bytes = 20011112280
+sha256 = "4ec199fa49917691056485e0c61b4eff77432c5ee55e63d28819234f5843a140"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "model-00005-of-00005.safetensors"
+bytes = 18751777152
+sha256 = "89c6b9272faa31fdc208fbf538efcf5e7947baff2923a99338ac7ac540a1029f"
+
+[[models.artifact.auxiliary]]
+role = "weight_shard"
+path = "model_mtp.safetensors"
+bytes = 5214305424
+sha256 = "f346d471136314ebe66af5193c0a01fd00ffdc22a4a8c9f86bd15948bc9a8212"

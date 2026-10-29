@@ -1,0 +1,10 @@
+The frozen config.py fixture is vLLM's models/qwen4_exp/config.py, distributed
+under Apache-2.0 (see LICENSE and its original copyright header).
+
+It was extracted without modification from the declared ARM64 dependency:
+eugr/spark-vllm-b12x@sha256:03a956544e9f9b4b7ba91690469fbe7848bdbef29a7d2e0f5788368467bb3595
+Runtime revision: b12x-8244d1c44-20261015
+Source SHA-256: 71230ef5e53e016416f54ae96b9f8b4e2c10a6311d8e6035ac063ac48fea2471
+
+Tests apply the repository's content-addressed compatibility patch only to a
+temporary copy. Keep this upstream fixture immutable.

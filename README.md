@@ -17,6 +17,8 @@ cargo build --locked --release
 Use the pinned Rust 1.95.0 toolchain (selected automatically by rustup), a
 C/C++ toolchain, CMake, pkg-config and Python 3.11+.
 Install the Minisign executable for the encrypted release-signing tests.
+Appliance I/O tests also need Python development headers and liburing development
+files (`python3-dev` and `liburing-dev` on Debian/Ubuntu).
 The client runs on Linux x86-64/ARM64; the appliance targets Linux ARM64 with
 NVIDIA GB10, Docker and the NVIDIA container toolkit already installed.
 

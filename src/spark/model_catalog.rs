@@ -316,11 +316,18 @@ mod tests {
                 2,
             ),
             (
-                "qwen3.8:flash-next-nvfp4",
+                "qwen3.8:flash-next-radixark",
                 "RadixArk/Qwen3.8-Flash-Next-NVFP4",
                 "7b719225242aacd3dbd3f9407468c2ee9a9d2594",
                 "model.safetensors.index.json",
                 206,
+            ),
+            (
+                "qwen3.8:flash-next-nvfp4",
+                "RedHatAI/Qwen3.8-Flash-Next-NVFP4",
+                "c8f2fb1b9869f686b214782036123b10ff96d14a",
+                "model.safetensors.index.json",
+                6,
             ),
             (
                 "qwen3.6:35b-a3b-nvfp4",

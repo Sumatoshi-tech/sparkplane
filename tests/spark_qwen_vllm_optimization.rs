@@ -1,9 +1,26 @@
 #[cfg(feature = "appliance")]
 #[test]
 fn qwen38_checkpoint_and_selected_engine_accept_inline_images() {
+    assert_qwen_vision_policy(
+        "qwen3.8:flash-next",
+        "bfbc24af59a3e73a9cd0653b8d4ae758dfaec4e3e6c15dfb1c6c8ee8d5683c85",
+    );
+}
+
+#[cfg(feature = "appliance")]
+#[test]
+fn retained_radixark_checkpoint_keeps_its_vision_policy() {
+    assert_qwen_vision_policy(
+        "qwen3.8:flash-next-radixark",
+        "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+    );
+}
+
+#[cfg(feature = "appliance")]
+fn assert_qwen_vision_policy(alias: &str, processor_sha256: &str) {
     use sparkplane::spark::{engine::EngineCatalog, gateway, model_catalog::ModelCatalog};
     let models = ModelCatalog::parse(include_str!("../configs/sparkplane/models.toml")).unwrap();
-    let artifacts = models.resolve("qwen3.8:flash-next").unwrap().artifacts();
+    let artifacts = models.resolve(alias).unwrap().artifacts();
     let directory =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("configs/sparkplane/engines");
     let files = std::fs::read_dir(directory)
@@ -28,10 +45,7 @@ fn qwen38_checkpoint_and_selected_engine_accept_inline_images() {
         .vision
         .as_ref()
         .expect("Qwen image input must have a verified vision policy");
-    assert_eq!(
-        vision.processor_sha256,
-        "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
-    );
+    assert_eq!(vision.processor_sha256, processor_sha256);
     assert_eq!(vision.max_count, 16);
     assert_eq!(vision.max_total_bytes, 524288);
     let image = serde_json::json!({"type":"input_image", "image_url":format!("data:image/png;base64,{}", vision.health_image_base64)});

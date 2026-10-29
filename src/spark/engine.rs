@@ -918,20 +918,26 @@ mod tests {
 
     #[test]
     fn declared_executable_caches_must_avoid_noexec_tmpfs() {
-        let path = std::fs::read_dir("configs/sparkplane/engines")
+        for entry in std::fs::read_dir("configs/sparkplane/engines")
             .unwrap()
             .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("toml"))
-            .unwrap();
-        let text = std::fs::read_to_string(path).unwrap();
-        let invalid = text.replacen(
-            "environment = [",
-            "executable_cache_environment = [\"JIT_CACHE_DIR\"]\nenvironment = [\n  \"JIT_CACHE_DIR=/tmp/jit\",",
-            1,
-        );
-        let error = EnginePolicy::parse(&invalid).err().unwrap();
-        assert!(error.contains("executable cache path must be under /compile-cache"));
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "toml"))
+        {
+            let text = std::fs::read_to_string(entry.path()).unwrap();
+            let mut invalid: toml::Value = toml::from_str(&text).unwrap();
+            invalid.as_table_mut().unwrap().insert(
+                "executable_cache_environment".into(),
+                toml::Value::try_from(vec!["JIT_CACHE_DIR"]).unwrap(),
+            );
+            invalid["environment"]
+                .as_array_mut()
+                .unwrap()
+                .push("JIT_CACHE_DIR=/tmp/jit".into());
+            let error = EnginePolicy::parse(&toml::to_string(&invalid).unwrap())
+                .err()
+                .unwrap();
+            assert!(error.contains("executable cache path must be under /compile-cache"));
+        }
     }
 
     #[test]
@@ -1136,12 +1142,12 @@ mod tests {
     }
 
     #[test]
-    fn recommended_nvfp4_model_selects_the_patched_engine_from_config() {
+    fn retained_radixark_model_selects_the_patched_engine_from_config() {
         let models = super::super::model_catalog::ModelCatalog::parse(include_str!(
             "../../configs/sparkplane/models.toml"
         ))
         .unwrap();
-        let model = models.resolve("qwen3.8:flash-next-nvfp4").unwrap();
+        let model = models.resolve("qwen3.8:flash-next-radixark").unwrap();
 
         assert_eq!(
             catalog().select(model.artifacts()).unwrap().config().id,

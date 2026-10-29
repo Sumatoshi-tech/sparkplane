@@ -22,10 +22,10 @@ jobs:
       - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
         with:
           tool: cargo-deny
-      - name: Install release signing executable
+      - name: Install signing and I/O test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y minisign
+          sudo apt-get install --no-install-recommends -y minisign python3-dev liburing-dev
       - run: cargo deny --no-default-features --features appliance check
       - run: make lint-spark
       - run: make test

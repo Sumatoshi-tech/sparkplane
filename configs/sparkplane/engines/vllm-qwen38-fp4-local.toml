@@ -1,0 +1,137 @@
+schema = "sparkplane.engine/v3"
+id = "vllm-qwen38-fp4-local-arm64"
+priority = 200
+family = "vllm"
+version = "b12x-8244d1c44-20261015-pread-v2"
+image_transport = "local"
+image_repository = "sparkplane/vllm-qwen38-fp4-local"
+image_digest = "sha256:ef7c260eafbca2ca1d7330c79f5599314838191f93c87953202834a097471bf2"
+image_architecture = "arm64"
+entrypoint = ["vllm", "serve"]
+arguments = [
+  "{model_snapshot}",
+  "--served-model-name", "{served_model}",
+  "--host", "0.0.0.0",
+  "--port", "{port}",
+]
+# Disk-backed PLE uses bounded pread and retains the default seccomp policy.
+# Executable JIT temporaries stay in the managed, per-engine compile cache.
+executable_cache_environment = ["TMPDIR"]
+environment = [
+  "HOME=/compile-cache",
+  "TMPDIR=/compile-cache",
+  "HF_HUB_OFFLINE=1",
+  "TRANSFORMERS_OFFLINE=1",
+  "HF_DATASETS_OFFLINE=1",
+  "VLLM_NO_USAGE_STATS=1",
+  "DO_NOT_TRACK=1",
+  "VLLM_PLE_TABLE_MEMORY=disk",
+  "B12X_CHECKPOINT_PREAD=1",
+  "B12X_DISK_BACKEND=pread",
+  "CUTE_DSL_ARCH=sm_121a",
+  "SAFETENSORS_FAST_GPU=1",
+  "VLLM_WORKER_MULTIPROC_METHOD=spawn",
+  "VLLM_SSM_CONV_STATE_LAYOUT=DS",
+  "VLLM_USE_AOT_COMPILE=1",
+  "VLLM_USE_MEGA_AOT_ARTIFACT=1",
+  "VLLM_USE_V2_MODEL_RUNNER=1",
+  "B12X_POLICY_MODE=auto",
+  "VLLM_MXFP8_LM_HEAD=1",
+  "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE=w13",
+  "VLLM_B12X_MOE_FP4_FORCE_A16=1",
+  "B12X_W4A16_A4_PREFILL=1",
+  "B12X_WEIGHTS_COMPILE_WORKERS=1",
+  "PYTORCH_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6,per_process_memory_fraction:0.82,throw_on_cudamalloc_oom:True",
+  "VLLM_CACHE_ROOT=/compile-cache/vllm",
+  "TORCHINDUCTOR_CACHE_DIR=/compile-cache/torchinductor",
+  "TRITON_CACHE_DIR=/compile-cache/triton",
+  "CUDA_CACHE_PATH=/compile-cache/cuda",
+  "XDG_CACHE_HOME=/compile-cache/xdg",
+  "UMASK=0027",
+]
+default_profile = "qwen3.8-flash-next-fp4-local"
+model_cache_root = "/var/lib/sparkplane/huggingface"
+compile_cache_root = "/var/lib/sparkplane/compile-cache"
+network = "sparkplane-internal"
+port = 8000
+run_as_uid = 65534
+pid_limit = 2048
+seccomp = "default"
+ipc_mode = "private"
+shm_size_bytes = 17179869184
+tmpfs = ["/tmp"]
+startup_deadline_seconds = 1800
+health_method = "GET"
+health_path = "/health"
+semantic_prompt = "Generate one completion token."
+semantic_max_tokens = 1
+model_mount = "snapshot"
+
+[matcher]
+formats = ["safetensors"]
+quantizations = ["NVFP4"]
+engine_profiles = ["qwen3.8-flash-next-fp4-local"]
+required_capabilities = ["text_generation"]
+
+[artifact_arguments]
+primary = []
+bindings = []
+ignored_roles = ["weight_shard"]
+
+[resources]
+image_bytes = 30000000000
+startup_peak_bytes = 114000000000
+steady_peak_bytes = 114000000000
+compile_cache_bytes = 8589934592
+
+[[routes]]
+method = "GET"
+path = "/v1/models"
+
+[[routes]]
+method = "POST"
+path = "/v1/completions"
+
+[[routes]]
+method = "POST"
+path = "/v1/chat/completions"
+
+[[routes]]
+method = "POST"
+path = "/tokenize"
+
+[[profiles]]
+id = "qwen3.8-flash-next-fp4-local"
+model_types = ["qwen4_exp"]
+context_window = 262144
+stream_idle_timeout_seconds = 600
+arguments = [
+  "--tensor-parallel-size", "1",
+  "--pipeline-parallel-size", "1",
+  "--mamba-cache-mode", "align",
+  "--enable-prefix-caching",
+  "--enable-chunked-prefill",
+  "--dtype", "bfloat16",
+  "--kv-cache-dtype", "fp8",
+  "--kv-cache-memory", "6442450944",
+  "--quantization", "modelopt_mixed",
+  "--block-size", "16",
+  "--load-format", "b12x",
+  "--max-model-len", "262144",
+  "--max-num-seqs", "8",
+  "--max-num-batched-tokens", "4096",
+  "--speculative-config", "{\"method\":\"mtp\",\"num_speculative_tokens\":4}",
+  "--gdn-decode-kernel", "b12x",
+  "--linear-backend", "b12x",
+  "--moe-backend", "b12x",
+  "--no-enable-flashinfer-autotune",
+  "--mm-encoder-tp-mode", "data",
+  "--reasoning-parser", "qwen3",
+  "--tool-call-parser", "qwen3_xml",
+  "--enable-auto-tool-choice",
+  "--compilation-config", "{\"pass_config\":{\"fuse_act_quant\":true}}",
+]
+capabilities = ["text_generation", "tool_calling", "vision"]
+vision = { processor_sha256 = "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516", media_types = ["image/jpeg", "image/png", "image/webp"], max_bytes = 524288, max_total_bytes = 524288, max_count = 16, max_width = 4096, max_height = 4096, health_media_type = "image/png", health_image_base64 = "iVBORw0KGgoAAAANSUhEUgAAAOAAAADgAQAAAAAyVldMAAAAHUlEQVRYw+3BMQEAAADCoPVPbQZ/oAAAAAAAAHgMGWAAAct2tnAAAAAASUVORK5CYII=", health_image_sha256 = "1b8ab2918e9fb346d8ff5b7579372510b0d8b1566d590dac31aea311fff15fc6", health_prompt = "Name the single dominant color using one lowercase word.", health_expected_text = "black", health_max_tokens = 32, health_disable_thinking = true }
+startup_protocol_probe = true
+sampling = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0, presence_penalty = 0.0, repetition_penalty = 1.0, thinking_token_budget = 8192, reasoning_effort_map = { low = "low", medium = "medium", high = "xhigh", max = "xhigh" } }

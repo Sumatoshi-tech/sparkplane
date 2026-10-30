@@ -19,7 +19,10 @@ use axum::{
     },
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response, Sse, sse::Event},
+    response::{
+        IntoResponse, Response, Sse,
+        sse::{Event, KeepAlive},
+    },
     routing::{any, delete, get},
 };
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DashMapStateStore};
@@ -74,6 +77,7 @@ type HmacSha256 = Hmac<Sha256>;
 type TokenLimiter = RateLimiter<String, DashMapStateStore<String>, DefaultClock>;
 type InferenceSlots = BTreeMap<String, (u32, Arc<tokio::sync::Semaphore>)>;
 const DATABASE_QUEUE_CAPACITY: usize = 64;
+const INFERENCE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 #[path = "web.rs"]
 mod web;
@@ -1000,7 +1004,13 @@ fn anthropic_sse(
             }
         },
     );
-    Sse::new(stream).into_response()
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(INFERENCE_HEARTBEAT_INTERVAL)
+                .text("keep-alive"),
+        )
+        .into_response()
 }
 
 fn anthropic_warming() -> Response {
@@ -1647,7 +1657,13 @@ fn chat_sse(
             ))
         },
     );
-    Sse::new(stream).into_response()
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(INFERENCE_HEARTBEAT_INTERVAL)
+                .text("keep-alive"),
+        )
+        .into_response()
 }
 
 async fn gateway_responses_stream(
@@ -1841,7 +1857,13 @@ fn responses_sse(
             ))
         },
     );
-    Sse::new(stream).into_response()
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(INFERENCE_HEARTBEAT_INTERVAL)
+                .text("keep-alive"),
+        )
+        .into_response()
 }
 
 fn gateway_warming() -> Response {
@@ -6777,6 +6799,150 @@ mod tests {
         assert!(count <= 12);
         assert_eq!(forwarded["input"][74]["call_id"], "long_24");
         assert_eq!(forwarded["input"][74]["output"][0]["text"], "Frame 24");
+        drop(adapter);
+        handle.shutdown();
+        server.await.unwrap();
+        engine_server.abort();
+    }
+
+    #[tokio::test]
+    async fn quiet_prefill_heartbeats_cross_pinned_https_and_the_private_adapter() {
+        use axum::{
+            response::{Sse, sse::Event},
+            routing::post,
+        };
+        use futures_util::StreamExt;
+        use sha2::{Digest, Sha256};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let release = Arc::new(tokio::sync::Notify::new());
+        let generated = Arc::new(AtomicBool::new(false));
+        let ready = release.clone();
+        let engine_generated = generated.clone();
+        let engine = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let ready = ready.clone();
+                let generated = engine_generated.clone();
+                async move {
+                    let stream = futures_util::stream::once(async move {
+                        ready.notified().await;
+                        generated.store(true, Ordering::SeqCst);
+                        Ok::<_, std::convert::Infallible>(Event::default().data(
+                            r#"{"choices":[{"delta":{"content":"READY"},"finish_reason":null}]}"#,
+                        ))
+                    })
+                    .chain(futures_util::stream::iter([
+                        Ok(Event::default()
+                            .data(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#)),
+                        Ok(Event::default().data(
+                            r#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
+                        )),
+                        Ok(Event::default().data("[DONE]")),
+                    ]));
+                    Sse::new(stream)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let engine_address = listener.local_addr().unwrap();
+        let engine_server = tokio::spawn(async move {
+            axum::serve(listener, engine).await.unwrap();
+        });
+        let state = AgentState::new(TOKEN, Vec::new(), Vec::new());
+        state.routes.publish(
+            "fixture",
+            "public-model".into(),
+            "served-model".into(),
+            crate::spark::upstream::ObservedRoute::new(
+                "i_11111111111111111111111111111111",
+                1,
+                engine_address.ip(),
+                engine_address.port(),
+                [("POST", "/v1/chat/completions")],
+            )
+            .unwrap(),
+        );
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certificate = cert.pem();
+        let tls = super::tls13_config(
+            certificate.as_bytes().to_vec(),
+            signing_key.serialize_pem().into_bytes(),
+        )
+        .await
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = axum_server::Handle::new();
+        let server_handle = handle.clone();
+        let server = tokio::spawn(async move {
+            axum_server::from_tcp_rustls(listener, tls)
+                .unwrap()
+                .handle(server_handle)
+                .serve(router(state).into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .unwrap();
+        });
+        let config = tempfile::tempdir().unwrap();
+        std::fs::create_dir(config.path().join("spark")).unwrap();
+        std::fs::write(config.path().join("spark/fixture.ca.pem"), &certificate).unwrap();
+        let pin = format!("sha256:{:x}", Sha256::digest(certificate.as_bytes()));
+        std::fs::write(config.path().join("spark.toml"), format!("[hosts.fixture]\nurl='https://localhost:{}'\nca_cert_sha256='{pin}'\ncredential='unused'\nrequest_timeout_seconds=1\n", address.port())).unwrap();
+        let adapter = crate::spark::inference_adapter::Adapter::start(
+            config.path(),
+            "fixture",
+            "fixture",
+            TOKEN,
+        )
+        .unwrap();
+        let mut response = reqwest::Client::new()
+            .post(format!("{}/openai/v1/responses", adapter.base_url))
+            .bearer_auth(adapter.token())
+            .json(&serde_json::json!({"input":"work","stream":true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let mut text = String::new();
+        tokio::time::timeout(Duration::from_secs(12), async {
+            while !text.contains(": keep-alive\n\n") {
+                text.push_str(
+                    std::str::from_utf8(
+                        &response
+                            .chunk()
+                            .await
+                            .unwrap()
+                            .expect("stream remains open during prefill"),
+                    )
+                    .unwrap(),
+                );
+            }
+        })
+        .await
+        .expect("quiet inference must emit a transport heartbeat");
+        assert!(!generated.load(Ordering::SeqCst));
+        assert!(!text.contains("READY") && !text.contains("response.completed"));
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(chunk) = response.chunk().await.unwrap() {
+                text.push_str(std::str::from_utf8(&chunk).unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        let events: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let terminal: Vec<_> = events
+            .iter()
+            .filter(|event| event["type"] == "response.completed")
+            .collect();
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0]["response"]["usage"]["total_tokens"], 4);
+        assert!(text.contains("READY"));
         drop(adapter);
         handle.shutdown();
         server.await.unwrap();

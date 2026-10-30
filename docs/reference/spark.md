@@ -184,6 +184,17 @@ The gateway preserves Ornith's parsed reasoning as a distinct channel. OpenAI
 Chat streams `reasoning_content`; Responses streams reasoning summary item
 events and includes the same item in non-stream documents; Anthropic streams a
 thinking block and accepts Sparkplane's integrity-checked block back in later turns.
+Translated Responses, Chat and Anthropic streams send SSE comment heartbeats
+every ten seconds while inference is quiet, including long prompt prefill.
+Comments carry no model output, sequence numbers or token usage, and stop when
+the stream ends. The private launch adapter forwards them unchanged. Its HTTP
+and Linux TCP unacknowledged-data deadlines both use the finite 1,800-second
+inference budget; a library's shorter TCP default cannot override that budget.
+Connection establishment remains bounded at ten seconds, and engine idle
+deadlines, cancellation and admission limits still apply. Adapter transport
+diagnostics identify the request/body stage and timeout classification without
+logging credentials or conversation content.
+
 Each healthy instance publishes `capabilities` through the control API and its
 public `/v1/models` metadata. The values come from the exact generation's verified
 gateway profile: tool calling, parallel tool calls, verbosity, and optional

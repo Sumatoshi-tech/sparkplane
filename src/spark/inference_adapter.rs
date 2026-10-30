@@ -460,7 +460,10 @@ async fn handle(request: Request<Incoming>, state: Arc<State>) -> Response<Body>
     }
     let response = match upstream.send().await {
         Ok(r) => r,
-        Err(_) => return error(502, "pinned Spark inference transport is unavailable"),
+        Err(error) => {
+            transport_failure(&error, "request");
+            return self::error(502, "pinned Spark inference transport is unavailable");
+        }
     };
     let mut builder = Response::builder().status(response.status());
     for name in ["content-type", "retry-after"] {
@@ -472,12 +475,27 @@ async fn handle(request: Request<Incoming>, state: Arc<State>) -> Response<Body>
         match response.chunk().await {
             Ok(Some(chunk)) => Ok(Some((Frame::data(chunk), response))),
             Ok(None) => Ok(None),
-            Err(_) => Err(io::Error::other("inference response stream disconnected")),
+            Err(error) => {
+                transport_failure(&error, "body");
+                Err(io::Error::other("inference response stream disconnected"))
+            }
         }
     });
     builder
         .body(StreamBody::new(stream).boxed_unsync())
         .expect("upstream status and headers")
+}
+
+fn transport_failure(error: &reqwest::Error, stage: &'static str) {
+    // No URL, headers, credentials or request/response content enters diagnostics.
+    tracing::warn!(
+        event_code = "spark.inference.transport-failed",
+        stage,
+        timeout = error.is_timeout(),
+        connect = error.is_connect(),
+        body = error.is_body(),
+        decode = error.is_decode(),
+    );
 }
 
 #[cfg(test)]

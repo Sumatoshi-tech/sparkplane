@@ -19,7 +19,10 @@ use axum::{
     },
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response, Sse, sse::Event},
+    response::{
+        IntoResponse, Response, Sse,
+        sse::{Event, KeepAlive},
+    },
     routing::{any, delete, get},
 };
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DashMapStateStore};
@@ -74,6 +77,7 @@ type HmacSha256 = Hmac<Sha256>;
 type TokenLimiter = RateLimiter<String, DashMapStateStore<String>, DefaultClock>;
 type InferenceSlots = BTreeMap<String, (u32, Arc<tokio::sync::Semaphore>)>;
 const DATABASE_QUEUE_CAPACITY: usize = 64;
+const INFERENCE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 #[path = "web.rs"]
 mod web;
@@ -410,6 +414,8 @@ impl Cidr {
         ServeRequest,
         StopRequest,
         InstanceDocument,
+        super::wire::InferenceCapabilitiesDocument,
+        super::wire::ReasoningCapabilitiesDocument,
         InstanceListDocument,
         EngineLogDocument,
         AnthropicTokenCountDocument,
@@ -998,7 +1004,13 @@ fn anthropic_sse(
             }
         },
     );
-    Sse::new(stream).into_response()
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(INFERENCE_HEARTBEAT_INTERVAL)
+                .text("keep-alive"),
+        )
+        .into_response()
 }
 
 fn anthropic_warming() -> Response {
@@ -1645,7 +1657,13 @@ fn chat_sse(
             ))
         },
     );
-    Sse::new(stream).into_response()
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(INFERENCE_HEARTBEAT_INTERVAL)
+                .text("keep-alive"),
+        )
+        .into_response()
 }
 
 async fn gateway_responses_stream(
@@ -1839,7 +1857,13 @@ fn responses_sse(
             ))
         },
     );
-    Sse::new(stream).into_response()
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(INFERENCE_HEARTBEAT_INTERVAL)
+                .text("keep-alive"),
+        )
+        .into_response()
 }
 
 fn gateway_warming() -> Response {
@@ -2189,6 +2213,7 @@ async fn serve_instance(
         context_window,
         input_modalities: vec!["text".into()],
         default_reasoning_effort,
+        capabilities: Default::default(),
         generation: 0,
         desired: InstanceDesiredState::Running,
         observed: InstanceObservedState::Creating,
@@ -2498,7 +2523,7 @@ async fn run_serve(
         return;
     }
     let endpoint = format!("/openai/{}/v1", instance.name);
-    let healthy_instance = match database
+    let mut healthy_instance = match database
         .set_instance_observed(
             &instance.id,
             instance.generation,
@@ -2532,6 +2557,7 @@ async fn run_serve(
             route,
         );
     }
+    project_route_health(&routes, std::slice::from_mut(&mut healthy_instance));
     let _ = database
         .transition(
             &operation_id,
@@ -2905,7 +2931,7 @@ async fn complete_recovered_operation(
     }) else {
         return;
     };
-    let Ok(current) = database.instance(&instance.id).await else {
+    let Ok(mut current) = database.instance(&instance.id).await else {
         return;
     };
     let route_ready = routes.is_some_and(|routes| {
@@ -2932,6 +2958,9 @@ async fn complete_recovered_operation(
     };
     if !recovered {
         return;
+    }
+    if let Some(routes) = routes {
+        project_route_health(routes, std::slice::from_mut(&mut current));
     }
     let result = serde_json::to_value(current).ok();
     if operation.state == super::wire::OperationState::Accepted {
@@ -3173,7 +3202,25 @@ async fn semantic_probe_result(
     route
         .protocol_probe(&observed.served_model, require_tools, remaining)
         .await
-        .map_err(|error| error.diagnostic())
+        .map_err(|error| error.diagnostic())?;
+    if let Some(reasoning) = &observed.gateway_profile.reasoning {
+        let effort = observed
+            .gateway_profile
+            .sampling
+            .reasoning_effort_map
+            .get(&reasoning.default_effort)
+            .unwrap_or(&reasoning.default_effort);
+        route
+            .reasoning_probe(
+                &observed.served_model,
+                effort,
+                reasoning.summaries,
+                timeout.saturating_sub(started.elapsed()),
+            )
+            .await
+            .map_err(|error| error.diagnostic())?;
+    }
+    Ok(())
 }
 
 fn semantic_failure_detail(reason: &'static str) -> String {
@@ -3275,12 +3322,14 @@ async fn list_instances(State(state): State<AgentState>, RawQuery(query): RawQue
 fn project_route_health(routes: &RouteRegistry, instances: &mut [InstanceDocument]) {
     for instance in instances {
         instance.input_modalities = vec!["text".into()];
+        instance.capabilities = Default::default();
         if !instance.healthy {
             continue;
         }
         if let RouteLookup::Healthy(route) = routes.lookup(&instance.name)
             && route.generation == instance.generation
         {
+            instance.capabilities = route.profile.inference_capabilities();
             if route.profile.capabilities.contains("vision") && route.profile.vision.is_some() {
                 instance.input_modalities.push("image".into());
             }
@@ -6757,6 +6806,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quiet_prefill_heartbeats_cross_pinned_https_and_the_private_adapter() {
+        use axum::{
+            response::{Sse, sse::Event},
+            routing::post,
+        };
+        use futures_util::StreamExt;
+        use sha2::{Digest, Sha256};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let release = Arc::new(tokio::sync::Notify::new());
+        let generated = Arc::new(AtomicBool::new(false));
+        let ready = release.clone();
+        let engine_generated = generated.clone();
+        let engine = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let ready = ready.clone();
+                let generated = engine_generated.clone();
+                async move {
+                    let stream = futures_util::stream::once(async move {
+                        ready.notified().await;
+                        generated.store(true, Ordering::SeqCst);
+                        Ok::<_, std::convert::Infallible>(Event::default().data(
+                            r#"{"choices":[{"delta":{"content":"READY"},"finish_reason":null}]}"#,
+                        ))
+                    })
+                    .chain(futures_util::stream::iter([
+                        Ok(Event::default()
+                            .data(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#)),
+                        Ok(Event::default().data(
+                            r#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
+                        )),
+                        Ok(Event::default().data("[DONE]")),
+                    ]));
+                    Sse::new(stream)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let engine_address = listener.local_addr().unwrap();
+        let engine_server = tokio::spawn(async move {
+            axum::serve(listener, engine).await.unwrap();
+        });
+        let state = AgentState::new(TOKEN, Vec::new(), Vec::new());
+        state.routes.publish(
+            "fixture",
+            "public-model".into(),
+            "served-model".into(),
+            crate::spark::upstream::ObservedRoute::new(
+                "i_11111111111111111111111111111111",
+                1,
+                engine_address.ip(),
+                engine_address.port(),
+                [("POST", "/v1/chat/completions")],
+            )
+            .unwrap(),
+        );
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certificate = cert.pem();
+        let tls = super::tls13_config(
+            certificate.as_bytes().to_vec(),
+            signing_key.serialize_pem().into_bytes(),
+        )
+        .await
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = axum_server::Handle::new();
+        let server_handle = handle.clone();
+        let server = tokio::spawn(async move {
+            axum_server::from_tcp_rustls(listener, tls)
+                .unwrap()
+                .handle(server_handle)
+                .serve(router(state).into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .unwrap();
+        });
+        let config = tempfile::tempdir().unwrap();
+        std::fs::create_dir(config.path().join("spark")).unwrap();
+        std::fs::write(config.path().join("spark/fixture.ca.pem"), &certificate).unwrap();
+        let pin = format!("sha256:{:x}", Sha256::digest(certificate.as_bytes()));
+        std::fs::write(config.path().join("spark.toml"), format!("[hosts.fixture]\nurl='https://localhost:{}'\nca_cert_sha256='{pin}'\ncredential='unused'\nrequest_timeout_seconds=1\n", address.port())).unwrap();
+        let adapter = crate::spark::inference_adapter::Adapter::start(
+            config.path(),
+            "fixture",
+            "fixture",
+            TOKEN,
+        )
+        .unwrap();
+        let mut response = reqwest::Client::new()
+            .post(format!("{}/openai/v1/responses", adapter.base_url))
+            .bearer_auth(adapter.token())
+            .json(&serde_json::json!({"input":"work","stream":true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let mut text = String::new();
+        tokio::time::timeout(Duration::from_secs(12), async {
+            while !text.contains(": keep-alive\n\n") {
+                text.push_str(
+                    std::str::from_utf8(
+                        &response
+                            .chunk()
+                            .await
+                            .unwrap()
+                            .expect("stream remains open during prefill"),
+                    )
+                    .unwrap(),
+                );
+            }
+        })
+        .await
+        .expect("quiet inference must emit a transport heartbeat");
+        assert!(!generated.load(Ordering::SeqCst));
+        assert!(!text.contains("READY") && !text.contains("response.completed"));
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(chunk) = response.chunk().await.unwrap() {
+                text.push_str(std::str::from_utf8(&chunk).unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        let events: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let terminal: Vec<_> = events
+            .iter()
+            .filter(|event| event["type"] == "response.completed")
+            .collect();
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0]["response"]["usage"]["total_tokens"], 4);
+        assert!(text.contains("READY"));
+        drop(adapter);
+        handle.shutdown();
+        server.await.unwrap();
+        engine_server.abort();
+    }
+
+    #[tokio::test]
     async fn upstream_client_rejections_keep_safe_status_codes_and_context_errors() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         for (status, body, expected, code) in [
@@ -8056,6 +8249,7 @@ mod tests {
             context_window: 65_536,
             input_modalities: vec!["text".into()],
             default_reasoning_effort: None,
+            capabilities: Default::default(),
             generation: 0,
             desired: crate::spark::wire::InstanceDesiredState::Running,
             observed: crate::spark::wire::InstanceObservedState::Creating,
@@ -8190,7 +8384,7 @@ mod tests {
             .build()
             .unwrap();
         let vision = crate::spark::engine::EnginePolicy::parse(include_str!(
-            "../../configs/sparkplane/engines/llama-cpp.toml"
+            "../../configs/sparkplane/engines/vllm-qwen38-redhat.toml"
         ))
         .unwrap()
         .gateway_profile(None);
@@ -8214,6 +8408,8 @@ mod tests {
                 [("POST", "/v1/chat/completions")],
             )
             .unwrap();
+            let advertised_reasoning =
+                generation == instance.generation && profile.reasoning.is_some();
             routes.publish_with_profile(
                 &instance.name,
                 instance.model.clone(),
@@ -8237,6 +8433,36 @@ mod tests {
                 .unwrap();
             assert_eq!(list.instances[0].input_modalities, expected);
             assert_eq!(list.instances[0].healthy, generation == instance.generation);
+            assert_eq!(
+                list.instances[0].capabilities.reasoning.is_some(),
+                advertised_reasoning
+            );
+            let catalog = crate::spark::launch::codex_catalog(&model, &list.instances[0]);
+            assert_eq!(
+                catalog["models"][0]["supports_reasoning_summaries"],
+                advertised_reasoning
+            );
+            if advertised_reasoning {
+                assert_eq!(catalog["models"][0]["default_reasoning_level"], "xhigh");
+                let metadata: serde_json::Value = client
+                    .get(format!(
+                        "https://localhost:{}/openai/ornith/v1/models",
+                        address.port()
+                    ))
+                    .bearer_auth(TOKEN)
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    metadata["data"][0]["capabilities"],
+                    serde_json::to_value(&list.instances[0].capabilities).unwrap()
+                );
+            }
         }
         handle.graceful_shutdown(None);
         server.await.unwrap();
@@ -8793,6 +9019,7 @@ mod tests {
             context_window: 65_536,
             input_modalities: vec!["text".into()],
             default_reasoning_effort: None,
+            capabilities: Default::default(),
             generation: 0,
             desired: crate::spark::wire::InstanceDesiredState::Running,
             observed: crate::spark::wire::InstanceObservedState::Creating,

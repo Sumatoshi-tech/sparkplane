@@ -242,7 +242,7 @@ enum Command {
         reply: oneshot::Sender<Result<(), StateError>>,
     },
     BeginServe {
-        instance: InstanceDocument,
+        instance: Box<InstanceDocument>,
         reply: oneshot::Sender<Result<AcceptedInstance, StateError>>,
     },
     ListInstances(oneshot::Sender<Result<Vec<InstanceDocument>, StateError>>),
@@ -529,8 +529,11 @@ impl DbActor {
         instance: InstanceDocument,
     ) -> Result<AcceptedInstance, StateError> {
         validate_instance(&instance)?;
-        self.submit(|reply| Command::BeginServe { instance, reply })
-            .await
+        self.submit(|reply| Command::BeginServe {
+            instance: Box::new(instance),
+            reply,
+        })
+        .await
     }
 
     pub async fn list_instances(&self) -> Result<Vec<InstanceDocument>, StateError> {
@@ -947,7 +950,7 @@ fn actor_loop(
                 let _ = reply.send(remove_model(&mut connection, &id));
             }
             Command::BeginServe { instance, reply } => {
-                let _ = reply.send(begin_serve(&mut connection, instance));
+                let _ = reply.send(begin_serve(&mut connection, *instance));
             }
             Command::ListInstances(reply) => {
                 let _ = reply.send(list_instances(&connection));
@@ -2582,6 +2585,7 @@ mod tests {
             context_window: 65_536,
             input_modalities: vec!["text".into()],
             default_reasoning_effort: None,
+            capabilities: Default::default(),
             generation: 0,
             desired: InstanceDesiredState::Running,
             observed: InstanceObservedState::Creating,

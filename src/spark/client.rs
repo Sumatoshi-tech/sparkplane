@@ -27,6 +27,7 @@ use super::{
 
 const MAX_SAFE_READ_ATTEMPTS: usize = 3;
 const OPERATION_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const INFERENCE_TIMEOUT: Duration = Duration::from_secs(1800);
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -94,13 +95,19 @@ pub(super) fn inference_transport(
     }
     let certificate = reqwest::Certificate::from_pem(&ca)
         .map_err(|_| unreachable("pinned Spark CA certificate is invalid"))?;
-    let http = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .tls_built_in_root_certs(false)
         .add_root_certificate(certificate)
         .https_only(base.scheme() == "https")
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(1800))
+        .timeout(INFERENCE_TIMEOUT);
+    // reqwest's Linux TCP_USER_TIMEOUT default is 30 seconds, independently of
+    // its HTTP deadline. Transient unacknowledged data on the appliance LAN must
+    // share the finite inference budget rather than silently shortening it.
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    let builder = builder.tcp_user_timeout(INFERENCE_TIMEOUT);
+    let http = builder
         .build()
         .map_err(|_| unreachable("could not construct pinned inference transport"))?;
     Ok((http, base))
@@ -1029,6 +1036,58 @@ fn write_private_atomic(_: &Path, _: &[u8]) -> Result<(), ClientError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(target_os = "linux", feature = "appliance"))]
+    #[tokio::test]
+    async fn inference_survives_tcp_backpressure_beyond_the_library_default() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let size = 8 * 1024 * 1024;
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            // Stop acknowledging more upload data once the kernel receive window
+            // fills. No packet filter, privilege or host network mutation is used.
+            tokio::time::sleep(Duration::from_secs(35)).await;
+            let mut socket = tokio::io::BufReader::new(socket);
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                assert!(
+                    !line.is_empty(),
+                    "inference TCP connection closed before recovery"
+                );
+            }
+            let mut body = vec![0; size];
+            socket.read_exact(&mut body).await.unwrap();
+            assert!(body.iter().all(|byte| *byte == b'x'));
+            socket
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                .await
+                .unwrap();
+        });
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("spark")).unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+            .unwrap()
+            .cert
+            .pem();
+        fs::write(root.path().join("spark/fixture.ca.pem"), &cert).unwrap();
+        fs::write(root.path().join("spark.toml"), format!("[hosts.fixture]\nurl='http://{address}'\nca_cert_sha256='sha256:{:x}'\ncredential='unused'\nrequest_timeout_seconds=1\n", sha2::Sha256::digest(cert.as_bytes()))).unwrap();
+        let (http, base) = super::inference_transport(root.path(), "fixture").unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(55),
+            http.post(base).body(vec![b'x'; size]).send(),
+        )
+        .await
+        .unwrap()
+        .expect("a short library TCP default must not override the inference budget");
+        assert_eq!(response.text().await.unwrap(), "OK");
+        server.await.unwrap();
+    }
     use super::SparkClient;
     use crate::spark::wire::{
         OPERATION_SCHEMA, OperationDocument, OperationProgress, OperationState,

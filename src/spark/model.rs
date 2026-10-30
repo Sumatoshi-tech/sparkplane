@@ -20,6 +20,57 @@ use super::wire::{
 
 const MODEL_PROGRESS_QUEUE_CAPACITY: usize = 64;
 
+// Both Hub transports write the same content-addressed `.incomplete` file and
+// rename it on success. Its existing allocation is already absent from statvfs
+// available space; charging it again prevents a bounded retry of a large shard.
+// This is disk accounting only: partial contents still require full verification.
+fn partial_blob_allocation(cache: &Path, repository: &Repository, key: &str, size: u64) -> u64 {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    if !matches!(key.len(), 40 | 64) || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return 0;
+    }
+    let Ok(cache_metadata) = fs::symlink_metadata(cache) else {
+        return 0;
+    };
+    let repository_path = cache.join(repository_cache_name(repository));
+    let blobs = repository_path.join("blobs");
+    // Refuse symlinked directories as well as symlinked partial files.
+    if !cache_metadata.is_dir()
+        || [&repository_path, &blobs]
+            .iter()
+            .any(|path| !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()))
+    {
+        return 0;
+    }
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(blobs.join(format!("{key}.incomplete")))
+    else {
+        return 0;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return 0;
+    };
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != cache_metadata.uid()
+        || metadata.dev() != cache_metadata.dev()
+        || metadata.len() > size
+    {
+        return 0;
+    }
+    // Linux st_blocks counts 512-byte units, including on sparse files. Never
+    // credit logical holes, block rounding, or bytes beyond the pinned size.
+    metadata
+        .blocks()
+        .checked_mul(512)
+        .unwrap_or_default()
+        .min(metadata.len())
+        .min(size)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Repository(String);
 
@@ -975,6 +1026,7 @@ impl HubAcquirer {
             .join(repository_cache_name(&repository))
             .join("blobs");
         let mut unique_bytes = 0_u64;
+        let mut unfinished_bytes = 0_u64;
         for file in &expected {
             let path = file.path.to_string_lossy();
             let resolved = tree
@@ -989,7 +1041,20 @@ impl HubAcquirer {
                 resolved.size,
             ) && !blobs.join(&resolved.blob_key).is_file()
             {
-                unique_bytes = unique_bytes.checked_add(resolved.size).ok_or_else(|| {
+                unfinished_bytes =
+                    unfinished_bytes.checked_add(resolved.size).ok_or_else(|| {
+                        acquisition_error(
+                            TransferFailure::Policy,
+                            "model size overflows byte accounting",
+                        )
+                    })?;
+                let remaining = resolved.size.saturating_sub(partial_blob_allocation(
+                    &self.cache,
+                    &repository,
+                    &resolved.blob_key,
+                    resolved.size,
+                ));
+                unique_bytes = unique_bytes.checked_add(remaining).ok_or_else(|| {
                     acquisition_error(
                         TransferFailure::Policy,
                         "model size overflows byte accounting",
@@ -997,7 +1062,9 @@ impl HubAcquirer {
                 })?;
             }
         }
-        let temporary_bytes = unique_bytes.min(8 * 1024 * 1024 * 1024);
+        // A fully allocated partial still needs transport scratch space. Credit
+        // its final allocation without reducing the existing temporary budget.
+        let temporary_bytes = unfinished_bytes.min(8 * 1024 * 1024 * 1024);
         self.enforce_disk_reserve(unique_bytes, temporary_bytes)?;
         let license = info
             .tags
@@ -1345,6 +1412,92 @@ mod tests {
             role,
             path: path.into(),
         }
+    }
+
+    #[test]
+    fn partial_cache_accounting_does_not_credit_sparse_holes() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let repository = Repository::parse("owner/model").unwrap();
+        let blobs = root.path().join("models--owner--model/blobs");
+        fs::create_dir_all(&blobs).unwrap();
+        let key = "a".repeat(64);
+        let path = blobs.join(format!("{key}.incomplete"));
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(&[42; 4096]).unwrap();
+        file.set_len(1024 * 1024).unwrap();
+        file.sync_all().unwrap();
+        let allocation =
+            super::partial_blob_allocation(root.path(), &repository, &key, 2 * 1024 * 1024);
+        assert!(allocation > 0);
+        assert!(allocation < file.metadata().unwrap().len());
+        assert!(allocation <= file.metadata().unwrap().blocks() * 512);
+    }
+
+    #[test]
+    fn partial_cache_accounting_rejects_links_directories_and_oversized_files() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = Repository::parse("owner/model").unwrap();
+        let blobs = root.path().join("models--owner--model/blobs");
+        fs::create_dir_all(&blobs).unwrap();
+        let key = "b".repeat(64);
+        let partial = blobs.join(format!("{key}.incomplete"));
+        let source = root.path().join("other-file");
+        fs::write(&source, [42; 8192]).unwrap();
+        symlink(&source, &partial).unwrap();
+        assert_eq!(
+            super::partial_blob_allocation(root.path(), &repository, &key, 8192),
+            0
+        );
+        fs::remove_file(&partial).unwrap();
+        fs::hard_link(&source, &partial).unwrap();
+        assert_eq!(
+            super::partial_blob_allocation(root.path(), &repository, &key, 8192),
+            0
+        );
+        fs::remove_file(&partial).unwrap();
+        fs::create_dir(&partial).unwrap();
+        assert_eq!(
+            super::partial_blob_allocation(root.path(), &repository, &key, 8192),
+            0
+        );
+        fs::remove_dir(&partial).unwrap();
+        fs::write(&partial, [42; 8193]).unwrap();
+        assert_eq!(
+            super::partial_blob_allocation(root.path(), &repository, &key, 8192),
+            0
+        );
+        assert_eq!(
+            super::partial_blob_allocation(root.path(), &repository, "../other-file", 8192),
+            0
+        );
+    }
+
+    #[test]
+    fn partial_cache_accounting_rejects_symlinked_cache_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let repository = Repository::parse("owner/model").unwrap();
+        let key = "c".repeat(64);
+        fs::create_dir(outside.path().join("blobs")).unwrap();
+        fs::write(
+            outside.path().join(format!("blobs/{key}.incomplete")),
+            [42; 8192],
+        )
+        .unwrap();
+        let repository_path = root.path().join("models--owner--model");
+        symlink(outside.path(), &repository_path).unwrap();
+        assert_eq!(
+            super::partial_blob_allocation(root.path(), &repository, &key, 16384),
+            0
+        );
+        fs::remove_file(&repository_path).unwrap();
+        fs::create_dir(&repository_path).unwrap();
+        symlink(outside.path().join("blobs"), repository_path.join("blobs")).unwrap();
+        assert_eq!(
+            super::partial_blob_allocation(root.path(), &repository, &key, 16384),
+            0
+        );
     }
 
     #[test]
@@ -1714,9 +1867,10 @@ mod tests {
         }
         async fn file() -> Response<Body> {
             let mut response = Response::new(Body::from(CONTENT));
-            response
-                .headers_mut()
-                .insert(header::ETAG, HeaderValue::from_static("\"hermetic-etag\""));
+            response.headers_mut().insert(
+                header::ETAG,
+                HeaderValue::from_str(&format!("\"{:x}\"", sha2::Sha256::digest(CONTENT))).unwrap(),
+            );
             response
                 .headers_mut()
                 .insert("x-repo-commit", HeaderValue::from_static(COMMIT));
@@ -1751,6 +1905,12 @@ mod tests {
             None,
         )
         .unwrap();
+        let blobs = root.path().join("models--owner--model/blobs");
+        fs::create_dir_all(&blobs).unwrap();
+        let partial = blobs.join(format!("{:x}.incomplete", sha2::Sha256::digest(CONTENT)));
+        // Allocation is reusable space, not evidence that these bytes are valid.
+        fs::write(&partial, b"garbage").unwrap();
+        fs::File::open(&partial).unwrap().sync_all().unwrap();
         let plan = acquirer
             .resolve_selected(
                 Repository::parse("owner/model").unwrap(),
@@ -1759,8 +1919,23 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(plan.unique_bytes, (CONTENT.len() - 7) as u64);
+        assert_eq!(plan.temporary_bytes, CONTENT.len() as u64);
+        fs::write(&partial, [42; CONTENT.len()]).unwrap();
+        fs::File::open(&partial).unwrap().sync_all().unwrap();
+        let plan = acquirer
+            .resolve_selected(
+                Repository::parse("owner/model").unwrap(),
+                Revision::parse("main").unwrap(),
+                super::ArtifactSelection::generic("model.gguf", Vec::new()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.unique_bytes, 0);
+        assert_eq!(plan.temporary_bytes, CONTENT.len() as u64);
         let (send, _receive) = super::progress_channel();
         let model = acquirer.acquire(&plan, None, send).await.unwrap();
+        assert!(!partial.exists());
         assert_eq!(
             (model.commit.as_str(), model.logical_bytes),
             (COMMIT, CONTENT.len() as u64)
@@ -1783,6 +1958,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resumed.unique_bytes, 0);
+        assert_eq!(resumed.temporary_bytes, 0);
         server.abort();
     }
 }

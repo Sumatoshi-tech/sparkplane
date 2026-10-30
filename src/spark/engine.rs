@@ -172,6 +172,12 @@ pub struct EngineProfile {
     pub capabilities: Vec<String>,
     pub startup_protocol_probe: bool,
     #[serde(default)]
+    pub reasoning: Option<super::wire::ReasoningCapabilitiesDocument>,
+    #[serde(default)]
+    pub parallel_tool_calls: bool,
+    #[serde(default)]
+    pub verbosity: bool,
+    #[serde(default)]
     pub resources: Option<EngineResources>,
     #[serde(default)]
     pub vision: Option<VisionPolicy>,
@@ -391,6 +397,9 @@ impl EnginePolicy {
             vision: profile.vision.clone(),
             embeddings: None,
             startup_protocol_probe: profile.startup_protocol_probe,
+            reasoning: profile.reasoning.clone(),
+            parallel_tool_calls: profile.parallel_tool_calls,
+            verbosity: profile.verbosity,
             native_responses: profile.native_responses,
             native_response_timeout_seconds: profile.native_response_timeout_seconds,
             stream_idle_timeout_seconds: profile.stream_idle_timeout_seconds,
@@ -434,6 +443,9 @@ impl EnginePolicy {
             vision: supports_vision.then(|| profile.vision.clone()).flatten(),
             embeddings,
             startup_protocol_probe: profile.startup_protocol_probe,
+            reasoning: profile.reasoning.clone(),
+            parallel_tool_calls: profile.parallel_tool_calls,
+            verbosity: profile.verbosity,
             native_responses: profile.native_responses,
             native_response_timeout_seconds: profile.native_response_timeout_seconds,
             stream_idle_timeout_seconds: profile.stream_idle_timeout_seconds,
@@ -762,6 +774,27 @@ fn validate_profiles(config: &EngineConfig) -> Result<(), String> {
         {
             return Err("engine profile is invalid or ambiguous".into());
         }
+        if profile.reasoning.as_ref().is_some_and(|reasoning| {
+            !reasoning.valid()
+                || !profile
+                    .capabilities
+                    .iter()
+                    .any(|value| value == "text_generation")
+                || !profile.startup_protocol_probe
+                || profile
+                    .sampling
+                    .default_reasoning_effort
+                    .as_ref()
+                    .is_some_and(|value| value != &reasoning.default_effort)
+        }) || profile.parallel_tool_calls
+            && !profile
+                .capabilities
+                .iter()
+                .any(|value| value == "tool_calling")
+            || profile.verbosity && !profile.native_responses
+        {
+            return Err("engine client capabilities disagree with the qualified profile".into());
+        }
         if let Some(vision) = &profile.vision {
             let processor = format!("sha256:{}", vision.processor_sha256);
             if !valid_digest(&processor) || super::gateway::vision_health_image(vision).is_err() {
@@ -918,20 +951,26 @@ mod tests {
 
     #[test]
     fn declared_executable_caches_must_avoid_noexec_tmpfs() {
-        let path = std::fs::read_dir("configs/sparkplane/engines")
+        for entry in std::fs::read_dir("configs/sparkplane/engines")
             .unwrap()
             .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("toml"))
-            .unwrap();
-        let text = std::fs::read_to_string(path).unwrap();
-        let invalid = text.replacen(
-            "environment = [",
-            "executable_cache_environment = [\"JIT_CACHE_DIR\"]\nenvironment = [\n  \"JIT_CACHE_DIR=/tmp/jit\",",
-            1,
-        );
-        let error = EnginePolicy::parse(&invalid).err().unwrap();
-        assert!(error.contains("executable cache path must be under /compile-cache"));
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "toml"))
+        {
+            let text = std::fs::read_to_string(entry.path()).unwrap();
+            let mut invalid: toml::Value = toml::from_str(&text).unwrap();
+            invalid.as_table_mut().unwrap().insert(
+                "executable_cache_environment".into(),
+                toml::Value::try_from(vec!["JIT_CACHE_DIR"]).unwrap(),
+            );
+            invalid["environment"]
+                .as_array_mut()
+                .unwrap()
+                .push("JIT_CACHE_DIR=/tmp/jit".into());
+            let error = EnginePolicy::parse(&toml::to_string(&invalid).unwrap())
+                .err()
+                .unwrap();
+            assert!(error.contains("executable cache path must be under /compile-cache"));
+        }
     }
 
     #[test]
@@ -1136,12 +1175,12 @@ mod tests {
     }
 
     #[test]
-    fn recommended_nvfp4_model_selects_the_patched_engine_from_config() {
+    fn retained_radixark_model_selects_the_patched_engine_from_config() {
         let models = super::super::model_catalog::ModelCatalog::parse(include_str!(
             "../../configs/sparkplane/models.toml"
         ))
         .unwrap();
-        let model = models.resolve("qwen3.8:flash-next-nvfp4").unwrap();
+        let model = models.resolve("qwen3.8:flash-next-radixark").unwrap();
 
         assert_eq!(
             catalog().select(model.artifacts()).unwrap().config().id,

@@ -1,6 +1,7 @@
 #![cfg(feature = "appliance")]
 
 use sparkplane::spark::image_history;
+use sparkplane::spark::wire;
 
 #[path = "../src/spark/gateway.rs"]
 #[cfg_attr(test, allow(dead_code))]
@@ -38,6 +39,7 @@ fn vision_profile() -> gateway::GatewayProfile {
         }),
         embeddings: None,
         startup_protocol_probe: true,
+        reasoning: None, parallel_tool_calls: false, verbosity: false,
         native_responses: false,
         native_response_timeout_seconds: 0,
         stream_idle_timeout_seconds: 0,

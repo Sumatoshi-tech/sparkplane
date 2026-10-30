@@ -2131,6 +2131,7 @@ mod tests {
             context_window: 65_536,
             input_modalities: vec!["text".into()],
             default_reasoning_effort: None,
+            capabilities: Default::default(),
             generation: 1,
             desired: InstanceDesiredState::Running,
             observed: InstanceObservedState::Healthy,

@@ -75,6 +75,12 @@ pub struct GatewayProfile {
     pub vision: Option<VisionPolicy>,
     pub embeddings: Option<EmbeddingPolicy>,
     pub startup_protocol_probe: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<super::wire::ReasoningCapabilitiesDocument>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub parallel_tool_calls: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub verbosity: bool,
     #[serde(default)]
     pub native_responses: bool,
     #[serde(default)]
@@ -85,7 +91,25 @@ pub struct GatewayProfile {
     pub sampling: SamplingPolicy,
 }
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 impl GatewayProfile {
+    pub fn inference_capabilities(&self) -> super::wire::InferenceCapabilitiesDocument {
+        let generation = self.capabilities.contains("text_generation");
+        let tools = generation && self.capabilities.contains("tool_calling");
+        super::wire::InferenceCapabilitiesDocument {
+            tool_calling: tools,
+            parallel_tool_calls: tools && self.parallel_tool_calls,
+            verbosity: generation && self.verbosity,
+            reasoning: generation
+                .then(|| self.reasoning.clone())
+                .flatten()
+                .filter(|reasoning| reasoning.valid()),
+        }
+    }
+
     pub fn stream_idle_timeout(&self) -> std::time::Duration {
         if self.stream_idle_timeout_seconds == 0 {
             DEFAULT_STREAM_IDLE_TIMEOUT
@@ -100,6 +124,9 @@ impl GatewayProfile {
             vision: None,
             embeddings: None,
             startup_protocol_probe: true,
+            reasoning: None,
+            parallel_tool_calls: false,
+            verbosity: false,
             native_responses: false,
             native_response_timeout_seconds: 0,
             stream_idle_timeout_seconds: 0,
@@ -126,6 +153,9 @@ impl GatewayProfile {
                 normalization_tolerance_ppm,
             }),
             startup_protocol_probe: true,
+            reasoning: None,
+            parallel_tool_calls: false,
+            verbosity: false,
             native_responses: false,
             native_response_timeout_seconds: 0,
             stream_idle_timeout_seconds: 0,
@@ -1416,7 +1446,8 @@ pub fn models_document(route: &HealthyRoute) -> Value {
         "data": [{
             "id": route.public_model,
             "object": "model",
-            "owned_by": "sparkplane"
+            "owned_by": "sparkplane",
+            "capabilities": route.profile.inference_capabilities()
         }]
     })
 }
@@ -2836,6 +2867,17 @@ fn response_tool_choice(value: Option<&Value>) -> Result<Value, OpenAiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_gateway_profile_serialization_preserves_protected_identity() {
+        let profile = GatewayProfile::text();
+        let document = serde_json::to_value(&profile).unwrap();
+        for key in ["reasoning", "parallel_tool_calls", "verbosity"] {
+            assert!(document.get(key).is_none());
+        }
+        let restored: GatewayProfile = serde_json::from_value(document.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), document);
+    }
 
     fn configured_sampling_profile() -> GatewayProfile {
         let mut profile = GatewayProfile::text();
